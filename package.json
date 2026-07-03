@@ -1,0 +1,35 @@
+{
+  "name": "hasu-panel",
+  "version": "1.5.0",
+  "description": "Panel de gestion des bots pm2 (Hasu) — auto-démarrage + mode jeu",
+  "main": "main.js",
+  "author": "saliox",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win dir"
+  },
+  "build": {
+    "appId": "hasu.panel",
+    "productName": "HasuPanel",
+    "electronLanguages": [
+      "fr",
+      "en-US"
+    ],
+    "win": {
+      "target": "dir",
+      "icon": "icon.ico"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "discordrpc.js",
+      "ui/**",
+      "icon.png"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12"
+  }
+}

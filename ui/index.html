@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'self'">
+<title>Hasu Panel</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #1a1d27; --card2: #22263380; --line: #2c3040;
+    --txt: #e6e8f0; --mut: #9aa0b5; --accent: #5865F2; --ok: #3ba55d; --err: #ed4245; --warn: #faa61a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--txt); font: 14px/1.45 "Segoe UI", sans-serif; padding: 22px; user-select: none; }
+  h1 { font-size: 20px; display: flex; align-items: center; gap: 10px; }
+  h1 .sub { font-size: 12px; color: var(--mut); font-weight: normal; }
+  .banner { margin: 14px 0; padding: 10px 14px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
+  .banner.game { border-color: var(--warn); background: #2a230f; }
+  .grid { display: grid; grid-template-columns: 1fr 380px; gap: 16px; align-items: start; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; color: #c8cdff; }
+  .bot { display: flex; align-items: center; gap: 10px; padding: 10px 8px; border-radius: 8px; }
+  .bot:nth-child(odd) { background: var(--card2); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .dot.online { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.stopped { background: var(--mut); }
+  .dot.errored { background: var(--err); box-shadow: 0 0 6px var(--err); }
+  .bot .name { font-weight: 600; min-width: 110px; }
+  .bot .meta { color: var(--mut); font-size: 12px; flex: 1; }
+  .btn { background: #2b2f3f; color: var(--txt); border: 1px solid var(--line); border-radius: 7px; padding: 4px 9px; cursor: pointer; font-size: 12px; }
+  .btn:hover { background: #353a4e; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); }
+  .btn.danger { background: #3d2224; border-color: #5c3336; }
+  .btn:disabled { opacity: .45; cursor: default; }
+  label.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--mut); cursor: pointer; white-space: nowrap; }
+  input[type=checkbox] { accent-color: var(--accent); }
+  .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; flex-wrap: wrap; }
+  .switch { position: relative; width: 40px; height: 22px; flex: none; }
+  .switch input { display: none; }
+  .switch span { position: absolute; inset: 0; background: #3a3f52; border-radius: 22px; transition: .15s; cursor: pointer; }
+  .switch span::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: .15s; }
+  .switch input:checked + span { background: var(--ok); }
+  .switch input:checked + span::after { left: 21px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-height: 180px; overflow-y: auto; }
+  .chip { background: #262a3a; border: 1px solid var(--line); border-radius: 14px; padding: 3px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+  .chip b { color: var(--err); cursor: pointer; font-weight: 700; }
+  input[type=text], input[type=number] { background: #12141d; color: var(--txt); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font-size: 13px; }
+  input[type=number] { width: 70px; }
+  .hint { color: var(--mut); font-size: 11.5px; margin-top: 6px; }
+  .stopped-banner { color: var(--warn); font-size: 12.5px; margin-top: 8px; }
+  .cardhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .cardhead h2 { margin-bottom: 0; }
+  .sechead { font-size: 12.5px; color: var(--mut); margin: 12px 0 4px; text-transform: uppercase; letter-spacing: .4px; }
+  .about-btn { margin-left: auto; }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.65); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal.hidden { display: none; }
+  .modal-box { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px; width: min(640px, 92vw); max-height: 84vh; overflow-y: auto; }
+  .modal-box h2 { font-size: 16px; color: #c8cdff; margin-bottom: 12px; }
+  .modal-box h3 { font-size: 13.5px; color: #c8cdff; margin: 14px 0 4px; }
+  .modal-box p { color: var(--txt); font-size: 13px; margin: 4px 0; }
+  .modal-box code { background: #12141d; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-size: 12px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <h1>🛡️ Hasu Panel <span class="sub">gestion des bots pm2 · mode jeu</span> <button class="btn about-btn" id="about-btn">ℹ️ À propos</button></h1>
+  <div id="banner" class="banner">Chargement…</div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="cardhead">
+        <h2>🤖 Bots (pm2)</h2>
+        <div style="display:flex;gap:6px">
+          <button class="btn primary" id="import-btn" title="Choisir le fichier principal du bot (index.js, bot.py…)">➕ Importer (fichier)</button>
+          <button class="btn" id="import-dir-btn" title="Choisir le DOSSIER du bot — le fichier principal est détecté automatiquement">📁 Importer (dossier)</button>
+        </div>
+      </div>
+      <div id="bots"></div>
+      <div class="hint">« Auto boot » : le bot est (re)mis en ligne à l'ouverture de session Windows. « Coupé en jeu » : ce bot est arrêté quand le mode jeu se déclenche (si « seulement les bots cochés »).</div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>🎮 Mode jeu</h2>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="gm-enabled"><span></span></label>
+          <div>Couper des bots quand un jeu est détecté</div>
+        </div>
+        <div class="row" style="margin-left:6px">
+          <label class="chk"><input type="radio" name="gm-scope" id="gm-all"> Tous les bots</label>
+          <label class="chk"><input type="radio" name="gm-scope" id="gm-some"> Seulement les bots cochés « Coupé en jeu »</label>
+        </div>
+        <div class="row">
+          <span style="color:var(--mut);font-size:12.5px">Relancer les bots</span>
+          <input type="number" id="gm-grace" min="10" max="3600" step="10">
+          <span style="color:var(--mut);font-size:12.5px">s après la fermeture du jeu</span>
+        </div>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="gm-soloskip"><span></span></label>
+          <div>Ignorer les jeux <b>solo</b> <span style="color:var(--mut);font-size:12px">(ne couper que si le jeu est vraiment en ligne)</span></div>
+        </div>
+        <div id="gm-stopped" class="stopped-banner"></div>
+
+        <h2 style="margin-top:16px">🌐 Faible usage internet</h2>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="gm-lownet"><span></span></label>
+          <div>Priorité réseau au jeu en ligne</div>
+        </div>
+        <div class="hint">Pendant une partie en ligne : les gros téléchargements des bots (listes anti-scam, sauvegardes chiffrées) sont mis en pause et leur priorité est abaissée — automatiquement plus strict si ta connexion est lente. Tout revient à la normale à la fin de la partie. Indépendant du mode jeu : utile pour les bots que tu laisses tourner.</div>
+
+        <h2 style="margin-top:16px">🕹️ Jeux détectés (process)</h2>
+        <div class="row">
+          <input type="text" id="game-add" placeholder="MonJeu.exe" style="flex:1">
+          <button class="btn primary" id="game-add-btn">Ajouter</button>
+        </div>
+        <div class="row">
+          <button class="btn" id="game-pick-btn" title="Choisir parmi les fenêtres ouvertes (lance le jeu d'abord)">📋 Programmes ouverts</button>
+          <button class="btn" id="game-exe-btn" title="Parcourir le disque pour choisir le .exe du jeu">📁 Choisir un .exe</button>
+          <button class="btn" id="game-scan-btn" title="Cherche les jeux installés (Steam, Epic) absents de la liste">🔍 Scanner</button>
+        </div>
+        <div id="game-suggest" class="stopped-banner"></div>
+        <div class="chips" id="games"></div>
+        <div class="hint">« Programmes ouverts » liste ce qui tourne sur TON PC (jeu ou logiciel inconnu de la liste par défaut) : lance le jeu puis choisis-le — c'est le plus précis. « Scanner » fouille les bibliothèques Steam/Epic (1×/jour automatique, jamais en continu).</div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>⚙️ Réglages</h2>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="set-autolaunch"><span></span></label>
+          <div>Lancer le panel au démarrage de Windows <span id="dev-note" style="color:var(--mut);font-size:11px"></span></div>
+        </div>
+        <div class="row">
+          <span style="color:var(--mut);font-size:12.5px">Vérifier les jeux / bots toutes les</span>
+          <input type="number" id="set-poll" min="5" max="120" step="5">
+          <span style="color:var(--mut);font-size:12.5px">secondes</span>
+        </div>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="set-scanauto"><span></span></label>
+          <div>Chercher de nouveaux jeux installés <b>1×/jour</b> <span id="set-scaninfo" style="color:var(--mut);font-size:11px"></span></div>
+        </div>
+        <div class="hint">La vérification ci-dessus ne lit que la liste des process (très léger). Le scan disque des jeux, lui, ne tourne <b>jamais en continu</b> : 1×/jour maximum, ou via le bouton « 🔍 Scanner ».</div>
+
+        <h2 style="margin-top:16px">🎮 Rich Presence Discord</h2>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="set-rpc"><span></span></label>
+          <div>Afficher « 🤖 Gère X bots en ligne » sur mon profil Discord</div>
+        </div>
+        <div class="row">
+          <input type="text" id="set-rpc-id" placeholder="Application ID Discord (18-19 chiffres)" style="flex:1" maxlength="40">
+        </div>
+        <div class="hint">Crée une appli sur <b>discord.com/developers/applications</b> → onglet <b>General Information</b> → copie l'<b>Application ID</b> et colle-le ici. Discord doit être ouvert sur ce PC.<span id="rpc-status"></span></div>
+      </div>
+    </div>
+  </div>
+
+<div id="modal" class="modal hidden"><div class="modal-box" id="modal-box"></div></div>
+<script src="app.js"></script>
+</body>
+</html>

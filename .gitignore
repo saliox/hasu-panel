@@ -1,0 +1,11 @@
+# Dépendances & build
+node_modules/
+dist/
+
+# Données locales / runtime (jamais versionnées)
+panel-config.json
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
