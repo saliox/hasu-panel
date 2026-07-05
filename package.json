@@ -1,13 +1,15 @@
 {
   "name": "hasu-panel",
-  "version": "1.5.0",
-  "description": "Panel de gestion des bots pm2 (Hasu) — auto-démarrage + mode jeu",
+  "version": "1.6.1",
+  "description": "Panel de gestion des bots pm2 (Hasu) — auto-démarrage + mode jeu + auto-update",
   "main": "main.js",
   "author": "saliox",
   "license": "UNLICENSED",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win dir"
+    "dist": "electron-builder --win dir",
+    "installer": "electron-builder --win nsis",
+    "publish": "electron-builder --win nsis --publish always"
   },
   "build": {
     "appId": "hasu.panel",
@@ -17,9 +19,24 @@
       "en-US"
     ],
     "win": {
-      "target": "dir",
+      "target": "nsis",
       "icon": "icon.ico"
     },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "runAfterFinish": true,
+      "artifactName": "HasuPanel-Setup-${version}.${ext}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "saliox",
+        "repo": "hasu-panel",
+        "releaseType": "release"
+      }
+    ],
     "files": [
       "main.js",
       "preload.js",
@@ -27,6 +44,9 @@
       "ui/**",
       "icon.png"
     ]
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
   },
   "devDependencies": {
     "electron": "^37.2.0",

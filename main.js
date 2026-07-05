@@ -12,6 +12,25 @@ const rpc = require('./discordrpc'); // Rich Presence Discord (IPC natif, sans d
 const IS_STARTUP = process.argv.includes('--startup'); // lancé par l'ouverture de session Windows
 const START_HIDDEN = process.argv.includes('--hidden');
 
+// ---------- Auto-update (electron-updater, releases GitHub saliox/hasu-panel) ----------
+// Sans écran : télécharge en fond et applique la MAJ au prochain redémarrage du panel (donc au
+// prochain démarrage du PC, puisqu'il se lance au logon). Pensé pour « installer chez un ami et
+// oublier ». Ne s'active QUE dans la version installée (NSIS) ; ignoré en dev / build « dir ».
+let updateReady = false;
+const setupAutoUpdate = () => {
+  if (!app.isPackaged) return;
+  let autoUpdater;
+  try { ({ autoUpdater } = require('electron-updater')); } catch (e) { log('updater indispo', e.message); return; }
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;      // la MAJ s'installe à la fermeture (donc au reboot)
+  autoUpdater.on('update-available', (i) => log('MAJ disponible :', i?.version));
+  autoUpdater.on('update-downloaded', (i) => { updateReady = true; log('MAJ téléchargée :', i?.version, '→ appliquée au prochain démarrage'); updateTray(); });
+  autoUpdater.on('error', (e) => log('updater erreur :', e?.message || e));
+  const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
+  setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
+  setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)
+};
+
 const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 const NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/; // noms pm2 autorisés (jamais d'espace ni de quote → sûr avec shell)
 const EXE_RE = /^[A-Za-z0-9 _.()+'-]{1,80}\.exe$/i; // noms de process de jeu autorisés
@@ -541,6 +560,7 @@ const updateTray = () => {
       label: `Mode jeu : ${cfg.gameMode.enabled ? 'activé ✔' : 'désactivé'}`,
       click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await exitGameMode(); updateTray(); }
     },
+    ...(updateReady ? [{ label: '🔄 Mise a jour prete', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
     { type: 'separator' },
     { label: 'Quitter', click: () => { quitting = true; app.quit(); } } // le nettoyage passe par before-quit (restaure les bots + drapeaux)
   ]));
@@ -755,6 +775,7 @@ else {
     updateTray();
     applyAutoLaunch();
     startRpc(); // Rich Presence Discord (si activée + App ID configuré)
+    setupAutoUpdate(); // auto-update en fond (version installee uniquement)
     if (!START_HIDDEN) showWindow();
 
     if (IS_STARTUP) {
