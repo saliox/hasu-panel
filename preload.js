@@ -18,5 +18,6 @@ contextBridge.exposeInMainWorld('panel', {
   ignoreGame: (exe) => ipcRenderer.invoke('panel:ignoreGame', exe),
   setSetting: (key, value) => ipcRenderer.invoke('panel:setSetting', { key, value }),
   checkUpdate: () => ipcRenderer.invoke('panel:checkUpdate'),
-  applyUpdate: () => ipcRenderer.invoke('panel:applyUpdate')
+  applyUpdate: () => ipcRenderer.invoke('panel:applyUpdate'),
+  installPm2: () => ipcRenderer.invoke('panel:installPm2')
 });

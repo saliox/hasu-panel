@@ -113,6 +113,21 @@ const loadCfg = () => {
 };
 const saveCfg = () => { try { fs.writeFileSync(cfgPath(), JSON.stringify(cfg, null, 2)); } catch (e) { log('saveCfg', e.message); } };
 
+// ---------- Détection de la chaîne d'outils (Node + pm2) ----------
+// Chez un ami, pm2 (voire Node) peut ne pas être installé → le panel affichait juste « Aucun process »,
+// ce qui laisse croire à un bug. On détecte l'absence et on propose de l'installer.
+let toolchain = { node: true, pm2: true };
+const probeToolchain = () => new Promise((resolve) => {
+  // pm2 accessible via le PATH ?
+  execFile('pm2', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (err, out) => {
+    if (!err && /\d+\.\d+/.test(String(out || ''))) return resolve({ node: true, pm2: true });
+    const pm2AtNpm = (() => { try { return fs.existsSync(PM2); } catch { return false; } })();
+    execFile('node', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (e2, o2) => {
+      resolve({ node: !e2 && /v\d+/.test(String(o2 || '')), pm2: pm2AtNpm });
+    });
+  });
+});
+
 // ---------- pm2 ----------
 // shell:true nécessaire pour lancer un .cmd → chaque argument est validé AVANT (aucune injection possible).
 // Le chemin de pm2.cmd est ENTOURÉ DE GUILLEMETS : sous shell, Node ne cite pas le fichier, donc un
@@ -593,6 +608,7 @@ ipcMain.handle('panel:status', () => ({
   updatedAt: statusCache.updatedAt,
   updateReady,
   updateStatus: lastUpdateStatus,
+  toolchain,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
   cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
@@ -764,6 +780,20 @@ ipcMain.handle('panel:applyUpdate', () => {
   return { ok: true };
 });
 
+// Installe pm2 globalement (bouton « Installer pm2 » quand il manque). Sans admin : npm installe dans le
+// préfixe utilisateur (%APPDATA%\npm). Nécessite Node/npm ; sinon on renvoie 'no-node' (guider vers nodejs.org).
+ipcMain.handle('panel:installPm2', async () => {
+  if (!toolchain.node) return { ok: false, reason: 'no-node' };
+  const r = await new Promise((resolve) => {
+    execFile('npm', ['install', '-g', 'pm2'], { shell: true, windowsHide: true, timeout: 240000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
+      resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim().slice(-600) });
+    });
+  });
+  log('install pm2 :', r.ok ? 'OK' : 'échec', r.out.slice(0, 200));
+  if (r.ok) { toolchain = await probeToolchain(); await tick().catch(() => {}); } // re-sonde + rafraîchit la liste
+  return { ok: r.ok && toolchain.pm2, out: r.out };
+});
+
 // ---------- Boucle ----------
 let pollTimer = null;
 const restartPoll = () => {
@@ -801,6 +831,7 @@ else {
     applyAutoLaunch();
     startRpc(); // Rich Presence Discord (si activée + App ID configuré)
     setupAutoUpdate(); // auto-update en fond (version installee uniquement)
+    probeToolchain().then((t) => { toolchain = t; }).catch(() => {}); // détecte Node/pm2 (guide si absent)
     if (!START_HIDDEN) showWindow();
 
     if (IS_STARTUP) {
