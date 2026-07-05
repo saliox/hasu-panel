@@ -149,6 +149,14 @@
           <input type="text" id="set-rpc-id" placeholder="Application ID Discord (18-19 chiffres)" style="flex:1" maxlength="40">
         </div>
         <div class="hint">Crée une appli sur <b>discord.com/developers/applications</b> → onglet <b>General Information</b> → copie l'<b>Application ID</b> et colle-le ici. Discord doit être ouvert sur ce PC.<span id="rpc-status"></span></div>
+
+        <h2 style="margin-top:16px">🔄 Mises à jour</h2>
+        <div class="row">
+          <span style="color:var(--mut);font-size:12.5px">Version : <b id="upd-version">—</b></span>
+          <button class="btn primary" id="upd-check">Vérifier les mises à jour</button>
+          <button class="btn" id="upd-apply" style="display:none">Redémarrer & appliquer</button>
+        </div>
+        <div id="upd-status" class="hint"></div>
       </div>
     </div>
   </div>

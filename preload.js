@@ -16,5 +16,7 @@ contextBridge.exposeInMainWorld('panel', {
   pickExe: () => ipcRenderer.invoke('panel:pickExe'),
   scanGames: () => ipcRenderer.invoke('panel:scanGames'),
   ignoreGame: (exe) => ipcRenderer.invoke('panel:ignoreGame', exe),
-  setSetting: (key, value) => ipcRenderer.invoke('panel:setSetting', { key, value })
+  setSetting: (key, value) => ipcRenderer.invoke('panel:setSetting', { key, value }),
+  checkUpdate: () => ipcRenderer.invoke('panel:checkUpdate'),
+  applyUpdate: () => ipcRenderer.invoke('panel:applyUpdate')
 });

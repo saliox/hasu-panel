@@ -21,6 +21,7 @@ const fmtNet = (b) => {
 
 let cur = null; // dernier statut reçu
 let pending = false;
+let updBusy = false, updMsg = ''; // état du bouton « Vérifier les mises à jour »
 
 const render = (st) => {
   cur = st;
@@ -89,6 +90,13 @@ const render = (st) => {
   $('set-rpc').checked = st.cfg.discordRpc !== false;
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
   $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.' : (st.cfg.discordAppId ? ' — ✅ activée.' : ' — ⚠️ colle ton Application ID pour l\'activer.');
+
+  // Mises à jour
+  $('upd-version').textContent = st.cfg.version || '—';
+  const applyBtn = $('upd-apply');
+  applyBtn.style.display = st.updateReady ? '' : 'none';
+  if (st.updateReady && !updBusy) $('upd-status').innerHTML = '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».';
+  else if (!updBusy && !st.updateReady && !updMsg) $('upd-status').textContent = st.cfg.packaged ? '' : 'ℹ️ L\'auto-update est actif seulement dans la version installée (Setup.exe).';
 };
 
 const refresh = async () => {
@@ -175,6 +183,31 @@ const startImport = async (picker) => {
 };
 $('import-btn').addEventListener('click', () => startImport(window.panel.importPick));
 $('import-dir-btn').addEventListener('click', () => startImport(window.panel.importPickDir));
+
+// Mises à jour : vérification manuelle + application.
+$('upd-check').addEventListener('click', async () => {
+  updBusy = true; updMsg = '';
+  $('upd-check').disabled = true;
+  $('upd-status').textContent = '⏳ Recherche de mise à jour…';
+  let r; try { r = await window.panel.checkUpdate(); } catch { r = { state: 'error' }; }
+  const msg = {
+    dev: 'ℹ️ L\'auto-update ne fonctionne que dans la version installée (Setup.exe), pas en développement.',
+    uptodate: `✅ Tu as déjà la dernière version (${r.current || ''}).`,
+    available: `⬇️ Nouvelle version <b>${r.version || ''}</b> trouvée — téléchargement en cours, elle sera prête dans un instant.`,
+    downloaded: '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».',
+    error: `⚠️ Impossible de vérifier maintenant${r.message ? ' (' + r.message + ')' : ''}. Réessaie plus tard.`,
+  }[r.state] || '⚠️ Réponse inattendue.';
+  updMsg = msg;
+  $('upd-status').innerHTML = msg;
+  $('upd-check').disabled = false;
+  updBusy = false;
+  refresh();
+});
+$('upd-apply').addEventListener('click', async () => {
+  $('upd-apply').disabled = true;
+  $('upd-status').textContent = '🔄 Application de la mise à jour et redémarrage…';
+  await window.panel.applyUpdate();
+});
 document.addEventListener('change', async (e) => {
   const t = e.target;
   if (t.dataset?.bot && t.dataset?.key) { await window.panel.setBot(t.dataset.bot, t.dataset.key, t.checked); await refresh(); return; }

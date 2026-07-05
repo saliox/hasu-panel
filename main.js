@@ -16,16 +16,17 @@ const START_HIDDEN = process.argv.includes('--hidden');
 // Sans écran : télécharge en fond et applique la MAJ au prochain redémarrage du panel (donc au
 // prochain démarrage du PC, puisqu'il se lance au logon). Pensé pour « installer chez un ami et
 // oublier ». Ne s'active QUE dans la version installée (NSIS) ; ignoré en dev / build « dir ».
-let updateReady = false;
+let updateReady = false, updaterRef = null, lastUpdateStatus = null;
 const setupAutoUpdate = () => {
   if (!app.isPackaged) return;
-  let autoUpdater;
-  try { ({ autoUpdater } = require('electron-updater')); } catch (e) { log('updater indispo', e.message); return; }
+  try { ({ autoUpdater: updaterRef } = require('electron-updater')); } catch (e) { log('updater indispo', e.message); return; }
+  const autoUpdater = updaterRef;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;      // la MAJ s'installe à la fermeture (donc au reboot)
-  autoUpdater.on('update-available', (i) => log('MAJ disponible :', i?.version));
-  autoUpdater.on('update-downloaded', (i) => { updateReady = true; log('MAJ téléchargée :', i?.version, '→ appliquée au prochain démarrage'); updateTray(); });
-  autoUpdater.on('error', (e) => log('updater erreur :', e?.message || e));
+  autoUpdater.on('update-available', (i) => { lastUpdateStatus = { state: 'available', version: i?.version }; log('MAJ disponible :', i?.version); });
+  autoUpdater.on('update-not-available', () => { lastUpdateStatus = { state: 'uptodate' }; });
+  autoUpdater.on('update-downloaded', (i) => { updateReady = true; lastUpdateStatus = { state: 'downloaded', version: i?.version }; log('MAJ téléchargée :', i?.version, '→ appliquée au prochain démarrage'); updateTray(); });
+  autoUpdater.on('error', (e) => { lastUpdateStatus = { state: 'error', message: e?.message || String(e) }; log('updater erreur :', e?.message || e); });
   const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
   setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
   setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)
@@ -590,6 +591,8 @@ ipcMain.handle('panel:status', () => ({
   online: statusCache.online,
   lowNetActive: !!cfg.lowNetApplied,
   updatedAt: statusCache.updatedAt,
+  updateReady,
+  updateStatus: lastUpdateStatus,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
   cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
@@ -737,6 +740,28 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
   if (key === 'discordAppId') { cfg.discordAppId = String(value || '').trim().slice(0, 40); saveCfg(); startRpc(); return { ok: true }; }
   return { ok: false };
+});
+
+// Vérification MANUELLE des mises à jour (bouton « Vérifier les mises à jour »).
+// Renvoie un état lisible : dev (non installé), uptodate, available (télécharge), downloaded (prête), error.
+ipcMain.handle('panel:checkUpdate', async () => {
+  if (!app.isPackaged) return { state: 'dev', current: app.getVersion() };
+  if (updateReady) return { state: 'downloaded', current: app.getVersion(), version: lastUpdateStatus?.version };
+  if (!updaterRef) { try { ({ autoUpdater: updaterRef } = require('electron-updater')); } catch (e) { return { state: 'error', message: e.message }; } }
+  try {
+    const r = await updaterRef.checkForUpdates();
+    const latest = r?.updateInfo?.version;
+    const isNewer = latest && latest !== app.getVersion();
+    return { state: isNewer ? 'available' : 'uptodate', current: app.getVersion(), version: latest };
+  } catch (e) { return { state: 'error', current: app.getVersion(), message: e?.message || String(e) }; }
+});
+
+// Applique la mise à jour téléchargée et redémarre (bouton « Redémarrer & appliquer »).
+ipcMain.handle('panel:applyUpdate', () => {
+  if (!updateReady || !updaterRef) return { ok: false };
+  quitting = true;
+  setTimeout(() => { try { updaterRef.quitAndInstall(); } catch {} }, 200);
+  return { ok: true };
 });
 
 // ---------- Boucle ----------
