@@ -17,6 +17,13 @@ const START_HIDDEN = process.argv.includes('--hidden');
 // prochain démarrage du PC, puisqu'il se lance au logon). Pensé pour « installer chez un ami et
 // oublier ». Ne s'active QUE dans la version installée (NSIS) ; ignoré en dev / build « dir ».
 let updateReady = false, updaterRef = null, lastUpdateStatus = null;
+// Vrai si a > b en version sémantique X.Y.Z (comparaison numérique champ par champ).
+const semverGt = (a, b) => {
+  const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
+  return false;
+};
 const setupAutoUpdate = () => {
   if (!app.isPackaged) return;
   try { ({ autoUpdater: updaterRef } = require('electron-updater')); } catch (e) { log('updater indispo', e.message); return; }
@@ -181,19 +188,37 @@ const listProcs = () => new Promise((resolve) => {
 // Jeu EN LIGNE ou solo ? → au moins une connexion TCP établie du process vers une IP publique.
 // Heuristique honnête : couvre les jeux TCP et les jeux « toujours en ligne » (services/lobby) ;
 // un jeu 100 % hors-ligne n'a aucune connexion sortante → mode jeu non déclenché.
+// Une IP « publique » = ni privée/locale/loopback (IPv4 ET IPv6). Sert à distinguer une vraie session
+// multijoueur (connexion vers Internet) d'un jeu solo/LAN.
+const isPublicIp = (raw) => {
+  const ip = String(raw || '').replace(/^\[|\]$/g, '').toLowerCase(); // retire les crochets IPv6
+  if (ip.includes('.') && !ip.includes(':')) { // IPv4
+    if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.|255\.)/.test(ip)) return false;
+    const b2 = Number(ip.split('.')[1]);
+    if (ip.startsWith('172.') && b2 >= 16 && b2 <= 31) return false;
+    return true;
+  }
+  if (ip.includes(':')) { // IPv6
+    if (ip === '::1' || ip === '::') return false;          // loopback / non spécifié
+    if (ip.startsWith('fe80')) return false;                // link-local
+    if (/^f[cd]/.test(ip)) return false;                    // unique-local (fc00::/7)
+    if (ip.startsWith('::ffff:')) return isPublicIp(ip.slice(7)); // IPv4 mappée
+    return true;                                            // adresse IPv6 globale
+  }
+  return false;
+};
+
 const hasOnlineActivity = (pids) => new Promise((resolve) => {
   if (!Array.isArray(pids) || !pids.length) return resolve(false);
   execFile('netstat.exe', ['-ano', '-p', 'tcp'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
     if (err || !out) return resolve(false);
     const set = new Set(pids.map(String));
     for (const line of String(out).split('\n')) {
-      const m = line.match(/^\s*TCP\s+\S+\s+(\d{1,3}(?:\.\d{1,3}){3}):\d+\s+ESTABLISHED\s+(\d+)\s*$/i);
-      if (!m || !set.has(m[2])) continue;
-      const ip = m[1];
-      if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(ip)) continue; // adresses locales/privées
-      const b2 = Number(ip.split('.')[1]);
-      if (ip.startsWith('172.') && b2 >= 16 && b2 <= 31) continue;
-      return resolve(true);
+      const t = line.trim().split(/\s+/); // Proto Local Foreign State PID (IPv4 comme IPv6)
+      if (t.length < 5 || t[0].toUpperCase() !== 'TCP' || t[3].toUpperCase() !== 'ESTABLISHED') continue;
+      if (!set.has(t[4])) continue;                          // pas un de nos PID
+      const foreign = t[2].replace(/:[0-9]+$/, '');          // retire le :port final (IPv4 ou [IPv6])
+      if (isPublicIp(foreign)) return resolve(true);
     }
     resolve(false);
   });
@@ -767,8 +792,9 @@ ipcMain.handle('panel:checkUpdate', async () => {
   try {
     const r = await updaterRef.checkForUpdates();
     const latest = r?.updateInfo?.version;
-    const isNewer = latest && latest !== app.getVersion();
-    return { state: isNewer ? 'available' : 'uptodate', current: app.getVersion(), version: latest };
+    // Comparaison sémantique : « dispo » seulement si la version publiée est STRICTEMENT plus récente
+    // (une version identique ou plus ancienne ne doit jamais s'afficher comme une mise à jour).
+    return { state: semverGt(latest, app.getVersion()) ? 'available' : 'uptodate', current: app.getVersion(), version: latest };
   } catch (e) { return { state: 'error', current: app.getVersion(), message: e?.message || String(e) }; }
 });
 

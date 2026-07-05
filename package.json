@@ -1,6 +1,6 @@
 {
   "name": "hasu-panel",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Panel de gestion des bots pm2 (Hasu) — auto-démarrage + mode jeu + auto-update",
   "main": "main.js",
   "author": "saliox",
