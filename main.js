@@ -95,8 +95,11 @@ const saveCfg = () => { try { fs.writeFileSync(cfgPath(), JSON.stringify(cfg, nu
 
 // ---------- pm2 ----------
 // shell:true nécessaire pour lancer un .cmd → chaque argument est validé AVANT (aucune injection possible).
+// Le chemin de pm2.cmd est ENTOURÉ DE GUILLEMETS : sous shell, Node ne cite pas le fichier, donc un
+// nom d'utilisateur avec espace (%APPDATA% contient un espace) tronquerait la commande. cmd.exe parse
+// correctement « "C:\...\npm\pm2.cmd" jlist » (et le cas sans espace reste valide).
 const pm2Raw = (args) => new Promise((resolve) => {
-  execFile(PM2, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
+  execFile(`"${PM2}"`, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
     resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
   });
 });
@@ -258,7 +261,11 @@ const importBot = async (name, script) => {
   const existing = await pm2List();
   if (existing.some((b) => b.name.toLowerCase() === name.toLowerCase())) return { ok: false, error: `« ${name} » existe déjà dans pm2 — choisis un autre nom` };
   const dir = path.dirname(script);
-  const r = await pm2Raw(['start', `"${script}"`, '--name', name, '--cwd', `"${dir}"`]);
+  // Un script à la racine d'un disque (D:\bot.js) donne dir = « D:\ » : cité tel quel → « "D:\" »,
+  // et cmd.exe interprète le \" final comme un guillemet échappé (fusion de jetons). On ajoute un « . »
+  // à un backslash final (D:\ → D:\.) pour que --cwd désigne bien la racine sans casser le parsing.
+  const cwd = dir.endsWith('\\') ? `${dir}.` : dir;
+  const r = await pm2Raw(['start', `"${script}"`, '--name', name, '--cwd', `"${cwd}"`]);
   if (!r.ok) { log('import ÉCHEC:', name, script, '—', r.out.slice(0, 400)); return { ok: false, error: 'pm2 a refusé le démarrage — vérifie le fichier (détails dans panel.log)' }; }
   await pm2(['save']); // survivra au redémarrage du PC (pm2 resurrect)
   if (!cfg.imported.includes(name)) cfg.imported.push(name);
@@ -456,9 +463,15 @@ const tick = async () => {
 const bootEnforce = async () => {
   let list = await pm2List();
   if (!list.length) { // le .cmd « pm2 resurrect » de la Startup n'est peut-être pas encore passé
-    await pm2(['resurrect']);
-    await new Promise((r) => setTimeout(r, 5000));
-    list = await pm2List();
+    // Boot lent : au lieu d'abandonner après un seul délai de 5 s, on réessaie resurrect + relecture
+    // plusieurs fois avec des délais croissants (~40 s cumulés) jusqu'à voir des process.
+    const delays = [3000, 5000, 8000, 12000, 12000];
+    for (let i = 0; i < delays.length && !list.length; i++) {
+      await pm2(['resurrect']);
+      await new Promise((r) => setTimeout(r, delays[i]));
+      list = await pm2List();
+    }
+    if (!list.length) log('bootEnforce: aucun process pm2 après plusieurs resurrect — auto-démarrage abandonné pour cette session');
   }
   for (const b of list) {
     const c = cfg.bots[b.name];
@@ -529,7 +542,7 @@ const updateTray = () => {
       click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await exitGameMode(); updateTray(); }
     },
     { type: 'separator' },
-    { label: 'Quitter', click: async () => { quitting = true; if (cfg.lowNetApplied) await clearLowNet().catch(() => {}); app.quit(); } }
+    { label: 'Quitter', click: () => { quitting = true; app.quit(); } } // le nettoyage passe par before-quit (restaure les bots + drapeaux)
   ]));
 };
 
@@ -646,11 +659,21 @@ ipcMain.handle('panel:importPickDir', async () => {
 ipcMain.handle('panel:importBot', (_e, { name, script } = {}) => importBot(String(name || '').trim(), script));
 ipcMain.handle('panel:removeBot', (_e, { name } = {}) => removeBot(String(name || '')));
 
+// Verrou par bot : le render() du renderer reconstruit le DOM et réactive les boutons, donc un
+// double-clic pourrait lancer deux start/stop concurrents sur le même bot (état final indéterminé).
+// On refuse ici toute nouvelle action tant qu'une action est déjà en cours pour ce bot.
+const actionsInFlight = new Set();
 ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
   if (!NAME_RE.test(String(name || '')) || !['start', 'stop', 'restart'].includes(action)) return { ok: false };
-  const r = await pm2([action, name]);
-  statusCache.bots = await pm2List();
-  return { ok: r.ok };
+  if (actionsInFlight.has(name)) return { ok: false, out: 'action en cours' };
+  actionsInFlight.add(name);
+  try {
+    const r = await pm2([action, name]);
+    statusCache.bots = await pm2List();
+    return { ok: r.ok };
+  } finally {
+    actionsInFlight.delete(name);
+  }
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {
@@ -745,6 +768,20 @@ else {
     if (added) saveCfg();
     restartPoll();
   });
-  app.on('before-quit', () => { quitting = true; });
+  // Nettoyage à la fermeture : on relance les bots coupés par le mode jeu et on efface les drapeaux
+  // (watchdog + faible usage internet). Sinon les bots resteraient éteints et les alertes crash
+  // suspendues indéfiniment. before-quit peut être asynchrone → on diffère la sortie le temps du nettoyage.
+  let cleanedUp = false;
+  app.on('before-quit', (e) => {
+    quitting = true;
+    if (cleanedUp) return; // nettoyage déjà fait → on laisse Electron quitter
+    e.preventDefault();
+    (async () => {
+      try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.length) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
+      try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
+      cleanedUp = true;
+      app.quit();
+    })();
+  });
   app.on('window-all-closed', () => { /* on reste dans le tray */ });
 }
