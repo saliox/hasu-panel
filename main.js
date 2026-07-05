@@ -560,7 +560,7 @@ const updateTray = () => {
       label: `Mode jeu : ${cfg.gameMode.enabled ? 'activé ✔' : 'désactivé'}`,
       click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await exitGameMode(); updateTray(); }
     },
-    ...(updateReady ? [{ label: '🔄 Mise a jour prete', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
+    ...(updateReady ? [{ label: '🔄 Mise à jour prête — appliquer & redémarrer', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
     { type: 'separator' },
     { label: 'Quitter', click: () => { quitting = true; app.quit(); } } // le nettoyage passe par before-quit (restaure les bots + drapeaux)
   ]));
