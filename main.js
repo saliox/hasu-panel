@@ -89,7 +89,8 @@ const DEFAULTS = {
   bots: {},                 // { name: { auto: true, gameStop: false } }
   gameMode: { enabled: false, stopAll: false, graceSec: 60, soloSkip: true }, // soloSkip : ne rien couper si le jeu n'est pas EN LIGNE
   games: DEFAULT_GAMES,
-  pollSec: 10,
+  pollSec: 10,              // cadence de sondage quand la fenêtre est au 1er plan (réactif)
+  idlePollSec: 30,          // cadence ralentie quand le panel est dans le tray (personne ne regarde → moins de CPU/batterie)
   autoLaunch: true,
   lowNet: false,            // mode « faible usage internet » : priorité réseau au jeu en ligne
   lowNetApplied: false,     // persisté → on sait restaurer les priorités après un crash du panel
@@ -631,7 +632,7 @@ const updateTray = () => {
 
 // ---------- Fenêtre ----------
 const showWindow = () => {
-  if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); return; } // restaure depuis le tray/minimisé
+  if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); restartPoll(true); return; } // restaure depuis le tray + rafraîchit tout de suite
   win = new BrowserWindow({
     width: 1020, height: 760, minWidth: 860, minHeight: 560,
     backgroundColor: '#0f1117',
@@ -665,7 +666,7 @@ ipcMain.handle('panel:status', () => ({
   updateStatus: lastUpdateStatus,
   toolchain,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
-  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
+  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
 
 // Scan disque à la demande (bouton « Scanner ») + gestion des suggestions.
@@ -806,6 +807,7 @@ ipcMain.handle('panel:removeGame', (_e, exe) => {
 ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'autoLaunch') { cfg.autoLaunch = !!value; saveCfg(); applyAutoLaunch(); return { ok: true }; }
   if (key === 'pollSec') { cfg.pollSec = Math.max(5, Math.min(120, Math.floor(Number(value) || 10))); saveCfg(); restartPoll(); return { ok: true }; }
+  if (key === 'idlePollSec') { cfg.idlePollSec = Math.max(15, Math.min(300, Math.floor(Number(value) || 30))); saveCfg(); restartPoll(); return { ok: true }; }
   if (key === 'lowNet') { cfg.lowNet = !!value; saveCfg(); return { ok: true }; } // le tick applique/retire tout seul
   if (key === 'scanAuto') { cfg.scanAuto = !!value; saveCfg(); return { ok: true }; }
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
@@ -850,12 +852,31 @@ ipcMain.handle('panel:installPm2', async () => {
   return { ok: r.ok && toolchain.pm2, out: r.out };
 });
 
-// ---------- Boucle ----------
+// ---------- Boucle (cadence adaptative) ----------
+// Fenêtre au 1er plan → cadence normale (réactif). Panel dans le tray (personne ne regarde) → cadence
+// ralentie = moins de spawns tasklist/pm2 = moins de CPU/batterie sur portable. Exception : si une
+// bascule AUTOMATIQUE dépend du sondage (mode jeu ou faible usage internet), on garde un rythme réactif
+// (~15 s) même caché, sinon un jeu qui se lance mettrait jusqu'à 30 s à couper les bots.
 let pollTimer = null;
-const restartPoll = () => {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => { tick().catch((e) => log('tick fatal', e.message)); }, cfg.pollSec * 1000);
-};
+let pollEpoch = 0;
+function pollDelayMs() {
+  const visible = !!(win && !win.isDestroyed() && win.isVisible());
+  if (visible) return Math.max(2, cfg.pollSec) * 1000;
+  const idle = Math.max(cfg.pollSec, cfg.idlePollSec || 30);
+  const responsive = cfg.gameMode.enabled || cfg.lowNet; // ces features réagissent à la détection → restent vives
+  return (responsive ? Math.min(idle, 15) : idle) * 1000;
+}
+function restartPoll(immediate = false) {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  const epoch = ++pollEpoch; // invalide toute chaîne de timers précédente (évite deux boucles en parallèle)
+  const loop = () => {
+    tick().catch((e) => log('tick fatal', e.message)).finally(() => {
+      if (epoch !== pollEpoch) return; // un restartPoll plus récent a pris le relais → cette chaîne s'arrête
+      pollTimer = setTimeout(loop, pollDelayMs());
+    });
+  };
+  pollTimer = setTimeout(loop, immediate ? 0 : pollDelayMs());
+}
 
 // ---------- Démarrage ----------
 if (process.argv.includes('--selftest')) {
