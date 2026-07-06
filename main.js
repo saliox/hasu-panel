@@ -2,7 +2,7 @@
 // (quand un jeu multijoueur est détecté, coupe tous les bots ou ceux cochés, puis les relance).
 // Electron, aucune dépendance externe. Sécurité : noms pm2/exe validés par regex (anti-injection),
 // contextIsolation activé, aucun contenu distant chargé.
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell } = require('electron');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -19,8 +19,10 @@ const START_HIDDEN = process.argv.includes('--hidden');
 let updateReady = false, updaterRef = null, lastUpdateStatus = null;
 // Vrai si a > b en version sémantique X.Y.Z (comparaison numérique champ par champ).
 const semverGt = (a, b) => {
-  const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
-  const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+  // Retire un éventuel préfixe "v"/"V" (ex. "v1.8.0") : sinon parseInt("v1", 10) vaut NaN||0 = 0,
+  // et une version distante réellement plus récente pouvait s'afficher comme plus ancienne/égale.
+  const pa = String(a || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
   return false;
 };
@@ -42,6 +44,19 @@ const setupAutoUpdate = () => {
 const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 const NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/; // noms pm2 autorisés (jamais d'espace ni de quote → sûr avec shell)
 const EXE_RE = /^[A-Za-z0-9 _.()+'-]{1,80}\.exe$/i; // noms de process de jeu autorisés
+// Noms interdits comme clé de cfg.bots (objet simple) : "__proto__" via `cfg.bots[name] = …`
+// ne crée PAS une propriété normale, il réassigne le PROTOTYPE de cfg.bots (pollution en mémoire,
+// affecte la lecture de tout autre nom non configuré ensuite). "constructor"/"prototype" par
+// prudence pour la même raison. Les noms de périphériques Windows (CON, COM1…) sont aussi rejetés :
+// pm2 dérive son nom de fichier de log du nom du process, et un fichier littéralement nommé "CON"
+// bloque/plante les I/O sous Windows.
+const RESERVED_NAMES = new Set([
+  '__proto__', 'constructor', 'prototype',
+  'con', 'prn', 'aux', 'nul',
+  'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
+  'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
+]);
+const isSafeName = (n) => typeof n === 'string' && NAME_RE.test(n) && !RESERVED_NAMES.has(n.toLowerCase());
 
 // Dossier « data » du bot saliox (drapeaux de coordination panel ↔ bot). Par défaut : <profil>\Desktop\saliox bot\data
 // (résolu via os.homedir → aucun nom d'utilisateur codé en dur). Personnalisable via la variable d'env HASU_SALIOX_DATA.
@@ -94,6 +109,15 @@ let lastGameSeen = null, lastGameAt = 0;
 let sessionOnline = false; // le jeu détecté a une vraie connexion Internet (session multijoueur)
 let statusCache = { bots: [], game: null, online: false, updatedAt: 0 };
 let busy = false; // évite deux bascules mode jeu simultanées
+// Verrou partagé par TOUS les appelants de enterGameMode/exitGameMode (tick, bascule manuelle
+// dans le tray, IPC panel:setGameMode) — avant, seul tick() posait `busy`, donc un clic manuel
+// pendant un tick en cours pouvait s'entrelacer avec lui (état pm2 final incohérent avec le
+// choix réel de l'utilisateur). `fn` est sauté silencieusement si une transition est déjà en cours.
+const withGameLock = async (fn) => {
+  if (busy) return;
+  busy = true;
+  try { await fn(); } finally { busy = false; }
+};
 let prevIo = new Map(); // pid -> { read, write, at } : relevé E/S précédent, pour calculer les DÉBITS (octets/s) par delta
 
 const log = (...a) => {
@@ -110,8 +134,8 @@ const loadCfg = () => {
       bots: raw.bots && typeof raw.bots === 'object' ? raw.bots : {},
       gameMode: { ...DEFAULTS.gameMode, ...(raw.gameMode || {}) },
       games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : DEFAULT_GAMES,
-      stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => NAME_RE.test(n)) : [],
-      imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => NAME_RE.test(n)) : [],
+      stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
+      imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
       ignoredExes: Array.isArray(raw.ignoredExes) ? raw.ignoredExes.filter((g) => EXE_RE.test(g)) : [],
       discovered: Array.isArray(raw.discovered) ? raw.discovered.filter((g) => g && EXE_RE.test(g.exe || '')) : [],
       discordAppId: (typeof raw.discordAppId === 'string' && raw.discordAppId.trim()) ? raw.discordAppId.trim().slice(0, 40) : DEFAULTS.discordAppId
@@ -164,7 +188,7 @@ const pm2List = async () => {
       memory: p.monit?.memory || 0,
       cpu: p.monit?.cpu || 0,
       pid: Number(p.pid) || 0
-    })).filter((b) => NAME_RE.test(b.name));
+    })).filter((b) => isSafeName(b.name));
   } catch { return []; }
 };
 
@@ -314,7 +338,7 @@ const clearLowNet = async () => {
 const BAD_SHELL_RE = /[&|<>^"%!\r\n`;]/; // métacaractères cmd interdits dans un chemin (shell:true)
 
 const importBot = async (name, script) => {
-  if (!NAME_RE.test(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
+  if (!isSafeName(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
   script = path.resolve(String(script || ''));
   if (BAD_SHELL_RE.test(script)) return { ok: false, error: 'Chemin non pris en charge (caractères spéciaux)' };
   if (!/\.(js|mjs|cjs|py)$/i.test(script) || !fs.existsSync(script)) return { ok: false, error: 'Fichier introuvable (attendu : .js, .mjs, .cjs ou .py)' };
@@ -337,7 +361,7 @@ const importBot = async (name, script) => {
 };
 
 const removeBot = async (name) => {
-  if (!NAME_RE.test(name) || !cfg.imported.includes(name)) return { ok: false, error: 'Seuls les bots importés peuvent être retirés ici' };
+  if (!isSafeName(name) || !cfg.imported.includes(name)) return { ok: false, error: 'Seuls les bots importés peuvent être retirés ici' };
   await pm2(['delete', name]);
   await pm2(['save']);
   cfg.imported = cfg.imported.filter((n) => n !== name);
@@ -461,7 +485,7 @@ const enterGameMode = async (game) => {
 };
 
 const exitGameMode = async () => {
-  const names = cfg.stoppedByGame.filter((n) => n !== '-' && NAME_RE.test(n)); // '-' = marqueur « rien à couper »
+  const names = cfg.stoppedByGame.filter((n) => n !== '-' && isSafeName(n)); // '-' = marqueur « rien à couper »
   names.sort((a, b) => (b === 'saliox') - (a === 'saliox')); // saliox relancé en premier
   for (const n of names) await pm2(['start', n]);
   clearFlag();
@@ -489,8 +513,7 @@ const tick = async () => {
     } else if (!gameRunning && graceOver) sessionOnline = false;
     statusCache.online = gameRunning && sessionOnline;
 
-    if (!busy) {
-      busy = true;
+    await withGameLock(async () => {
       try {
         if (cfg.gameMode.enabled && gameRunning && sessionOnline && cfg.stoppedByGame.length === 0) {
           await enterGameMode(hit);
@@ -504,8 +527,7 @@ const tick = async () => {
           await clearLowNet(); // couvre aussi la reprise après crash/redémarrage du panel
         }
       } catch (e) { log('tick', e.message); }
-      busy = false;
-    }
+    });
   }
   statusCache.bots = await pm2List();
   await measureNet().catch(() => {}); // débit réseau (E/S) par bot, affiché à côté du CPU
@@ -599,7 +621,7 @@ const updateTray = () => {
     { label: 'Ouvrir le panel', click: () => showWindow() },
     {
       label: `Mode jeu : ${cfg.gameMode.enabled ? 'activé ✔' : 'désactivé'}`,
-      click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await exitGameMode(); updateTray(); }
+      click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); updateTray(); }
     },
     ...(updateReady ? [{ label: '🔄 Mise à jour prête — appliquer & redémarrer', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
     { type: 'separator' },
@@ -618,6 +640,14 @@ const showWindow = () => {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: false }
   });
   win.removeMenu();
+  // window.open('https://...') (ex. lien « Télécharger Node.js ») ouvrait sinon une SECONDE
+  // BrowserWindow Electron chargeant le contenu distant EN INTERNE — contraire au commentaire
+  // d'en-tête du fichier ("aucun contenu distant chargé") et à l'anti-pattern documenté par
+  // Electron. On route systématiquement vers le navigateur système et on refuse la fenêtre in-app.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
   win.loadFile(path.join(__dirname, 'ui', 'index.html'));
   win.on('close', (e) => { if (!quitting) { e.preventDefault(); win.hide(); } }); // fermer = réduire dans le tray
   win.on('minimize', (e) => { e.preventDefault(); win.hide(); }); // minimiser = réduire dans le tray (comme Hasu ftn)
@@ -728,7 +758,7 @@ ipcMain.handle('panel:removeBot', (_e, { name } = {}) => removeBot(String(name |
 // On refuse ici toute nouvelle action tant qu'une action est déjà en cours pour ce bot.
 const actionsInFlight = new Set();
 ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
-  if (!NAME_RE.test(String(name || '')) || !['start', 'stop', 'restart'].includes(action)) return { ok: false };
+  if (!isSafeName(String(name || '')) || !['start', 'stop', 'restart'].includes(action)) return { ok: false };
   if (actionsInFlight.has(name)) return { ok: false, out: 'action en cours' };
   actionsInFlight.add(name);
   try {
@@ -741,7 +771,7 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {
-  if (!NAME_RE.test(String(name || '')) || !['auto', 'gameStop'].includes(key)) return { ok: false };
+  if (!isSafeName(String(name || '')) || !['auto', 'gameStop'].includes(key)) return { ok: false };
   cfg.bots[name] = { auto: true, gameStop: false, ...(cfg.bots[name] || {}), [key]: !!value };
   saveCfg();
   return { ok: true };
@@ -753,7 +783,7 @@ ipcMain.handle('panel:setGameMode', async (_e, patch = {}) => {
   if (typeof patch.soloSkip === 'boolean') cfg.gameMode.soloSkip = patch.soloSkip;
   if (Number.isFinite(patch.graceSec)) cfg.gameMode.graceSec = Math.max(10, Math.min(3600, Math.floor(patch.graceSec)));
   saveCfg();
-  if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await exitGameMode(); // désactivation = tout relancer
+  if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); // désactivation = tout relancer
   updateTray();
   return { ok: true };
 });

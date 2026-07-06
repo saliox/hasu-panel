@@ -37,7 +37,16 @@ const connect = (i) => {
     sock = s; connecting = false;
     s.on('error', () => { cleanup(); scheduleReconnect(); });
     s.on('close', () => { cleanup(); scheduleReconnect(); });
-    s.on('data', () => { if (!ready) { ready = true; if (wanted) push(wanted); } }); // 1re trame = handshake OK (READY)
+    // 1re trame reçue = handshake OK, mais SEULEMENT si c'est bien une trame op=1 (FRAME) — avant,
+    // n'importe quel octet reçu (y compris une trame d'erreur de Discord pour un client_id invalide)
+    // faisait passer `ready` à true et déclenchait l'envoi de SET_ACTIVITY sur une session non prête.
+    s.on('data', (chunk) => {
+      if (ready) return;
+      if (!Buffer.isBuffer(chunk) || chunk.length < 8) return; // trame incomplète (TCP peut fragmenter) : on attend la suite
+      if (chunk.readInt32LE(0) !== 1) return; // pas une trame FRAME (handshake OK) → ignorée
+      ready = true;
+      if (wanted) push(wanted);
+    });
     try { s.write(encode(0, { v: 1, client_id: clientId })); } catch { nextPipe(); }
   });
 };
