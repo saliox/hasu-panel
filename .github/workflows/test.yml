@@ -1,0 +1,23 @@
+# Lance les tests unitaires (node --test) et vérifie la syntaxe du main à chaque
+# push / PR. Les tests couvrent validators.js (logique pure, aucune dépendance) :
+# pas besoin du binaire Electron (ELECTRON_SKIP_BINARY_DOWNLOAD).
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm test
+      - run: node --check main.js && node --check preload.js && node --check discordrpc.js && node --check validators.js
