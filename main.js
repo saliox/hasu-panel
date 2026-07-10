@@ -42,21 +42,13 @@ const setupAutoUpdate = () => {
 };
 
 const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
-const NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/; // noms pm2 autorisés (jamais d'espace ni de quote → sûr avec shell)
-const EXE_RE = /^[A-Za-z0-9 _.()+'-]{1,80}\.exe$/i; // noms de process de jeu autorisés
-// Noms interdits comme clé de cfg.bots (objet simple) : "__proto__" via `cfg.bots[name] = …`
-// ne crée PAS une propriété normale, il réassigne le PROTOTYPE de cfg.bots (pollution en mémoire,
-// affecte la lecture de tout autre nom non configuré ensuite). "constructor"/"prototype" par
-// prudence pour la même raison. Les noms de périphériques Windows (CON, COM1…) sont aussi rejetés :
-// pm2 dérive son nom de fichier de log du nom du process, et un fichier littéralement nommé "CON"
-// bloque/plante les I/O sous Windows.
-const RESERVED_NAMES = new Set([
-  '__proto__', 'constructor', 'prototype',
-  'con', 'prn', 'aux', 'nul',
-  'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
-  'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
-]);
-const isSafeName = (n) => typeof n === 'string' && NAME_RE.test(n) && !RESERVED_NAMES.has(n.toLowerCase());
+// Entrée JS de pm2 : pm2.cmd n'est qu'un shim npm qui exécute « node …\node_modules\pm2\bin\pm2 %* ».
+// L'appeler directement avec node est sémantiquement identique et supprime le shell (cmd.exe) de
+// la chaîne → les arguments sont passés tels quels au processus, aucune injection possible.
+const PM2_JS = path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'pm2', 'bin', 'pm2');
+// Validateurs de sécurité (regex noms/exe, noms réservés, IP publique) : extraits dans un
+// module pur pour être couverts par les tests unitaires (npm test).
+const { EXE_RE, isSafeName, BAD_SHELL_RE, isPublicIp } = require('./validators');
 
 // Dossier « data » du bot saliox (drapeaux de coordination panel ↔ bot). Par défaut : <profil>\Desktop\saliox bot\data
 // (résolu via os.homedir → aucun nom d'utilisateur codé en dur). Personnalisable via la variable d'env HASU_SALIOX_DATA.
@@ -150,25 +142,39 @@ const saveCfg = () => { try { fs.writeFileSync(cfgPath(), JSON.stringify(cfg, nu
 // ce qui laisse croire à un bug. On détecte l'absence et on propose de l'installer.
 let toolchain = { node: true, pm2: true };
 const probeToolchain = () => new Promise((resolve) => {
-  // pm2 accessible via le PATH ?
-  execFile('pm2', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (err, out) => {
+  // pm2 installé au prefix npm ? (invocation directe node + bin JS, sans shell ; le repli
+  // cmd /c couvre un pm2 accessible via le PATH depuis un autre emplacement — arguments
+  // CONSTANTS uniquement, donc sûr).
+  const probeArgs = fs.existsSync(PM2_JS)
+    ? ['node', [PM2_JS, '-v']]
+    : [process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'pm2 -v']];
+  execFile(probeArgs[0], probeArgs[1], { windowsHide: true, timeout: 15000 }, (err, out) => {
     if (!err && /\d+\.\d+/.test(String(out || ''))) return resolve({ node: true, pm2: true });
     const pm2AtNpm = (() => { try { return fs.existsSync(PM2); } catch { return false; } })();
-    execFile('node', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (e2, o2) => {
+    // node.exe se résout via le PATH sans shell (seuls les .cmd/.bat exigent cmd.exe).
+    execFile('node', ['-v'], { windowsHide: true, timeout: 15000 }, (e2, o2) => {
       resolve({ node: !e2 && /v\d+/.test(String(o2 || '')), pm2: pm2AtNpm });
     });
   });
 });
 
 // ---------- pm2 ----------
-// shell:true nécessaire pour lancer un .cmd → chaque argument est validé AVANT (aucune injection possible).
-// Le chemin de pm2.cmd est ENTOURÉ DE GUILLEMETS : sous shell, Node ne cite pas le fichier, donc un
-// nom d'utilisateur avec espace (%APPDATA% contient un espace) tronquerait la commande. cmd.exe parse
-// correctement « "C:\...\npm\pm2.cmd" jlist » (et le cas sans espace reste valide).
+// Chemin principal SANS shell : node exécute directement l'entrée JS de pm2 (PM2_JS), exactement
+// ce que fait le shim pm2.cmd. execFile passe chaque argument tel quel au processus → l'injection
+// de commande est impossible PAR CONSTRUCTION, plus seulement par validation des arguments
+// (les validations restent : défense en profondeur).
+// Repli (layout npm inhabituel où pm2.cmd existe sans bin JS au prefix) : ancien chemin shell,
+// avec le path de pm2.cmd cité (espace possible dans %APPDATA%) et les arguments contenant un
+// espace cités aussi — comme avant l'extraction.
 const pm2Raw = (args) => new Promise((resolve) => {
-  execFile(`"${PM2}"`, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
-    resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
-  });
+  const done = (err, out, errOut) => resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
+  const opts = { windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 };
+  if (fs.existsSync(PM2_JS)) {
+    execFile('node', [PM2_JS, ...args], opts, done);
+  } else {
+    const quoted = args.map((a) => (/\s/.test(a) ? `"${a}"` : a));
+    execFile(`"${PM2}"`, quoted, { ...opts, shell: true }, done);
+  }
 });
 // Variante courante : uniquement des mots-clés/noms sûrs (start/stop/restart/jlist/save/… + noms pm2).
 const pm2 = (args) => {
@@ -210,29 +216,10 @@ const listProcs = () => new Promise((resolve) => {
   });
 });
 
-// Jeu EN LIGNE ou solo ? → au moins une connexion TCP établie du process vers une IP publique.
-// Heuristique honnête : couvre les jeux TCP et les jeux « toujours en ligne » (services/lobby) ;
-// un jeu 100 % hors-ligne n'a aucune connexion sortante → mode jeu non déclenché.
-// Une IP « publique » = ni privée/locale/loopback (IPv4 ET IPv6). Sert à distinguer une vraie session
-// multijoueur (connexion vers Internet) d'un jeu solo/LAN.
-const isPublicIp = (raw) => {
-  const ip = String(raw || '').replace(/^\[|\]$/g, '').toLowerCase(); // retire les crochets IPv6
-  if (ip.includes('.') && !ip.includes(':')) { // IPv4
-    if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.|255\.)/.test(ip)) return false;
-    const b2 = Number(ip.split('.')[1]);
-    if (ip.startsWith('172.') && b2 >= 16 && b2 <= 31) return false;
-    return true;
-  }
-  if (ip.includes(':')) { // IPv6
-    if (ip === '::1' || ip === '::') return false;          // loopback / non spécifié
-    if (ip.startsWith('fe80')) return false;                // link-local
-    if (/^f[cd]/.test(ip)) return false;                    // unique-local (fc00::/7)
-    if (ip.startsWith('::ffff:')) return isPublicIp(ip.slice(7)); // IPv4 mappée
-    return true;                                            // adresse IPv6 globale
-  }
-  return false;
-};
-
+// Jeu EN LIGNE ou solo ? → au moins une connexion TCP établie du process vers une IP publique
+// (isPublicIp, voir validators.js). Heuristique honnête : couvre les jeux TCP et les jeux
+// « toujours en ligne » (services/lobby) ; un jeu 100 % hors-ligne n'a aucune connexion
+// sortante → mode jeu non déclenché.
 const hasOnlineActivity = (pids) => new Promise((resolve) => {
   if (!Array.isArray(pids) || !pids.length) return resolve(false);
   execFile('netstat.exe', ['-ano', '-p', 'tcp'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
@@ -336,8 +323,6 @@ const clearLowNet = async () => {
 // ---------- Import de bots (catégorie « importés ») ----------
 // Confie un projet perso (lancé d'habitude à la main / via Visual Studio) à pm2 : il devient
 // gérable comme les autres (auto boot, mode jeu, start/stop) et survit aux redémarrages (pm2 save).
-const BAD_SHELL_RE = /[&|<>^"%!\r\n`;]/; // métacaractères cmd interdits dans un chemin (shell:true)
-
 const importBot = async (name, script) => {
   if (!isSafeName(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
   script = path.resolve(String(script || ''));
@@ -346,11 +331,12 @@ const importBot = async (name, script) => {
   const existing = await pm2List();
   if (existing.some((b) => b.name.toLowerCase() === name.toLowerCase())) return { ok: false, error: `« ${name} » existe déjà dans pm2 — choisis un autre nom` };
   const dir = path.dirname(script);
-  // Un script à la racine d'un disque (D:\bot.js) donne dir = « D:\ » : cité tel quel → « "D:\" »,
-  // et cmd.exe interprète le \" final comme un guillemet échappé (fusion de jetons). On ajoute un « . »
-  // à un backslash final (D:\ → D:\.) pour que --cwd désigne bien la racine sans casser le parsing.
+  // Un script à la racine d'un disque (D:\bot.js) donne dir = « D:\ » : un backslash final devant
+  // un guillemet fermant est piégeux quel que soit le parseur (cmd du repli comme quoting Win32).
+  // On ajoute un « . » (D:\ → D:\.) : même racine, aucun cas limite. Les arguments sont passés
+  // BRUTS à pm2Raw — c'est lui qui cite si (et seulement si) le repli shell est utilisé.
   const cwd = dir.endsWith('\\') ? `${dir}.` : dir;
-  const r = await pm2Raw(['start', `"${script}"`, '--name', name, '--cwd', `"${cwd}"`]);
+  const r = await pm2Raw(['start', script, '--name', name, '--cwd', cwd]);
   if (!r.ok) { log('import ÉCHEC:', name, script, '—', r.out.slice(0, 400)); return { ok: false, error: 'pm2 a refusé le démarrage — vérifie le fichier (détails dans panel.log)' }; }
   await pm2(['save']); // survivra au redémarrage du PC (pm2 resurrect)
   if (!cfg.imported.includes(name)) cfg.imported.push(name);
@@ -843,7 +829,8 @@ ipcMain.handle('panel:applyUpdate', () => {
 ipcMain.handle('panel:installPm2', async () => {
   if (!toolchain.node) return { ok: false, reason: 'no-node' };
   const r = await new Promise((resolve) => {
-    execFile('npm', ['install', '-g', 'pm2'], { shell: true, windowsHide: true, timeout: 240000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
+    // npm est un .cmd → passe par cmd.exe, mais avec une commande CONSTANTE (aucune interpolation).
+    execFile(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'npm install -g pm2'], { windowsHide: true, timeout: 240000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
       resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim().slice(-600) });
     });
   });

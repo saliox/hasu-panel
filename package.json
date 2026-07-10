@@ -6,6 +6,7 @@
   "author": "saliox",
   "license": "UNLICENSED",
   "scripts": {
+    "test": "node --test",
     "start": "electron .",
     "dist": "electron-builder --win dir",
     "installer": "electron-builder --win nsis",
@@ -41,6 +42,7 @@
       "main.js",
       "preload.js",
       "discordrpc.js",
+      "validators.js",
       "ui/**",
       "icon.png"
     ]
