@@ -559,6 +559,10 @@ const bootEnforce = async () => {
   for (const b of list) {
     const c = cfg.bots[b.name];
     if (!c) continue;
+    // Un bot listé dans cfg.stoppedByGame est coupé VOLONTAIREMENT par le mode jeu (déjà en cours
+    // à peine le panel démarré) : le relancer ici court-circuiterait ce choix et laisserait pm2 dans
+    // un état incohérent avec cfg.stoppedByGame (le bot tournerait alors qu'on croit l'avoir coupé).
+    if (cfg.stoppedByGame.includes(b.name)) continue;
     if (c.auto === false && b.status === 'online') { await pm2(['stop', b.name]); log('boot: stop', b.name, '(auto off)'); }
     else if (c.auto !== false && b.status !== 'online') { await pm2(['start', b.name]); log('boot: start', b.name); }
   }
