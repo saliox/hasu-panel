@@ -4,7 +4,7 @@
 const net = require('net');
 const crypto = require('crypto');
 
-let sock = null, ready = false, connecting = false, clientId = null, wanted = null, reconnectT = null;
+let sock = null, pendingSock = null, ready = false, connecting = false, clientId = null, wanted = null, reconnectT = null, handshakeT = null;
 
 // Trame IPC Discord : [op: Int32LE][taille: Int32LE][JSON utf8].
 const encode = (op, obj) => {
@@ -17,7 +17,12 @@ const encode = (op, obj) => {
 
 const cleanup = () => {
   ready = false; connecting = false;
+  if (handshakeT) { clearTimeout(handshakeT); handshakeT = null; }
   if (sock) { try { sock.destroy(); } catch {} sock = null; }
+  // Détruit aussi le socket encore en cours de sondage (pipes 0..9) : sans ça, un start() rapproché
+  // (édition rapide de l'App ID, toggle on/off) laissait fuiter la connexion en cours et pouvait
+  // laisser une ancienne "génération" de callback s'exécuter contre l'état courant.
+  if (pendingSock) { try { pendingSock.destroy(); } catch {} pendingSock = null; }
 };
 
 const scheduleReconnect = () => {
@@ -30,13 +35,26 @@ const connect = (i) => {
   if (i > 9) { scheduleReconnect(); return; } // aucun pipe 0..9 → Discord absent, on réessaiera
   connecting = true;
   const s = net.connect(`\\\\?\\pipe\\discord-ipc-${i}`);
-  const nextPipe = () => { try { s.destroy(); } catch {} connecting = false; connect(i + 1); };
+  pendingSock = s; // socket de sondage en cours, pas encore promu en `sock` — doit rester joignable par cleanup()
+  const nextPipe = () => {
+    try { s.destroy(); } catch {}
+    if (pendingSock === s) pendingSock = null;
+    connecting = false;
+    connect(i + 1);
+  };
   s.once('error', nextPipe);
   s.once('connect', () => {
     s.removeListener('error', nextPipe);
-    sock = s; connecting = false;
+    sock = s; pendingSock = null; connecting = false;
     s.on('error', () => { cleanup(); scheduleReconnect(); });
     s.on('close', () => { cleanup(); scheduleReconnect(); });
+    // Pas de handshake reçu dans le délai imparti (process Discord zombie qui accepte le pipe mais ne
+    // répond jamais) → on abandonne cette connexion et on relance le cycle de reconnexion, plutôt que
+    // de rester bloqué indéfiniment avec ready=false (contredit le comportement "auto-reconnect" voulu).
+    handshakeT = setTimeout(() => {
+      handshakeT = null;
+      if (!ready) { cleanup(); scheduleReconnect(); }
+    }, 8000);
     // 1re trame reçue = handshake OK, mais SEULEMENT si c'est bien une trame op=1 (FRAME) — avant,
     // n'importe quel octet reçu (y compris une trame d'erreur de Discord pour un client_id invalide)
     // faisait passer `ready` à true et déclenchait l'envoi de SET_ACTIVITY sur une session non prête.
@@ -45,6 +63,7 @@ const connect = (i) => {
       if (!Buffer.isBuffer(chunk) || chunk.length < 8) return; // trame incomplète (TCP peut fragmenter) : on attend la suite
       if (chunk.readInt32LE(0) !== 1) return; // pas une trame FRAME (handshake OK) → ignorée
       ready = true;
+      if (handshakeT) { clearTimeout(handshakeT); handshakeT = null; }
       if (wanted) push(wanted);
     });
     try { s.write(encode(0, { v: 1, client_id: clientId })); } catch { nextPipe(); }
@@ -58,9 +77,11 @@ const push = (activity) => {
 
 // ---- API publique ----
 // start(appId) : (re)branche la Rich Presence sur cette Application Discord (client_id snowflake).
+const APP_ID_RE = /^\d{17,20}$/;
+const isValidAppId = (id) => APP_ID_RE.test(String(id || '').trim());
 const start = (id) => {
   const clean = String(id || '').trim();
-  const valid = /^\d{17,20}$/.test(clean) ? clean : null;
+  const valid = APP_ID_RE.test(clean) ? clean : null;
   if (valid === clientId && (ready || connecting || reconnectT)) return; // déjà branché sur ce même App ID
   cleanup(); if (reconnectT) { clearTimeout(reconnectT); reconnectT = null; }
   clientId = valid;
@@ -71,4 +92,4 @@ const set = (activity) => { wanted = activity; if (ready) push(activity); };
 // stop() : coupe complètement la Rich Presence.
 const stop = () => { clientId = null; wanted = null; if (reconnectT) { clearTimeout(reconnectT); reconnectT = null; } cleanup(); };
 
-module.exports = { start, set, stop };
+module.exports = { start, set, stop, isValidAppId };

@@ -21,11 +21,25 @@ let updateReady = false, updaterRef = null, lastUpdateStatus = null;
 const semverGt = (a, b) => {
   // Retire un éventuel préfixe "v"/"V" (ex. "v1.8.0") : sinon parseInt("v1", 10) vaut NaN||0 = 0,
   // et une version distante réellement plus récente pouvait s'afficher comme plus ancienne/égale.
-  const pa = String(a || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
-  const pb = String(b || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  // Retire aussi un éventuel suffixe de pré-version ("-beta.1", "-rc.2", …) AVANT de découper sur les
+  // points : sans ça, "1.8.0-beta.1".split('.') donne ["1","8","0-beta","1"] et parseInt("0-beta",10)
+  // vaut 0 par coïncidence mais décale/pollue la comparaison sur le champ suivant. On ne vise pas les
+  // vraies règles de préséance semver (une pré-version est censée être < la version stable correspondante),
+  // juste éviter un parsing silencieusement faux.
+  const strip = (v) => String(v || '').trim().replace(/^v/i, '').replace(/-.*$/, '');
+  const pa = strip(a).split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = strip(b).split('.').map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
   return false;
 };
+// NOTE (trust model, not fixed here — needs a real code-signing certificate/infrastructure decision,
+// out of scope for a code change): electron-updater validates a downloaded update against the SHA512
+// recorded in latest.yml, but that latest.yml is published from the SAME GitHub release it's meant to
+// validate (see package.json build.publish) — i.e. same-origin trust, not an independent signature.
+// Anyone who can publish/tamper with the release (compromised token, MITM'd unauthenticated GitHub API
+// call, etc.) can update both the installer and its own checksum together. A real fix means signing
+// releases with a code-signing cert whose public key is pinned in the app, independent of the release
+// artifacts themselves.
 const setupAutoUpdate = () => {
   if (!app.isPackaged) return;
   try { ({ autoUpdater: updaterRef } = require('electron-updater')); } catch (e) { log('updater indispo', e.message); return; }
@@ -148,7 +162,10 @@ const saveCfg = () => { try { fs.writeFileSync(cfgPath(), JSON.stringify(cfg, nu
 // ---------- Détection de la chaîne d'outils (Node + pm2) ----------
 // Chez un ami, pm2 (voire Node) peut ne pas être installé → le panel affichait juste « Aucun process »,
 // ce qui laisse croire à un bug. On détecte l'absence et on propose de l'installer.
-let toolchain = { node: true, pm2: true };
+// node/pm2 à `null` = "pas encore sondé" (distinct de true/false) + `checking: true` : sans ça, le
+// renderer pouvait interroger panel:status avant la résolution de probeToolchain() et lire un faux
+// "installé" (true par défaut) le temps du 1er sondage.
+let toolchain = { node: null, pm2: null, checking: true };
 const probeToolchain = () => new Promise((resolve) => {
   // pm2 accessible via le PATH ?
   execFile('pm2', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (err, out) => {
@@ -338,7 +355,20 @@ const clearLowNet = async () => {
 // gérable comme les autres (auto boot, mode jeu, start/stop) et survit aux redémarrages (pm2 save).
 const BAD_SHELL_RE = /[&|<>^"%!\r\n`;]/; // métacaractères cmd interdits dans un chemin (shell:true)
 
-const importBot = async (name, script) => {
+// Verrou par nom de bot, partagé par TOUT ce qui crée/supprime/démarre/arrête une entrée pm2 : l'action
+// manuelle (panel:action), l'import/retrait (importBot/removeBot) ET les transitions automatiques
+// (enterGameMode/exitGameMode/bootEnforce). Sans un verrou COMMUN, deux appels rapides sur le même nom
+// (double-clic, import + suppression, ou une bascule mode jeu qui chevauche un clic manuel) pouvaient
+// tous les deux passer leurs vérifications avant que l'un ou l'autre ait fini → entrées pm2 dupliquées /
+// en double, ou état pm2 final désynchronisé de cfg.stoppedByGame.
+const actionsInFlight = new Set();
+const withBotLock = async (name, fn) => {
+  if (actionsInFlight.has(name)) return { ok: false, out: 'action en cours' };
+  actionsInFlight.add(name);
+  try { return await fn(); } finally { actionsInFlight.delete(name); }
+};
+
+const importBot = (name, script) => withBotLock(name, async () => {
   if (!isSafeName(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
   script = path.resolve(String(script || ''));
   if (BAD_SHELL_RE.test(script)) return { ok: false, error: 'Chemin non pris en charge (caractères spéciaux)' };
@@ -359,9 +389,9 @@ const importBot = async (name, script) => {
   log('import OK:', name, '←', script);
   statusCache.bots = await pm2List();
   return { ok: true };
-};
+});
 
-const removeBot = async (name) => {
+const removeBot = (name) => withBotLock(name, async () => {
   if (!isSafeName(name) || !cfg.imported.includes(name)) return { ok: false, error: 'Seuls les bots importés peuvent être retirés ici' };
   await pm2(['delete', name]);
   await pm2(['save']);
@@ -372,7 +402,7 @@ const removeBot = async (name) => {
   log('retrait:', name);
   statusCache.bots = await pm2List();
   return { ok: true };
-};
+});
 
 // ---------- Découverte de jeux installés (scan disque : 1×/JOUR max ou bouton « Scanner ») ----------
 // Ne tourne JAMAIS en continu : la détection en jeu (tick) ne lit que la liste des process (léger) ;
@@ -478,7 +508,9 @@ const enterGameMode = async (game) => {
   // Drapeau AVANT l'arrêt pour que le watchdog de saliox n'alerte pas ; saliox coupé EN DERNIER (il héberge le watchdog).
   writeFlag(targets, game);
   targets.sort((a, b) => (a === 'saliox') - (b === 'saliox'));
-  for (const n of targets) await pm2(['stop', n]);
+  // Verrou par bot partagé avec panel:action/importBot/removeBot : si un Stop/Start manuel est déjà en
+  // cours sur ce bot, on saute notre propre commande plutôt que d'entrelacer deux ordres pm2 concurrents.
+  for (const n of targets) await withBotLock(n, () => pm2(['stop', n]));
   cfg.stoppedByGame = targets;
   saveCfg();
   log('mode jeu ON —', game, '— coupés :', targets.join(', '));
@@ -488,7 +520,7 @@ const enterGameMode = async (game) => {
 const exitGameMode = async () => {
   const names = cfg.stoppedByGame.filter((n) => n !== '-' && isSafeName(n)); // '-' = marqueur « rien à couper »
   names.sort((a, b) => (b === 'saliox') - (a === 'saliox')); // saliox relancé en premier
-  for (const n of names) await pm2(['start', n]);
+  for (const n of names) await withBotLock(n, () => pm2(['start', n]));
   clearFlag();
   cfg.stoppedByGame = [];
   saveCfg();
@@ -559,8 +591,8 @@ const bootEnforce = async () => {
   for (const b of list) {
     const c = cfg.bots[b.name];
     if (!c) continue;
-    if (c.auto === false && b.status === 'online') { await pm2(['stop', b.name]); log('boot: stop', b.name, '(auto off)'); }
-    else if (c.auto !== false && b.status !== 'online') { await pm2(['start', b.name]); log('boot: start', b.name); }
+    if (c.auto === false && b.status === 'online') { await withBotLock(b.name, () => pm2(['stop', b.name])); log('boot: stop', b.name, '(auto off)'); }
+    else if (c.auto !== false && b.status !== 'online') { await withBotLock(b.name, () => pm2(['start', b.name])); log('boot: start', b.name); }
   }
 };
 
@@ -622,7 +654,15 @@ const updateTray = () => {
     { label: 'Ouvrir le panel', click: () => showWindow() },
     {
       label: `Mode jeu : ${cfg.gameMode.enabled ? 'activé ✔' : 'désactivé'}`,
-      click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); updateTray(); }
+      // try/catch aligné sur tick() (~ligne 517) : sans lui, une exception ici (ex. saveCfg/pm2 en échec
+      // pendant exitGameMode) restait non gérée côté handler de clic Electron, au lieu d'être journalisée.
+      click: async () => {
+        try {
+          cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg();
+          if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode);
+          updateTray();
+        } catch (e) { log('tray mode jeu', e.message); }
+      }
     },
     ...(updateReady ? [{ label: '🔄 Mise à jour prête — appliquer & redémarrer', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
     { type: 'separator' },
@@ -666,7 +706,11 @@ ipcMain.handle('panel:status', () => ({
   updateStatus: lastUpdateStatus,
   toolchain,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
-  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
+  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '',
+    // Validité réelle de l'App ID (regex partagée avec discordrpc.js, seul endroit où elle vivait avant) :
+    // un ID non-vide mais mal formé se connectait jamais côté rpc.start(), mais l'UI se basait juste sur
+    // "non-vide" pour afficher « ✅ activée » — faux positif silencieux. On expose la vraie validité ici.
+    discordAppIdValid: rpc.isValidAppId(cfg.discordAppId || '') }
 }));
 
 // Scan disque à la demande (bouton « Scanner ») + gestion des suggestions.
@@ -754,21 +798,17 @@ ipcMain.handle('panel:importPickDir', async () => {
 ipcMain.handle('panel:importBot', (_e, { name, script } = {}) => importBot(String(name || '').trim(), script));
 ipcMain.handle('panel:removeBot', (_e, { name } = {}) => removeBot(String(name || '')));
 
-// Verrou par bot : le render() du renderer reconstruit le DOM et réactive les boutons, donc un
-// double-clic pourrait lancer deux start/stop concurrents sur le même bot (état final indéterminé).
+// Verrou par bot (withBotLock, défini plus haut, partagé avec importBot/removeBot/enterGameMode/
+// exitGameMode/bootEnforce) : le render() du renderer reconstruit le DOM et réactive les boutons, donc
+// un double-clic pourrait lancer deux start/stop concurrents sur le même bot (état final indéterminé).
 // On refuse ici toute nouvelle action tant qu'une action est déjà en cours pour ce bot.
-const actionsInFlight = new Set();
 ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
   if (!isSafeName(String(name || '')) || !['start', 'stop', 'restart'].includes(action)) return { ok: false };
-  if (actionsInFlight.has(name)) return { ok: false, out: 'action en cours' };
-  actionsInFlight.add(name);
-  try {
+  return withBotLock(name, async () => {
     const r = await pm2([action, name]);
     statusCache.bots = await pm2List();
     return { ok: r.ok };
-  } finally {
-    actionsInFlight.delete(name);
-  }
+  });
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {
@@ -848,7 +888,7 @@ ipcMain.handle('panel:installPm2', async () => {
     });
   });
   log('install pm2 :', r.ok ? 'OK' : 'échec', r.out.slice(0, 200));
-  if (r.ok) { toolchain = await probeToolchain(); await tick().catch(() => {}); } // re-sonde + rafraîchit la liste
+  if (r.ok) { toolchain = { ...(await probeToolchain()), checking: false }; await tick().catch(() => {}); } // re-sonde + rafraîchit la liste
   return { ok: r.ok && toolchain.pm2, out: r.out };
 });
 
@@ -908,7 +948,7 @@ else {
     applyAutoLaunch();
     startRpc(); // Rich Presence Discord (si activée + App ID configuré)
     setupAutoUpdate(); // auto-update en fond (version installee uniquement)
-    probeToolchain().then((t) => { toolchain = t; }).catch(() => {}); // détecte Node/pm2 (guide si absent)
+    probeToolchain().then((t) => { toolchain = { ...t, checking: false }; }).catch(() => { toolchain = { node: null, pm2: null, checking: false }; }); // détecte Node/pm2 (guide si absent)
     if (!START_HIDDEN) showWindow();
 
     if (IS_STARTUP) {

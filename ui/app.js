@@ -62,10 +62,14 @@ const render = (st) => {
   };
   const main = st.bots.filter((b) => !imported.includes(b.name));
   const imps = st.bots.filter((b) => imported.includes(b.name));
-  const tc = st.toolchain || { node: true, pm2: true };
+  const tc = st.toolchain || { node: null, pm2: null, checking: true };
   // Chaîne d'outils manquante : au lieu du trompeur « Aucun process », on guide.
+  // Pendant le 1er sondage (checking / node ou pm2 encore null), on ne sait pas encore → on ne montre
+  // ni « installé » ni « manquant », sinon un panel juste ouvert affichait un faux avertissement.
   let empty;
-  if (!tc.node) {
+  if (tc.checking || tc.node == null || tc.pm2 == null) {
+    empty = '<div class="hint">Vérification de Node.js / pm2…</div>';
+  } else if (!tc.node) {
     empty = '<div class="tc-warn"><b>⚠️ Node.js n\'est pas installé.</b><br>pm2 (qui fait tourner les bots) a besoin de Node.js. '
       + 'Installe-le d\'abord, puis reviens installer pm2.<div class="row" style="margin-top:8px">'
       + '<button class="btn primary" id="tc-node">Télécharger Node.js</button></div></div>';
@@ -104,7 +108,10 @@ const render = (st) => {
   $('dev-note').textContent = st.cfg.packaged ? '' : '(actif seulement dans la version .exe)';
   $('set-rpc').checked = st.cfg.discordRpc !== false;
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
-  $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.' : (st.cfg.discordAppId ? ' — ✅ activée.' : ' — ⚠️ colle ton Application ID pour l\'activer.');
+  $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.'
+    : !st.cfg.discordAppId ? ' — ⚠️ colle ton Application ID pour l\'activer.'
+    : st.cfg.discordAppIdValid ? ' — ✅ activée.'
+    : ' — ⚠️ Application ID invalide (attendu : un nombre de 17 à 20 chiffres) — Rich Presence inactive.';
 
   // Mises à jour
   $('upd-version').textContent = st.cfg.version || '—';
