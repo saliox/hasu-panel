@@ -97,6 +97,8 @@ const DEFAULTS = {
   autoLaunch: true,
   lowNet: false,            // mode « faible usage internet » : priorité réseau au jeu en ligne
   lowNetApplied: false,     // persisté → on sait restaurer les priorités après un crash du panel
+  cpuMax: 0,                // limite CPU par bot en % (0 = désactivé) : au-delà, priorité abaissée
+  cpuThrottled: [],         // persisté → on sait restaurer les priorités après un crash du panel
   stoppedByGame: [],        // persisté → si le panel redémarre pendant une partie, on sait quoi relancer
   imported: [],             // bots importés par l'utilisateur (catégorie à part, retirables du panel)
   scanAuto: true,           // découverte de nouveaux jeux installés : 1×/JOUR max (jamais en continu)
@@ -561,6 +563,50 @@ const exitGameMode = async () => {
   updateTray();
 };
 
+// ---------- Limite CPU par bot (réglage « CPU max ») ----------
+// L'utilisateur fixe un plafond d'utilisation processeur par bot (en % d'un
+// cœur, la mesure de pm2). Windows n'offre pas de plafonnement dur par process
+// sans droits admin/Job Objects : on abaisse la PRIORITÉ du bot qui dépasse
+// durablement (BelowNormal, ou Idle si ≥ 2× la limite) — il ne consomme alors
+// du CPU que quand personne d'autre n'en veut — puis on la restaure quand il
+// redescend. Hystérésis de 3 ticks dans chaque sens pour éviter le ping-pong.
+const cpuThrottle = new Map(); // name -> { over, under, level (0|1|2), pid }
+const CPU_STREAK = 3;
+const CPU_LEVEL_CLS = ['Normal', 'BelowNormal', 'Idle'];
+const enforceCpuMax = async () => {
+  if (cfg.lowNetApplied) return; // lowNet pilote déjà les priorités : pas de conflit
+  const limit = Math.max(0, Number(cfg.cpuMax) || 0);
+  if (!limit) {
+    if (cpuThrottle.size) { // option désactivée → restaurer tout le monde
+      await setBotPriority([...cpuThrottle.values()].filter((t) => t.level > 0).map((t) => t.pid), 'Normal');
+      cpuThrottle.clear();
+      cfg.cpuThrottled = []; saveCfg();
+    }
+    return;
+  }
+  for (const b of statusCache.bots) {
+    if (b.status !== 'online' || !b.pid) { cpuThrottle.delete(b.name); continue; }
+    const t = cpuThrottle.get(b.name) || { over: 0, under: 0, level: 0, pid: b.pid };
+    t.pid = b.pid;
+    if (b.cpu > limit) { t.over++; t.under = 0; } else { t.under++; t.over = 0; }
+    let want = t.level;
+    if (t.over >= CPU_STREAK) want = b.cpu > limit * 2 ? 2 : 1;
+    else if (t.under >= CPU_STREAK) want = 0;
+    if (want !== t.level) {
+      await setBotPriority([b.pid], CPU_LEVEL_CLS[want]);
+      log(`cpu max: ${b.name} à ${Math.round(b.cpu)} % (limite ${limit} %) → priorité ${CPU_LEVEL_CLS[want]}`);
+      t.level = want;
+      t.over = 0; t.under = 0;
+    }
+    if (t.level === 0 && t.under >= CPU_STREAK) cpuThrottle.delete(b.name);
+    else cpuThrottle.set(b.name, t);
+  }
+  const throttledNames = [...cpuThrottle.entries()].filter(([, t]) => t.level > 0).map(([n]) => n);
+  if (JSON.stringify(throttledNames) !== JSON.stringify(cfg.cpuThrottled || [])) {
+    cfg.cpuThrottled = throttledNames; saveCfg(); // persisté → restauration après crash du panel
+  }
+};
+
 // ---------- Boucle de surveillance ----------
 let ticking = false; // anti-réentrance : un tick lent (awaits jusqu'à 60 s) chevauchait
                      // le suivant et corrompait prevIo/statusCache (débits aberrants)
@@ -604,6 +650,7 @@ const tickBody = async () => {
   }
   statusCache.bots = await pm2List();
   await measureNet().catch(() => {}); // débit réseau (E/S) par bot, affiché à côté du CPU
+  await enforceCpuMax().catch((e) => log('cpuMax', e.message)); // limite CPU par bot (réglage utilisateur)
   statusCache.updatedAt = Date.now();
   updateTray();
   updateRpc(); // met à jour la Rich Presence Discord (« gère X bots en ligne »)
@@ -748,6 +795,7 @@ ipcMain.handle('panel:status', () => ({
   updateStatus: lastUpdateStatus,
   toolchain,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
+  cpuThrottled: cfg.cpuThrottled || [], // bots actuellement bridés par la limite CPU
   // état EFFECTIF de la Rich Presence (l'UI affichait « activée » sur la seule
   // présence d'un ID en config, même invalide ou supplanté par la variable d'env)
   rpc: {
@@ -756,7 +804,7 @@ ipcMain.handle('panel:status', () => ({
     fromEnv: !!(process.env.HASU_DISCORD_APP_ID || '').trim(),
     connected: rpc.status().ready
   },
-  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
+  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, cpuMax: cfg.cpuMax || 0, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
 
 // Scan disque à la demande (bouton « Scanner ») + gestion des suggestions.
@@ -895,6 +943,7 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'autoLaunch') { cfg.autoLaunch = !!value; saveCfg(); applyAutoLaunch(); return { ok: true }; }
   if (key === 'pollSec') { cfg.pollSec = Math.max(5, Math.min(120, Math.floor(Number(value) || 10))); saveCfg(); restartPoll(); return { ok: true }; }
   if (key === 'idlePollSec') { cfg.idlePollSec = Math.max(15, Math.min(300, Math.floor(Number(value) || 30))); saveCfg(); restartPoll(); return { ok: true }; }
+  if (key === 'cpuMax') { cfg.cpuMax = Math.max(0, Math.min(95, Math.floor(Number(value) || 0))); saveCfg(); return { ok: true }; } // 0 = désactivé ; la restauration passe par enforceCpuMax au tick suivant
   if (key === 'lowNet') { cfg.lowNet = !!value; saveCfg(); return { ok: true }; } // le tick applique/retire tout seul
   if (key === 'scanAuto') { cfg.scanAuto = !!value; saveCfg(); return { ok: true }; }
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
@@ -1005,6 +1054,13 @@ else {
     }
     // Reprise après crash : des bots coupés par le mode jeu mais plus de jeu → le tick les relancera.
     await tick().catch(() => {});
+    // Reprise après crash (limite CPU) : des priorités abaissées ont pu survivre au panel →
+    // on repart de zéro, enforceCpuMax rebridera au besoin après son hystérésis.
+    if (Array.isArray(cfg.cpuThrottled) && cfg.cpuThrottled.length) {
+      const pids = statusCache.bots.filter((b) => cfg.cpuThrottled.includes(b.name) && b.pid).map((b) => b.pid);
+      if (pids.length) await setBotPriority(pids, 'Normal').catch(() => {});
+      cfg.cpuThrottled = []; saveCfg();
+    }
     // Enregistre les bots découverts dans la config (défaut : auto ON, mode jeu OFF).
     let added = false;
     for (const b of statusCache.bots) if (!cfg.bots[b.name]) { cfg.bots[b.name] = { auto: true, gameStop: false }; added = true; }

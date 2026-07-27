@@ -51,7 +51,7 @@ const render = (st) => {
     return `<div class="bot">
       <span class="dot ${dot}" title="${esc(b.status)}"></span>
       <span class="name">${esc(b.name)}</span>
-      <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="Réseau du bot, mesuré via ses entrées/sorties (pour un bot Discord, quasi exclusivement du réseau + un peu de disque SQLite) — ↓ reçu · ↑ envoyé">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? '⏸ coupé par le mode jeu' : esc(b.status)} · ↻ ${b.restarts}</span>
+      <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="Réseau du bot, mesuré via ses entrées/sorties (pour un bot Discord, quasi exclusivement du réseau + un peu de disque SQLite) — ↓ reçu · ↑ envoyé">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>${(st.cpuThrottled || []).includes(b.name) ? ' · <span title="Ce bot dépasse la limite « CPU max » des réglages : priorité abaissée jusqu’à ce qu’il redescende">🐢 bridé (CPU max)</span>' : ''}` : stoppedByGame ? '⏸ coupé par le mode jeu' : esc(b.status)} · ↻ ${b.restarts}</span>
       <label class="chk" title="(Re)mis en ligne à l'ouverture de session Windows"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> Auto boot</label>
       <label class="chk" title="Arrêté quand un jeu est détecté (mode « bots cochés »)"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> Coupé en jeu</label>
       ${b.status === 'online'
@@ -99,6 +99,7 @@ const render = (st) => {
   // Réglages
   $('set-autolaunch').checked = !!st.cfg.autoLaunch;
   if (document.activeElement !== $('set-poll')) $('set-poll').value = st.cfg.pollSec;
+  if (document.activeElement !== $('set-cpumax')) $('set-cpumax').value = st.cfg.cpuMax || 0;
   $('set-scanauto').checked = st.cfg.scanAuto !== false;
   $('set-scaninfo').textContent = st.cfg.lastScanAt ? `(dernier scan : ${new Date(st.cfg.lastScanAt).toLocaleString('fr-FR')})` : '(aucun scan pour l\'instant)';
   $('dev-note').textContent = st.cfg.packaged ? '' : '(actif seulement dans la version .exe)';
@@ -251,6 +252,7 @@ document.addEventListener('change', async (e) => {
   if (t.id === 'gm-lownet') { await window.panel.setSetting('lowNet', t.checked); await refresh(); return; }
   if (t.id === 'set-autolaunch') { await window.panel.setSetting('autoLaunch', t.checked); await refresh(); return; }
   if (t.id === 'set-poll') { await window.panel.setSetting('pollSec', Number(t.value)); await refresh(); return; }
+  if (t.id === 'set-cpumax') { await window.panel.setSetting('cpuMax', Number(t.value)); await refresh(); return; }
   if (t.id === 'set-scanauto') { await window.panel.setSetting('scanAuto', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc') { await window.panel.setSetting('discordRpc', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc-id') { await window.panel.setSetting('discordAppId', t.value.trim()); await refresh(); return; }

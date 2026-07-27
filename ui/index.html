@@ -136,6 +136,12 @@
           <span style="color:var(--mut);font-size:12.5px">secondes</span>
         </div>
         <div class="row">
+          <span style="color:var(--mut);font-size:12.5px">CPU max par bot</span>
+          <input type="number" id="set-cpumax" min="0" max="95" step="5">
+          <span style="color:var(--mut);font-size:12.5px">% <b>(0 = désactivé)</b></span>
+        </div>
+        <div class="hint">Un bot qui dépasse durablement cette limite passe en <b>priorité basse</b> (🐢) : il n'utilise le processeur que quand rien d'autre n'en a besoin, et retrouve sa priorité normale dès qu'il redescend. Pratique pour qu'un bot gourmand ne gêne jamais le PC.</div>
+        <div class="row">
           <label class="switch"><input type="checkbox" id="set-scanauto"><span></span></label>
           <div>Chercher de nouveaux jeux installés <b>1×/jour</b> <span id="set-scaninfo" style="color:var(--mut);font-size:11px"></span></div>
         </div>
