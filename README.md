@@ -1,54 +1,78 @@
-<div align="center">
+# Hasu Panel
 
-# 🛡️ Hasu Panel
-
-**A lightweight desktop control panel for your [pm2](https://pm2.keymetrics.io/) bots.**
-Auto-boot your bots at login, free your PC while gaming, and keep the app up to date on its own.
-
-![platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows)
-![built with](https://img.shields.io/badge/built%20with-Electron-47848F?logo=electron)
-![auto update](https://img.shields.io/badge/auto--update-yes-3ba55d)
-
-</div>
+Un petit panneau de contrôle Windows pour tes bots [pm2](https://pm2.keymetrics.io/).
+Il les démarre à l'ouverture de session, les met en pause quand tu joues, et se met à jour tout seul.
 
 ---
 
-## ✨ What it does
+## Ce qu'il fait
 
-- **🤖 One place for all your bots** — live status of every pm2 process (uptime, RAM, CPU, network, restarts) with one-click **start / stop / restart**.
-- **▶️ Auto-boot per bot** — pick which bots come online automatically when Windows starts. Reliable even on Windows 11 (uses both the Run key *and* a logon scheduled task, because Windows can delay Run-key apps by minutes).
-- **🎮 Game mode** — when an **online** multiplayer game is detected, the panel pauses the bots you choose and brings them back a minute after you close the game. Solo/offline sessions are ignored (checked via real network activity, not just the process name).
-- **🌐 Low-internet mode** — during an online match, bots defer their heavy downloads and drop to low CPU priority so your game gets the bandwidth. Everything returns to normal afterwards.
-- **➕ Import any bot** — point it at a script (`index.js`, `bot.py`…) or a folder; it's handed to pm2 and managed like the rest. Your files are never modified.
-- **🔍 Game auto-detect** — scans your Steam & Epic libraries (once a day, never continuously) and lets you add any running program in one click.
-- **🎧 Discord Rich Presence** *(optional)* — shows "🤖 Managing X bots online" on your profile.
-- **🔄 Auto-update** — new versions download in the background and install on the next restart. Nothing to do.
+**Tous tes bots au même endroit.** L'état de chaque process pm2 en direct — durée de fonctionnement,
+RAM, CPU, réseau, nombre de redémarrages — avec démarrer, arrêter et relancer en un clic.
 
-## 🚀 Install
+**Le démarrage automatique, bot par bot.** Tu choisis lesquels se lancent avec Windows. Le panel passe
+à la fois par la clé Run *et* par une tâche planifiée à l'ouverture de session, parce que Windows 11
+retarde parfois les applis de la clé Run de plusieurs minutes.
 
-Download the latest **`HasuPanel-Setup.exe`** from the [Releases](https://github.com/saliox/hasu-panel/releases/latest) page and run it.
-No admin rights required — it installs per-user and starts automatically at login (toggleable).
+**Le mode jeu.** Quand tu lances une partie multijoueur **en ligne**, le panel coupe les bots que tu as
+cochés et les relance une minute après que tu aies fermé le jeu. Une partie solo ou hors-ligne ne
+déclenche rien : la détection se base sur l'activité réseau réelle, pas juste sur le nom du process.
 
-Closing the window minimizes to the tray. To quit: right-click the tray icon → **Quit**.
+**Le mode faible débit.** Pendant une partie en ligne, les bots repoussent leurs gros téléchargements et
+passent en priorité CPU basse pour te laisser la bande passante. Tout revient à la normale ensuite.
 
-## 🔄 How updates work
+**L'import de n'importe quel bot.** Tu pointes un script (`index.js`, `bot.py`…) ou un dossier, il est
+confié à pm2 et géré comme les autres. Tes fichiers ne sont jamais modifiés.
 
-Hasu Panel checks its GitHub releases on startup and every few hours. When a new version is available it's downloaded silently and applied the next time the app restarts (i.e. your next reboot) — or immediately via the tray's **"Update ready"** item. Install it once, and it stays current forever.
+**La détection des jeux.** Le panel parcourt tes bibliothèques Steam et Epic une fois par jour — jamais
+en continu — et te laisse ajouter n'importe quel programme en cours d'exécution en un clic.
 
-## 🔒 Privacy
+**Le Rich Presence Discord**, si tu veux : « 🤖 Gère X bots en ligne » sur ton profil.
 
-Hasu Panel holds **no credentials** — it only talks to your local pm2. It never sends your data anywhere: the only network calls are the update check (GitHub) and, if you enable it, Discord Rich Presence. Settings and logs live in `%APPDATA%\hasu-panel` and are never bundled or uploaded.
+**Les mises à jour automatiques.** Les nouvelles versions se téléchargent en fond et s'installent au
+redémarrage suivant.
 
-## 🛠️ Build from source
+## Installation
+
+Télécharge le dernier **`HasuPanel-Setup.exe`** depuis la page
+[Releases](https://github.com/saliox/hasu-panel/releases/latest) et lance-le.
+
+Pas besoin de droits admin : l'installation se fait par utilisateur et l'appli démarre à l'ouverture de
+session (désactivable). Fermer la fenêtre la réduit dans la zone de notification — pour vraiment quitter,
+clic droit sur l'icône puis **Quitter**.
+
+## Comment marchent les mises à jour
+
+Le panel regarde les releases GitHub au démarrage puis toutes les quelques heures. S'il y en a une
+nouvelle, elle se télécharge en silence et s'applique au prochain lancement de l'appli — ou tout de
+suite via l'entrée **« Mise à jour prête »** du menu de la zone de notification. Tu l'installes une
+fois, elle reste à jour ensuite.
+
+## Vie privée
+
+Hasu Panel ne détient **aucun identifiant**. Il ne parle qu'à ton pm2 local et n'envoie tes données
+nulle part : les seuls appels réseau sont la vérification de mise à jour (GitHub) et, si tu l'actives,
+le Rich Presence Discord. Réglages et journaux restent dans `%APPDATA%\hasu-panel`.
+
+## Sécurité
+
+Le panel lance des commandes système, donc quelques précautions sont prises :
+
+- pm2 est appelé **directement avec node**, sans passer par un shell — l'injection de commande est
+  impossible par construction.
+- Les noms de bots et de process sont validés par des règles strictes (`validators.js`), avec les tests
+  unitaires qui vont avec.
+- La fenêtre tourne avec `contextIsolation`, sans intégration Node, et ne charge aucun contenu distant.
+
+## Développer
 
 ```bash
 npm install
-npm start          # run in dev
-npm run installer  # build the Windows installer (dist/)
+npm test           # tests unitaires des validateurs
+npm start          # lancer en dev
+npm run installer  # construire l'installeur Windows (dist/)
 ```
 
 ---
 
-<div align="center">
-<sub>Made with Electron · pm2 · a lot of tea 🍵</sub>
-</div>
+*Fait avec Electron, pm2 et beaucoup de thé.*
