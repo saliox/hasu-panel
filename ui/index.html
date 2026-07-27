@@ -47,6 +47,7 @@
   input[type=text], input[type=number] { background: #12141d; color: var(--txt); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font-size: 13px; }
   input[type=number] { width: 70px; }
   .hint { color: var(--mut); font-size: 11.5px; margin-top: 6px; }
+  .tc-warn { background: #3a2a12; border: 1px solid #6b4e1f; border-radius: 8px; padding: 12px 14px; color: #f0dcae; font-size: 13px; line-height: 1.5; }
   .stopped-banner { color: var(--warn); font-size: 12.5px; margin-top: 8px; }
   .cardhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
   .cardhead h2 { margin-bottom: 0; }
@@ -149,6 +150,14 @@
           <input type="text" id="set-rpc-id" placeholder="Application ID Discord (18-19 chiffres)" style="flex:1" maxlength="40">
         </div>
         <div class="hint">Crée une appli sur <b>discord.com/developers/applications</b> → onglet <b>General Information</b> → copie l'<b>Application ID</b> et colle-le ici. Discord doit être ouvert sur ce PC.<span id="rpc-status"></span></div>
+
+        <h2 style="margin-top:16px">🔄 Mises à jour</h2>
+        <div class="row">
+          <span style="color:var(--mut);font-size:12.5px">Version : <b id="upd-version">—</b></span>
+          <button class="btn primary" id="upd-check">Vérifier les mises à jour</button>
+          <button class="btn" id="upd-apply" style="display:none">Redémarrer & appliquer</button>
+        </div>
+        <div id="upd-status" class="hint"></div>
       </div>
     </div>
   </div>

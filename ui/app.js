@@ -21,6 +21,7 @@ const fmtNet = (b) => {
 
 let cur = null; // dernier statut reçu
 let pending = false;
+let updBusy = false, updMsg = ''; // état du bouton « Vérifier les mises à jour »
 
 const render = (st) => {
   cur = st;
@@ -61,10 +62,25 @@ const render = (st) => {
   };
   const main = st.bots.filter((b) => !imported.includes(b.name));
   const imps = st.bots.filter((b) => imported.includes(b.name));
+  const tc = st.toolchain || { node: true, pm2: true };
+  // Chaîne d'outils manquante : au lieu du trompeur « Aucun process », on guide.
+  let empty;
+  if (!tc.node) {
+    empty = '<div class="tc-warn"><b>⚠️ Node.js n\'est pas installé.</b><br>pm2 (qui fait tourner les bots) a besoin de Node.js. '
+      + 'Installe-le d\'abord, puis reviens installer pm2.<div class="row" style="margin-top:8px">'
+      + '<button class="btn primary" id="tc-node">Télécharger Node.js</button></div></div>';
+  } else if (!tc.pm2) {
+    empty = '<div class="tc-warn"><b>⚠️ pm2 n\'est pas installé.</b><br>pm2 est l\'outil qui garde tes bots en ligne. '
+      + 'Clique pour l\'installer automatiquement (sans droits administrateur).'
+      + '<div class="row" style="margin-top:8px"><button class="btn primary" id="tc-pm2">Installer pm2</button>'
+      + '<span id="tc-pm2-status" style="color:var(--mut);font-size:12px"></span></div></div>';
+  } else {
+    empty = '<div class="hint">Aucun bot géré par pm2 pour l\'instant. Importe un bot avec « ➕ Importer » ci-dessus.</div>';
+  }
   $('bots').innerHTML = (
     main.map(botRow).join('') +
     (imps.length ? `<div class="sechead">🧩 Bots importés</div>${imps.map(botRow).join('')}` : '')
-  ) || '<div class="hint">Aucun process pm2 trouvé. Vérifie que pm2 tourne (pm2 list).</div>';
+  ) || empty;
 
   // Mode jeu
   $('gm-enabled').checked = !!st.cfg.gameMode.enabled;
@@ -97,6 +113,13 @@ const render = (st) => {
     : !st.cfg.discordAppId ? ' — ⚠️ colle ton Application ID pour l\'activer.'
     : !rpcSt.idValid ? ' — ⚠️ ID invalide (attendu : 17 à 20 chiffres, l\'Application ID du portail développeur Discord).'
     : ' — ⏳ en attente de Discord (lancé ? ID d\'application correct ?)…';
+
+  // Mises à jour
+  $('upd-version').textContent = st.cfg.version || '—';
+  const applyBtn = $('upd-apply');
+  applyBtn.style.display = st.updateReady ? '' : 'none';
+  if (st.updateReady && !updBusy) $('upd-status').innerHTML = '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».';
+  else if (!updBusy && !st.updateReady && !updMsg) $('upd-status').textContent = st.cfg.packaged ? '' : 'ℹ️ L\'auto-update est actif seulement dans la version installée (Setup.exe).';
 };
 
 const refresh = async () => {
@@ -150,6 +173,16 @@ const importFormHTML = (script, suggested) => `
 document.addEventListener('click', async (e) => {
   const t = e.target;
   if (t.id === 'modal-close' || t.id === 'modal') { closeModal(); return; }
+  // Chaîne d'outils manquante : télécharger Node.js / installer pm2.
+  if (t.id === 'tc-node') { window.open?.('https://nodejs.org/fr/download'); return; }
+  if (t.id === 'tc-pm2') {
+    t.disabled = true;
+    const st = document.getElementById('tc-pm2-status'); if (st) st.textContent = ' ⏳ installation de pm2… (jusqu\'à 1 min)';
+    let r; try { r = await window.panel.installPm2(); } catch { r = { ok: false }; }
+    if (r.ok) { if (st) st.textContent = ' ✅ pm2 installé !'; setTimeout(refresh, 800); }
+    else { t.disabled = false; if (st) st.textContent = r.reason === 'no-node' ? ' ❌ Node.js requis d\'abord.' : ' ❌ Échec — réessaie ou installe pm2 à la main.'; }
+    return;
+  }
   const addExe = t.closest?.('[data-addexe]');
   if (addExe) { await window.panel.addGame(addExe.dataset.addexe); closeModal(); await refresh(); return; }
   if (t.dataset?.scanadd) { await window.panel.addGame(t.dataset.scanadd); document.querySelector(`[data-scanrow="${CSS.escape(t.dataset.scanadd.toLowerCase())}"]`)?.remove(); await refresh(); return; }
@@ -183,6 +216,31 @@ const startImport = async (picker) => {
 };
 $('import-btn').addEventListener('click', () => startImport(window.panel.importPick));
 $('import-dir-btn').addEventListener('click', () => startImport(window.panel.importPickDir));
+
+// Mises à jour : vérification manuelle + application.
+$('upd-check').addEventListener('click', async () => {
+  updBusy = true; updMsg = '';
+  $('upd-check').disabled = true;
+  $('upd-status').textContent = '⏳ Recherche de mise à jour…';
+  let r; try { r = await window.panel.checkUpdate(); } catch { r = { state: 'error' }; }
+  const msg = {
+    dev: 'ℹ️ L\'auto-update ne fonctionne que dans la version installée (Setup.exe), pas en développement.',
+    uptodate: `✅ Tu as déjà la dernière version (${r.current || ''}).`,
+    available: `⬇️ Nouvelle version <b>${r.version || ''}</b> trouvée — téléchargement en cours, elle sera prête dans un instant.`,
+    downloaded: '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».',
+    error: `⚠️ Impossible de vérifier maintenant${r.message ? ' (' + r.message + ')' : ''}. Réessaie plus tard.`,
+  }[r.state] || '⚠️ Réponse inattendue.';
+  updMsg = msg;
+  $('upd-status').innerHTML = msg;
+  $('upd-check').disabled = false;
+  updBusy = false;
+  refresh();
+});
+$('upd-apply').addEventListener('click', async () => {
+  $('upd-apply').disabled = true;
+  $('upd-status').textContent = '🔄 Application de la mise à jour et redémarrage…';
+  await window.panel.applyUpdate();
+});
 document.addEventListener('change', async (e) => {
   const t = e.target;
   if (t.dataset?.bot && t.dataset?.key) { await window.panel.setBot(t.dataset.bot, t.dataset.key, t.checked); await refresh(); return; }

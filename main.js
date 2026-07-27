@@ -2,7 +2,7 @@
 // (quand un jeu multijoueur est détecté, coupe tous les bots ou ceux cochés, puis les relance).
 // Electron, aucune dépendance externe. Sécurité : noms pm2/exe validés par regex (anti-injection),
 // contextIsolation activé, aucun contenu distant chargé.
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell } = require('electron');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -12,14 +12,54 @@ const rpc = require('./discordrpc'); // Rich Presence Discord (IPC natif, sans d
 const IS_STARTUP = process.argv.includes('--startup'); // lancé par l'ouverture de session Windows
 const START_HIDDEN = process.argv.includes('--hidden');
 
+// ---------- Auto-update (electron-updater, releases GitHub saliox/hasu-panel) ----------
+// Sans écran : télécharge en fond et applique la MAJ au prochain redémarrage du panel (donc au
+// prochain démarrage du PC, puisqu'il se lance au logon). Pensé pour « installer chez un ami et
+// oublier ». Ne s'active QUE dans la version installée (NSIS) ; ignoré en dev / build « dir ».
+let updateReady = false, updaterRef = null, lastUpdateStatus = null;
+// Vrai si a > b en version sémantique X.Y.Z (comparaison numérique champ par champ).
+const semverGt = (a, b) => {
+  // Retire un éventuel préfixe "v"/"V" (ex. "v1.8.0") : sinon parseInt("v1", 10) vaut NaN||0 = 0,
+  // et une version distante réellement plus récente pouvait s'afficher comme plus ancienne/égale.
+  const pa = String(a || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
+  return false;
+};
+const setupAutoUpdate = () => {
+  if (!app.isPackaged) return;
+  try { ({ autoUpdater: updaterRef } = require('electron-updater')); } catch (e) { log('updater indispo', e.message); return; }
+  const autoUpdater = updaterRef;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;      // la MAJ s'installe à la fermeture (donc au reboot)
+  autoUpdater.on('update-available', (i) => { lastUpdateStatus = { state: 'available', version: i?.version }; log('MAJ disponible :', i?.version); });
+  autoUpdater.on('update-not-available', () => { lastUpdateStatus = { state: 'uptodate' }; });
+  autoUpdater.on('update-downloaded', (i) => { updateReady = true; lastUpdateStatus = { state: 'downloaded', version: i?.version }; log('MAJ téléchargée :', i?.version, '→ appliquée au prochain démarrage'); updateTray(); });
+  autoUpdater.on('error', (e) => { lastUpdateStatus = { state: 'error', message: e?.message || String(e) }; log('updater erreur :', e?.message || e); });
+  const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
+  setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
+  setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)
+};
+
 // pm2.cmd : emplacement npm par défaut, sinon résolution via le PATH (préfixe
-// npm personnalisé, nvm-windows…). Le chemin est TOUJOURS quoté à l'exécution :
-// avec shell:true, cmd.exe coupait « C:\Users\Jean Dupont\... » à l'espace et
-// tout le panel devenait un no-op silencieux pour ces profils Windows.
+// npm personnalisé, nvm-windows…).
 const PM2_DEFAULT = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 const PM2 = fs.existsSync(PM2_DEFAULT) ? PM2_DEFAULT : 'pm2.cmd';
 const NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/; // noms pm2 autorisés (jamais d'espace ni de quote → sûr avec shell)
 const EXE_RE = /^[A-Za-z0-9 _.()+'-]{1,80}\.exe$/i; // noms de process de jeu autorisés
+// Noms interdits comme clé de cfg.bots (objet simple) : "__proto__" via `cfg.bots[name] = …`
+// ne crée PAS une propriété normale, il réassigne le PROTOTYPE de cfg.bots (pollution en mémoire,
+// affecte la lecture de tout autre nom non configuré ensuite). "constructor"/"prototype" par
+// prudence pour la même raison. Les noms de périphériques Windows (CON, COM1…) sont aussi rejetés :
+// pm2 dérive son nom de fichier de log du nom du process, et un fichier littéralement nommé "CON"
+// bloque/plante les I/O sous Windows.
+const RESERVED_NAMES = new Set([
+  '__proto__', 'constructor', 'prototype',
+  'con', 'prn', 'aux', 'nul',
+  'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
+  'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
+]);
+const isSafeName = (n) => typeof n === 'string' && NAME_RE.test(n) && !RESERVED_NAMES.has(n.toLowerCase());
 
 // Dossier « data » du bot saliox (drapeaux de coordination panel ↔ bot). Par défaut : <profil>\Desktop\saliox bot\data
 // (résolu via os.homedir → aucun nom d'utilisateur codé en dur). Personnalisable via la variable d'env HASU_SALIOX_DATA.
@@ -52,7 +92,8 @@ const DEFAULTS = {
   bots: {},                 // { name: { auto: true, gameStop: false } }
   gameMode: { enabled: false, stopAll: false, graceSec: 60, soloSkip: true }, // soloSkip : ne rien couper si le jeu n'est pas EN LIGNE
   games: DEFAULT_GAMES,
-  pollSec: 10,
+  pollSec: 10,              // cadence de sondage quand la fenêtre est au 1er plan (réactif)
+  idlePollSec: 30,          // cadence ralentie quand le panel est dans le tray (personne ne regarde → moins de CPU/batterie)
   autoLaunch: true,
   lowNet: false,            // mode « faible usage internet » : priorité réseau au jeu en ligne
   lowNetApplied: false,     // persisté → on sait restaurer les priorités après un crash du panel
@@ -72,6 +113,15 @@ let lastGameSeen = null, lastGameAt = 0;
 let sessionOnline = false; // le jeu détecté a une vraie connexion Internet (session multijoueur)
 let statusCache = { bots: [], game: null, online: false, updatedAt: 0 };
 let busy = false; // évite deux bascules mode jeu simultanées
+// Verrou partagé par TOUS les appelants de enterGameMode/exitGameMode (tick, bascule manuelle
+// dans le tray, IPC panel:setGameMode) — avant, seul tick() posait `busy`, donc un clic manuel
+// pendant un tick en cours pouvait s'entrelacer avec lui (état pm2 final incohérent avec le
+// choix réel de l'utilisateur). `fn` est sauté silencieusement si une transition est déjà en cours.
+const withGameLock = async (fn) => {
+  if (busy) return;
+  busy = true;
+  try { await fn(); } finally { busy = false; }
+};
 let prevIo = new Map(); // pid -> { read, write, at } : relevé E/S précédent, pour calculer les DÉBITS (octets/s) par delta
 
 const log = (...a) => {
@@ -88,8 +138,8 @@ const loadCfg = () => {
       bots: raw.bots && typeof raw.bots === 'object' ? raw.bots : {},
       gameMode: { ...DEFAULTS.gameMode, ...(raw.gameMode || {}) },
       games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : DEFAULT_GAMES,
-      stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => NAME_RE.test(n)) : [],
-      imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => NAME_RE.test(n)) : [],
+      stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
+      imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
       ignoredExes: Array.isArray(raw.ignoredExes) ? raw.ignoredExes.filter((g) => EXE_RE.test(g)) : [],
       discovered: Array.isArray(raw.discovered) ? raw.discovered.filter((g) => g && EXE_RE.test(g.exe || '')) : [],
       discordAppId: (typeof raw.discordAppId === 'string' && raw.discordAppId.trim()) ? raw.discordAppId.trim().slice(0, 40) : DEFAULTS.discordAppId
@@ -98,8 +148,26 @@ const loadCfg = () => {
 };
 const saveCfg = () => { try { fs.writeFileSync(cfgPath(), JSON.stringify(cfg, null, 2)); } catch (e) { log('saveCfg', e.message); } };
 
+// ---------- Détection de la chaîne d'outils (Node + pm2) ----------
+// Chez un ami, pm2 (voire Node) peut ne pas être installé → le panel affichait juste « Aucun process »,
+// ce qui laisse croire à un bug. On détecte l'absence et on propose de l'installer.
+let toolchain = { node: true, pm2: true };
+const probeToolchain = () => new Promise((resolve) => {
+  // pm2 accessible via le PATH ?
+  execFile('pm2', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (err, out) => {
+    if (!err && /\d+\.\d+/.test(String(out || ''))) return resolve({ node: true, pm2: true });
+    const pm2AtNpm = (() => { try { return fs.existsSync(PM2); } catch { return false; } })();
+    execFile('node', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (e2, o2) => {
+      resolve({ node: !e2 && /v\d+/.test(String(o2 || '')), pm2: pm2AtNpm });
+    });
+  });
+});
+
 // ---------- pm2 ----------
 // shell:true nécessaire pour lancer un .cmd → chaque argument est validé AVANT (aucune injection possible).
+// Le chemin de pm2.cmd est ENTOURÉ DE GUILLEMETS : sous shell, Node ne cite pas le fichier, donc un
+// nom d'utilisateur avec espace (%APPDATA% contient un espace) tronquerait la commande. cmd.exe parse
+// correctement « "C:\...\npm\pm2.cmd" jlist » (et le cas sans espace reste valide).
 let pm2FailLogged = false; // premier échec loggué (sinon un pm2 absent spammait panel.log à chaque tick)
 const pm2Raw = (args) => new Promise((resolve) => {
   execFile(`"${PM2}"`, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
@@ -126,7 +194,7 @@ const pm2List = async () => {
       memory: p.monit?.memory || 0,
       cpu: p.monit?.cpu || 0,
       pid: Number(p.pid) || 0
-    })).filter((b) => NAME_RE.test(b.name));
+    })).filter((b) => isSafeName(b.name));
   } catch { return []; }
 };
 
@@ -217,7 +285,7 @@ const isPublicAddress = (ip) => {
   const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
     const a = Number(v4[1]), b = Number(v4[2]);
-    if (a === 0 || a === 127 || a === 10) return false;
+    if (a === 0 || a === 127 || a === 10 || a === 255) return false;
     if (a === 192 && b === 168) return false;
     if (a === 169 && b === 254) return false;
     if (a === 172 && b >= 16 && b <= 31) return false;
@@ -331,14 +399,18 @@ const clearLowNet = async () => {
 const BAD_SHELL_RE = /[&|<>^"%!\r\n`;]/; // métacaractères cmd interdits dans un chemin (shell:true)
 
 const importBot = async (name, script) => {
-  if (!NAME_RE.test(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
+  if (!isSafeName(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
   script = path.resolve(String(script || ''));
   if (BAD_SHELL_RE.test(script)) return { ok: false, error: 'Chemin non pris en charge (caractères spéciaux)' };
   if (!/\.(js|mjs|cjs|py)$/i.test(script) || !fs.existsSync(script)) return { ok: false, error: 'Fichier introuvable (attendu : .js, .mjs, .cjs ou .py)' };
   const existing = await pm2List();
   if (existing.some((b) => b.name.toLowerCase() === name.toLowerCase())) return { ok: false, error: `« ${name} » existe déjà dans pm2 — choisis un autre nom` };
   const dir = path.dirname(script);
-  const r = await pm2Raw(['start', `"${script}"`, '--name', name, '--cwd', `"${dir}"`]);
+  // Un script à la racine d'un disque (D:\bot.js) donne dir = « D:\ » : cité tel quel → « "D:\" »,
+  // et cmd.exe interprète le \" final comme un guillemet échappé (fusion de jetons). On ajoute un « . »
+  // à un backslash final (D:\ → D:\.) pour que --cwd désigne bien la racine sans casser le parsing.
+  const cwd = dir.endsWith('\\') ? `${dir}.` : dir;
+  const r = await pm2Raw(['start', `"${script}"`, '--name', name, '--cwd', `"${cwd}"`]);
   if (!r.ok) { log('import ÉCHEC:', name, script, '—', r.out.slice(0, 400)); return { ok: false, error: 'pm2 a refusé le démarrage — vérifie le fichier (détails dans panel.log)' }; }
   await pm2(['save']); // survivra au redémarrage du PC (pm2 resurrect)
   if (!cfg.imported.includes(name)) cfg.imported.push(name);
@@ -350,7 +422,7 @@ const importBot = async (name, script) => {
 };
 
 const removeBot = async (name) => {
-  if (!NAME_RE.test(name) || !cfg.imported.includes(name)) return { ok: false, error: 'Seuls les bots importés peuvent être retirés ici' };
+  if (!isSafeName(name) || !cfg.imported.includes(name)) return { ok: false, error: 'Seuls les bots importés peuvent être retirés ici' };
   await pm2(['delete', name]);
   await pm2(['save']);
   cfg.imported = cfg.imported.filter((n) => n !== name);
@@ -479,7 +551,7 @@ const enterGameMode = async (game) => {
 };
 
 const exitGameMode = async () => {
-  const names = cfg.stoppedByGame.filter((n) => n !== '-' && NAME_RE.test(n)); // '-' = marqueur « rien à couper »
+  const names = cfg.stoppedByGame.filter((n) => n !== '-' && isSafeName(n)); // '-' = marqueur « rien à couper »
   names.sort((a, b) => (b === 'saliox') - (a === 'saliox')); // saliox relancé en premier
   for (const n of names) await pm2(['start', n]);
   clearFlag();
@@ -514,8 +586,7 @@ const tickBody = async () => {
     } else if (!gameRunning && graceOver) sessionOnline = false;
     statusCache.online = gameRunning && sessionOnline;
 
-    if (!busy) {
-      busy = true;
+    await withGameLock(async () => {
       try {
         if (cfg.gameMode.enabled && gameRunning && sessionOnline && cfg.stoppedByGame.length === 0) {
           await enterGameMode(hit);
@@ -529,8 +600,7 @@ const tickBody = async () => {
           await clearLowNet(); // couvre aussi la reprise après crash/redémarrage du panel
         }
       } catch (e) { log('tick', e.message); }
-      busy = false;
-    }
+    });
   }
   statusCache.bots = await pm2List();
   await measureNet().catch(() => {}); // débit réseau (E/S) par bot, affiché à côté du CPU
@@ -548,9 +618,15 @@ const tickBody = async () => {
 const bootEnforce = async () => {
   let list = await pm2List();
   if (!list.length) { // le .cmd « pm2 resurrect » de la Startup n'est peut-être pas encore passé
-    await pm2(['resurrect']);
-    await new Promise((r) => setTimeout(r, 5000));
-    list = await pm2List();
+    // Boot lent : au lieu d'abandonner après un seul délai de 5 s, on réessaie resurrect + relecture
+    // plusieurs fois avec des délais croissants (~40 s cumulés) jusqu'à voir des process.
+    const delays = [3000, 5000, 8000, 12000, 12000];
+    for (let i = 0; i < delays.length && !list.length; i++) {
+      await pm2(['resurrect']);
+      await new Promise((r) => setTimeout(r, delays[i]));
+      list = await pm2List();
+    }
+    if (!list.length) log('bootEnforce: aucun process pm2 après plusieurs resurrect — auto-démarrage abandonné pour cette session');
   }
   for (const b of list) {
     const c = cfg.bots[b.name];
@@ -621,23 +697,24 @@ const updateTray = () => {
   tray.setToolTip(tip);
   // menu natif reconstruit uniquement quand son contenu change (le rebuild à
   // chaque tick pouvait désynchroniser un menu ouvert et allouait pour rien)
-  const sig = `${tip}|${cfg.gameMode.enabled}`;
+  const sig = `${tip}|${cfg.gameMode.enabled}|${updateReady}`;
   if (sig === lastTraySig) return;
   lastTraySig = sig;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Ouvrir le panel', click: () => showWindow() },
     {
       label: `Mode jeu : ${cfg.gameMode.enabled ? 'activé ✔' : 'désactivé'}`,
-      click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await exitGameMode(); updateTray(); }
+      click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); updateTray(); }
     },
+    ...(updateReady ? [{ label: '🔄 Mise à jour prête — appliquer & redémarrer', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
     { type: 'separator' },
-    { label: 'Quitter', click: async () => { quitting = true; if (cfg.lowNetApplied) await clearLowNet().catch(() => {}); app.quit(); } }
+    { label: 'Quitter', click: () => { quitting = true; app.quit(); } } // le nettoyage passe par before-quit (restaure les bots + drapeaux)
   ]));
 };
 
 // ---------- Fenêtre ----------
 const showWindow = () => {
-  if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); return; } // restaure depuis le tray/minimisé
+  if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); restartPoll(true); return; } // restaure depuis le tray + rafraîchit tout de suite
   win = new BrowserWindow({
     width: 1020, height: 760, minWidth: 860, minHeight: 560,
     backgroundColor: '#0f1117',
@@ -646,6 +723,14 @@ const showWindow = () => {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: false }
   });
   win.removeMenu();
+  // window.open('https://...') (ex. lien « Télécharger Node.js ») ouvrait sinon une SECONDE
+  // BrowserWindow Electron chargeant le contenu distant EN INTERNE — contraire au commentaire
+  // d'en-tête du fichier ("aucun contenu distant chargé") et à l'anti-pattern documenté par
+  // Electron. On route systématiquement vers le navigateur système et on refuse la fenêtre in-app.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
   win.loadFile(path.join(__dirname, 'ui', 'index.html'));
   win.on('close', (e) => { if (!quitting) { e.preventDefault(); win.hide(); } }); // fermer = réduire dans le tray
   win.on('minimize', (e) => { e.preventDefault(); win.hide(); }); // minimiser = réduire dans le tray (comme Hasu ftn)
@@ -659,6 +744,9 @@ ipcMain.handle('panel:status', () => ({
   online: statusCache.online,
   lowNetActive: !!cfg.lowNetApplied,
   updatedAt: statusCache.updatedAt,
+  updateReady,
+  updateStatus: lastUpdateStatus,
+  toolchain,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
   // état EFFECTIF de la Rich Presence (l'UI affichait « activée » sur la seule
   // présence d'un ID en config, même invalide ou supplanté par la variable d'env)
@@ -668,7 +756,7 @@ ipcMain.handle('panel:status', () => ({
     fromEnv: !!(process.env.HASU_DISCORD_APP_ID || '').trim(),
     connected: rpc.status().ready
   },
-  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
+  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
 
 // Scan disque à la demande (bouton « Scanner ») + gestion des suggestions.
@@ -753,15 +841,25 @@ ipcMain.handle('panel:importPickDir', async () => {
 ipcMain.handle('panel:importBot', (_e, { name, script } = {}) => importBot(String(name || '').trim(), script));
 ipcMain.handle('panel:removeBot', (_e, { name } = {}) => removeBot(String(name || '')));
 
+// Verrou par bot : le render() du renderer reconstruit le DOM et réactive les boutons, donc un
+// double-clic pourrait lancer deux start/stop concurrents sur le même bot (état final indéterminé).
+// On refuse ici toute nouvelle action tant qu'une action est déjà en cours pour ce bot.
+const actionsInFlight = new Set();
 ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
-  if (!NAME_RE.test(String(name || '')) || !['start', 'stop', 'restart'].includes(action)) return { ok: false };
-  const r = await pm2([action, name]);
-  statusCache.bots = await pm2List();
-  return { ok: r.ok };
+  if (!isSafeName(String(name || '')) || !['start', 'stop', 'restart'].includes(action)) return { ok: false };
+  if (actionsInFlight.has(name)) return { ok: false, out: 'action en cours' };
+  actionsInFlight.add(name);
+  try {
+    const r = await pm2([action, name]);
+    statusCache.bots = await pm2List();
+    return { ok: r.ok };
+  } finally {
+    actionsInFlight.delete(name);
+  }
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {
-  if (!NAME_RE.test(String(name || '')) || !['auto', 'gameStop'].includes(key)) return { ok: false };
+  if (!isSafeName(String(name || '')) || !['auto', 'gameStop'].includes(key)) return { ok: false };
   cfg.bots[name] = { auto: true, gameStop: false, ...(cfg.bots[name] || {}), [key]: !!value };
   saveCfg();
   return { ok: true };
@@ -773,7 +871,7 @@ ipcMain.handle('panel:setGameMode', async (_e, patch = {}) => {
   if (typeof patch.soloSkip === 'boolean') cfg.gameMode.soloSkip = patch.soloSkip;
   if (Number.isFinite(patch.graceSec)) cfg.gameMode.graceSec = Math.max(10, Math.min(3600, Math.floor(patch.graceSec)));
   saveCfg();
-  if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await exitGameMode(); // désactivation = tout relancer
+  if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); // désactivation = tout relancer
   updateTray();
   return { ok: true };
 });
@@ -796,6 +894,7 @@ ipcMain.handle('panel:removeGame', (_e, exe) => {
 ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'autoLaunch') { cfg.autoLaunch = !!value; saveCfg(); applyAutoLaunch(); return { ok: true }; }
   if (key === 'pollSec') { cfg.pollSec = Math.max(5, Math.min(120, Math.floor(Number(value) || 10))); saveCfg(); restartPoll(); return { ok: true }; }
+  if (key === 'idlePollSec') { cfg.idlePollSec = Math.max(15, Math.min(300, Math.floor(Number(value) || 30))); saveCfg(); restartPoll(); return { ok: true }; }
   if (key === 'lowNet') { cfg.lowNet = !!value; saveCfg(); return { ok: true }; } // le tick applique/retire tout seul
   if (key === 'scanAuto') { cfg.scanAuto = !!value; saveCfg(); return { ok: true }; }
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
@@ -803,12 +902,68 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   return { ok: false };
 });
 
-// ---------- Boucle ----------
+// Vérification MANUELLE des mises à jour (bouton « Vérifier les mises à jour »).
+// Renvoie un état lisible : dev (non installé), uptodate, available (télécharge), downloaded (prête), error.
+ipcMain.handle('panel:checkUpdate', async () => {
+  if (!app.isPackaged) return { state: 'dev', current: app.getVersion() };
+  if (updateReady) return { state: 'downloaded', current: app.getVersion(), version: lastUpdateStatus?.version };
+  if (!updaterRef) { try { ({ autoUpdater: updaterRef } = require('electron-updater')); } catch (e) { return { state: 'error', message: e.message }; } }
+  try {
+    const r = await updaterRef.checkForUpdates();
+    const latest = r?.updateInfo?.version;
+    // Comparaison sémantique : « dispo » seulement si la version publiée est STRICTEMENT plus récente
+    // (une version identique ou plus ancienne ne doit jamais s'afficher comme une mise à jour).
+    return { state: semverGt(latest, app.getVersion()) ? 'available' : 'uptodate', current: app.getVersion(), version: latest };
+  } catch (e) { return { state: 'error', current: app.getVersion(), message: e?.message || String(e) }; }
+});
+
+// Applique la mise à jour téléchargée et redémarre (bouton « Redémarrer & appliquer »).
+ipcMain.handle('panel:applyUpdate', () => {
+  if (!updateReady || !updaterRef) return { ok: false };
+  quitting = true;
+  setTimeout(() => { try { updaterRef.quitAndInstall(); } catch {} }, 200);
+  return { ok: true };
+});
+
+// Installe pm2 globalement (bouton « Installer pm2 » quand il manque). Sans admin : npm installe dans le
+// préfixe utilisateur (%APPDATA%\npm). Nécessite Node/npm ; sinon on renvoie 'no-node' (guider vers nodejs.org).
+ipcMain.handle('panel:installPm2', async () => {
+  if (!toolchain.node) return { ok: false, reason: 'no-node' };
+  const r = await new Promise((resolve) => {
+    execFile('npm', ['install', '-g', 'pm2'], { shell: true, windowsHide: true, timeout: 240000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
+      resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim().slice(-600) });
+    });
+  });
+  log('install pm2 :', r.ok ? 'OK' : 'échec', r.out.slice(0, 200));
+  if (r.ok) { toolchain = await probeToolchain(); await tick().catch(() => {}); } // re-sonde + rafraîchit la liste
+  return { ok: r.ok && toolchain.pm2, out: r.out };
+});
+
+// ---------- Boucle (cadence adaptative) ----------
+// Fenêtre au 1er plan → cadence normale (réactif). Panel dans le tray (personne ne regarde) → cadence
+// ralentie = moins de spawns tasklist/pm2 = moins de CPU/batterie sur portable. Exception : si une
+// bascule AUTOMATIQUE dépend du sondage (mode jeu ou faible usage internet), on garde un rythme réactif
+// (~15 s) même caché, sinon un jeu qui se lance mettrait jusqu'à 30 s à couper les bots.
 let pollTimer = null;
-const restartPoll = () => {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => { tick().catch((e) => log('tick fatal', e.message)); }, cfg.pollSec * 1000);
-};
+let pollEpoch = 0;
+function pollDelayMs() {
+  const visible = !!(win && !win.isDestroyed() && win.isVisible());
+  if (visible) return Math.max(2, cfg.pollSec) * 1000;
+  const idle = Math.max(cfg.pollSec, cfg.idlePollSec || 30);
+  const responsive = cfg.gameMode.enabled || cfg.lowNet; // ces features réagissent à la détection → restent vives
+  return (responsive ? Math.min(idle, 15) : idle) * 1000;
+}
+function restartPoll(immediate = false) {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  const epoch = ++pollEpoch; // invalide toute chaîne de timers précédente (évite deux boucles en parallèle)
+  const loop = () => {
+    tick().catch((e) => log('tick fatal', e.message)).finally(() => {
+      if (epoch !== pollEpoch) return; // un restartPoll plus récent a pris le relais → cette chaîne s'arrête
+      pollTimer = setTimeout(loop, pollDelayMs());
+    });
+  };
+  pollTimer = setTimeout(loop, immediate ? 0 : pollDelayMs());
+}
 
 // ---------- Démarrage ----------
 if (process.argv.includes('--selftest')) {
@@ -841,6 +996,8 @@ else {
     updateTray();
     applyAutoLaunch();
     startRpc(); // Rich Presence Discord (si activée + App ID configuré)
+    setupAutoUpdate(); // auto-update en fond (version installee uniquement)
+    probeToolchain().then((t) => { toolchain = t; }).catch(() => {}); // détecte Node/pm2 (guide si absent)
     if (!START_HIDDEN) showWindow();
 
     if (IS_STARTUP) {
@@ -854,6 +1011,21 @@ else {
     if (added) saveCfg();
     restartPoll();
   });
-  app.on('before-quit', () => { quitting = true; psStop(); });
+  // Nettoyage à la fermeture : on relance les bots coupés par le mode jeu et on efface les drapeaux
+  // (watchdog + faible usage internet). Sinon les bots resteraient éteints et les alertes crash
+  // suspendues indéfiniment. before-quit peut être asynchrone → on diffère la sortie le temps du nettoyage.
+  let cleanedUp = false;
+  app.on('before-quit', (e) => {
+    quitting = true;
+    if (cleanedUp) { psStop(); return; } // nettoyage déjà fait → on laisse Electron quitter
+    e.preventDefault();
+    (async () => {
+      try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.length) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
+      try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
+      psStop(); // le worker PowerShell n'est plus utile après le nettoyage (clearLowNet s'en sert)
+      cleanedUp = true;
+      app.quit();
+    })();
+  });
   app.on('window-all-closed', () => { /* on reste dans le tray */ });
 }
