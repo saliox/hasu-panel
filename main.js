@@ -3,7 +3,7 @@
 // Electron, aucune dépendance externe. Sécurité : noms pm2/exe validés par regex (anti-injection),
 // contextIsolation activé, aucun contenu distant chargé.
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog } = require('electron');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -130,6 +130,66 @@ const pm2List = async () => {
   } catch { return []; }
 };
 
+// ---------- Worker PowerShell persistant ----------
+// Un seul powershell.exe longue durée exécute toutes les sondes (débits E/S,
+// détection en ligne, priorités CPU, débit du lien, programmes ouverts) au
+// lieu d'un démarrage à froid par appel (~8 640/jour à 10 s de tick, ~0,5 s
+// CPU et ~50 Mo chacun). Chaque requête est encodée en Base64 → une seule
+// ligne sur stdin, sortie délimitée par un marqueur unique. En cas de blocage
+// (timeout) ou de crash, le worker est tué et relancé ; l'appel en cours
+// résout null (même sémantique d'échec que les anciens execFile).
+let psProc = null, psJobs = [], psJob = null, psBuf = '', psSeq = 0;
+const psSpawn = () => {
+  const p = spawn('powershell.exe',
+    ['-NoLogo', '-NoExit', '-NoProfile', '-InputFormat', 'Text', '-OutputFormat', 'Text', '-Command', '-'],
+    { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+  p.stdout.setEncoding('utf8');
+  p.stdout.on('data', (d) => { if (psProc === p) { psBuf += d; psDrain(); } });
+  p.on('error', () => { if (psProc === p) psFail(); });
+  p.on('exit', () => { if (psProc === p) psFail(); });
+  return p;
+};
+const psFail = () => {
+  psProc = null; psBuf = '';
+  const j = psJob; psJob = null;
+  if (j) { clearTimeout(j.timer); j.resolve(null); }
+  psNext(); // la file repart sur un worker neuf
+};
+const psDrain = () => {
+  if (!psJob) return;
+  const i = psBuf.indexOf(psJob.marker);
+  if (i < 0) return;
+  const out = psBuf.slice(0, i);
+  psBuf = psBuf.slice(i + psJob.marker.length).replace(/^\r?\n/, '');
+  const j = psJob; psJob = null;
+  clearTimeout(j.timer);
+  j.resolve(out);
+  psNext();
+};
+const psNext = () => {
+  if (psJob || !psJobs.length) return;
+  if (!psProc) { psProc = psSpawn(); psBuf = ''; }
+  const j = psJobs.shift();
+  psJob = j;
+  j.timer = setTimeout(() => { // commande bloquée → worker neuf, la suite de la file continue
+    const p = psProc; psProc = null; psBuf = '';
+    try { if (p) p.kill(); } catch {}
+    const cur = psJob; psJob = null;
+    if (cur) cur.resolve(null);
+    psNext();
+  }, j.timeout);
+  const b64 = Buffer.from(j.script, 'utf16le').toString('base64');
+  try {
+    psProc.stdin.write(`try { iex ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64}'))) } catch {}; Write-Output '${j.marker}'\n`);
+  } catch { psFail(); }
+};
+// psRun(script) → stdout (string) ou null en cas d'échec/timeout.
+const psRun = (script, timeout = 20000) => new Promise((resolve) => {
+  psJobs.push({ script, timeout, resolve, marker: `##PSDONE${psSeq++}##` });
+  psNext();
+});
+const psStop = () => { const p = psProc; psProc = null; try { if (p) p.kill(); } catch {} };
+
 // ---------- Détection de jeu (liste de process + PID) ----------
 const listProcs = () => new Promise((resolve) => {
   execFile('tasklist.exe', ['/fo', 'csv', '/nh'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
@@ -173,44 +233,38 @@ const isPublicAddress = (ip) => {
   return true;
 };
 
-const hasOnlineActivity = (pids) => new Promise((resolve) => {
+const hasOnlineActivity = async (pids) => {
   pids = (Array.isArray(pids) ? pids : []).filter((p) => Number.isInteger(p) && p > 0);
-  if (!pids.length) return resolve(false);
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    `Get-NetTCPConnection -State Established -OwningProcess ${pids.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RemoteAddress`],
-    { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
-      if (err || !out) return resolve(false);
-      for (const line of String(out).split('\n')) {
-        const ip = line.trim();
-        if (ip && isPublicAddress(ip)) return resolve(true);
-      }
-      resolve(false);
-    });
-});
+  if (!pids.length) return false;
+  const out = await psRun(`Get-NetTCPConnection -State Established -OwningProcess ${pids.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RemoteAddress`);
+  if (!out) return false;
+  for (const line of String(out).split('\n')) {
+    const ip = line.trim();
+    if (ip && isPublicAddress(ip)) return true;
+  }
+  return false;
+};
 
 // ---------- Débit réseau par bot ----------
 // Octets d'E/S CUMULÉS par process (Win32_Process.ReadTransferCount + WriteTransferCount). Pour un bot Discord,
 // l'E/S est quasi exclusivement du RÉSEAU (gateway websocket + API REST) + un peu de disque (SQLite) : c'est
 // un proxy honnête du réseau, sans admin (le vrai réseau pur par process exigerait de l'ETW + élévation).
 // Le tick transforme ce cumul en DÉBIT (octets/s) via le delta entre deux relevés.
-const ioRawByPid = (pids) => new Promise((resolve) => {
+const ioRawByPid = async (pids) => {
   const m = new Map();
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
-  if (!pids.length) return resolve(m);
+  if (!pids.length) return m;
   const filter = pids.map((p) => `ProcessId=${p}`).join(' OR ');
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    `Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$([int64]$_.ReadTransferCount):$([int64]$_.WriteTransferCount)" }`],
-    { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
-      if (err || !out) return resolve(m);
-      for (const line of String(out).split('\n')) {
-        const p = line.trim().split(':'); // "PID:read:write" (octets cumulés lus / écrits)
-        if (p.length < 3) continue;
-        const pid = Number(p[0]), read = Number(p[1]), write = Number(p[2]);
-        if (pid > 0 && Number.isFinite(read) && Number.isFinite(write)) m.set(pid, { read, write });
-      }
-      resolve(m);
-    });
-});
+  const out = await psRun(`Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$([int64]$_.ReadTransferCount):$([int64]$_.WriteTransferCount)" }`);
+  if (!out) return m;
+  for (const line of String(out).split('\n')) {
+    const p = line.trim().split(':'); // "PID:read:write" (octets cumulés lus / écrits)
+    if (p.length < 3) continue;
+    const pid = Number(p[0]), read = Number(p[1]), write = Number(p[2]);
+    if (pid > 0 && Number.isFinite(read) && Number.isFinite(write)) m.set(pid, { read, write });
+  }
+  return m;
+};
 
 // Enrichit statusCache.bots avec b.net (octets/s) = delta d'E/S cumulée depuis le relevé précédent / temps écoulé.
 const measureNet = async () => {
@@ -234,26 +288,22 @@ const measureNet = async () => {
 // Sans droits admin, on agit sur ce qu'on contrôle VRAIMENT : 1) drapeau lu par saliox → gros
 // transferts différés (phishlist ~Mo, backups chiffrés) ; 2) priorité CPU des bots abaissée
 // (moins de contention pendant la partie). Niveau choisi selon le débit du lien réseau.
-const setBotPriority = (pids, cls) => new Promise((resolve) => {
+const setBotPriority = async (pids, cls) => {
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
-  if (!pids.length || !['Normal', 'BelowNormal', 'Idle'].includes(cls)) return resolve(false);
-  const cmd = `foreach($p in ${pids.join(',')}){ try { (Get-Process -Id $p -ErrorAction Stop).PriorityClass = '${cls}' } catch {} }`;
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true, timeout: 20000 }, () => resolve(true));
-});
+  if (!pids.length || !['Normal', 'BelowNormal', 'Idle'].includes(cls)) return false;
+  await psRun(`foreach($p in ${pids.join(',')}){ try { (Get-Process -Id $p -ErrorAction Stop).PriorityClass = '${cls}' } catch {} }`);
+  return true;
+};
 
-const linkSpeedMbps = () => new Promise((resolve) => {
+const linkSpeedMbps = async () => {
   // Propriété numérique Speed (bits/s) et non LinkSpeed : LinkSpeed est une
   // chaîne d'AFFICHAGE formatée selon la culture (« 866,7 Mbps » en français
   // → la regex capturait « 7 » → bots à tort en priorité Idle sur un lien
   // rapide). On prend l'adaptateur actif le plus rapide.
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    "(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Sort-Object -Property Speed -Descending | Select-Object -First 1 -ExpandProperty Speed)"],
-    { windowsHide: true, timeout: 20000 }, (err, out) => {
-      if (err) return resolve(0);
-      const bps = parseInt(String(out || '').trim(), 10);
-      resolve(Number.isFinite(bps) && bps > 0 ? bps / 1e6 : 0);
-    });
-});
+  const out = await psRun("(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Sort-Object -Property Speed -Descending | Select-Object -First 1 -ExpandProperty Speed)");
+  const bps = parseInt(String(out || '').trim(), 10);
+  return Number.isFinite(bps) && bps > 0 ? bps / 1e6 : 0;
+};
 
 const applyLowNet = async (game) => {
   const speed = await linkSpeedMbps();
@@ -633,26 +683,23 @@ ipcMain.handle('panel:ignoreGame', (_e, exe) => {
 });
 
 // Liste des programmes ouverts (avec une fenêtre) → pour ajouter un jeu/logiciel inconnu en 1 clic.
-ipcMain.handle('panel:runningApps', () => new Promise((resolve) => {
+ipcMain.handle('panel:runningApps', async () => {
   const SKIP = new Set(['hasupanel', 'explorer', 'applicationframehost', 'systemsettings', 'textinputhost', 'electron', 'searchhost', 'startmenuexperiencehost', 'shellexperiencehost']);
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { $_.ProcessName + '|' + $_.MainWindowTitle }"],
-    { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
-      if (err || !out) return resolve([]);
-      const seen = new Map();
-      for (const line of String(out).split('\n')) {
-        const i = line.indexOf('|');
-        if (i < 1) continue;
-        const name = line.slice(0, i).trim();
-        const title = line.slice(i + 1).trim();
-        if (!name || SKIP.has(name.toLowerCase())) continue;
-        const exe = `${name}.exe`;
-        if (!EXE_RE.test(exe) || seen.has(exe.toLowerCase())) continue;
-        seen.set(exe.toLowerCase(), { exe, title: title.slice(0, 70) });
-      }
-      resolve([...seen.values()].sort((a, b) => a.exe.localeCompare(b.exe)));
-    });
-}));
+  const out = await psRun("Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { $_.ProcessName + '|' + $_.MainWindowTitle }");
+  if (!out) return [];
+  const seen = new Map();
+  for (const line of String(out).split('\n')) {
+    const i = line.indexOf('|');
+    if (i < 1) continue;
+    const name = line.slice(0, i).trim();
+    const title = line.slice(i + 1).trim();
+    if (!name || SKIP.has(name.toLowerCase())) continue;
+    const exe = `${name}.exe`;
+    if (!EXE_RE.test(exe) || seen.has(exe.toLowerCase())) continue;
+    seen.set(exe.toLowerCase(), { exe, title: title.slice(0, 70) });
+  }
+  return [...seen.values()].sort((a, b) => a.exe.localeCompare(b.exe));
+});
 
 // Choisir un .exe sur le disque (jeu pas encore lancé) — seul le NOM du fichier est gardé.
 ipcMain.handle('panel:pickExe', async () => {
@@ -807,6 +854,6 @@ else {
     if (added) saveCfg();
     restartPoll();
   });
-  app.on('before-quit', () => { quitting = true; });
+  app.on('before-quit', () => { quitting = true; psStop(); });
   app.on('window-all-closed', () => { /* on reste dans le tray */ });
 }
