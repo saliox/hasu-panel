@@ -12,7 +12,12 @@ const rpc = require('./discordrpc'); // Rich Presence Discord (IPC natif, sans d
 const IS_STARTUP = process.argv.includes('--startup'); // lancé par l'ouverture de session Windows
 const START_HIDDEN = process.argv.includes('--hidden');
 
-const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
+// pm2.cmd : emplacement npm par défaut, sinon résolution via le PATH (préfixe
+// npm personnalisé, nvm-windows…). Le chemin est TOUJOURS quoté à l'exécution :
+// avec shell:true, cmd.exe coupait « C:\Users\Jean Dupont\... » à l'espace et
+// tout le panel devenait un no-op silencieux pour ces profils Windows.
+const PM2_DEFAULT = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
+const PM2 = fs.existsSync(PM2_DEFAULT) ? PM2_DEFAULT : 'pm2.cmd';
 const NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/; // noms pm2 autorisés (jamais d'espace ni de quote → sûr avec shell)
 const EXE_RE = /^[A-Za-z0-9 _.()+'-]{1,80}\.exe$/i; // noms de process de jeu autorisés
 
@@ -95,8 +100,10 @@ const saveCfg = () => { try { fs.writeFileSync(cfgPath(), JSON.stringify(cfg, nu
 
 // ---------- pm2 ----------
 // shell:true nécessaire pour lancer un .cmd → chaque argument est validé AVANT (aucune injection possible).
+let pm2FailLogged = false; // premier échec loggué (sinon un pm2 absent spammait panel.log à chaque tick)
 const pm2Raw = (args) => new Promise((resolve) => {
-  execFile(PM2, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
+  execFile(`"${PM2}"`, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
+    if (err && !pm2FailLogged) { pm2FailLogged = true; log('pm2 échec (chemin:', PM2, ') :', err.message.slice(0, 200)); }
     resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
   });
 });
@@ -143,22 +150,42 @@ const listProcs = () => new Promise((resolve) => {
 // Jeu EN LIGNE ou solo ? → au moins une connexion TCP établie du process vers une IP publique.
 // Heuristique honnête : couvre les jeux TCP et les jeux « toujours en ligne » (services/lobby) ;
 // un jeu 100 % hors-ligne n'a aucune connexion sortante → mode jeu non déclenché.
+// Via Get-NetTCPConnection (objets typés) : netstat -p tcp excluait l'IPv6 (préférée par Windows
+// quand le FAI la fournit) et son état « ESTABLISHED » est localisé sur certains Windows —
+// dans les deux cas le mode jeu ne se déclenchait jamais, silencieusement.
+const isPublicAddress = (ip) => {
+  const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const a = Number(v4[1]), b = Number(v4[2]);
+    if (a === 0 || a === 127 || a === 10) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT
+    return true;
+  }
+  const v6 = ip.toLowerCase().replace(/%.*$/, ''); // retire l'éventuel zone id (fe80::1%12)
+  if (!v6.includes(':')) return false;
+  if (v6 === '::' || v6 === '::1') return false;
+  if (/^fe[89ab]/.test(v6)) return false;              // lien-local fe80::/10
+  if (/^f[cd]/.test(v6)) return false;                 // ULA fc00::/7
+  if (v6.startsWith('::ffff:')) return isPublicAddress(v6.slice(7)); // IPv4 mappée
+  return true;
+};
+
 const hasOnlineActivity = (pids) => new Promise((resolve) => {
-  if (!Array.isArray(pids) || !pids.length) return resolve(false);
-  execFile('netstat.exe', ['-ano', '-p', 'tcp'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
-    if (err || !out) return resolve(false);
-    const set = new Set(pids.map(String));
-    for (const line of String(out).split('\n')) {
-      const m = line.match(/^\s*TCP\s+\S+\s+(\d{1,3}(?:\.\d{1,3}){3}):\d+\s+ESTABLISHED\s+(\d+)\s*$/i);
-      if (!m || !set.has(m[2])) continue;
-      const ip = m[1];
-      if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(ip)) continue; // adresses locales/privées
-      const b2 = Number(ip.split('.')[1]);
-      if (ip.startsWith('172.') && b2 >= 16 && b2 <= 31) continue;
-      return resolve(true);
-    }
-    resolve(false);
-  });
+  pids = (Array.isArray(pids) ? pids : []).filter((p) => Number.isInteger(p) && p > 0);
+  if (!pids.length) return resolve(false);
+  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    `Get-NetTCPConnection -State Established -OwningProcess ${pids.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RemoteAddress`],
+    { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
+      if (err || !out) return resolve(false);
+      for (const line of String(out).split('\n')) {
+        const ip = line.trim();
+        if (ip && isPublicAddress(ip)) return resolve(true);
+      }
+      resolve(false);
+    });
 });
 
 // ---------- Débit réseau par bot ----------
@@ -215,13 +242,16 @@ const setBotPriority = (pids, cls) => new Promise((resolve) => {
 });
 
 const linkSpeedMbps = () => new Promise((resolve) => {
+  // Propriété numérique Speed (bits/s) et non LinkSpeed : LinkSpeed est une
+  // chaîne d'AFFICHAGE formatée selon la culture (« 866,7 Mbps » en français
+  // → la regex capturait « 7 » → bots à tort en priorité Idle sur un lien
+  // rapide). On prend l'adaptateur actif le plus rapide.
   execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    "(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1 -ExpandProperty LinkSpeed)"],
+    "(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Sort-Object -Property Speed -Descending | Select-Object -First 1 -ExpandProperty Speed)"],
     { windowsHide: true, timeout: 20000 }, (err, out) => {
-      const m = String(out || '').match(/([\d.]+)\s*(G|M|K)?bps/i);
-      if (!m) return resolve(0);
-      const v = parseFloat(m[1]); const u = (m[2] || '').toUpperCase();
-      resolve(u === 'G' ? v * 1000 : u === 'K' ? v / 1000 : v);
+      if (err) return resolve(0);
+      const bps = parseInt(String(out || '').trim(), 10);
+      resolve(Number.isFinite(bps) && bps > 0 ? bps / 1e6 : 0);
     });
 });
 
@@ -386,9 +416,14 @@ const enterGameMode = async (game) => {
   // Drapeau AVANT l'arrêt pour que le watchdog de saliox n'alerte pas ; saliox coupé EN DERNIER (il héberge le watchdog).
   writeFlag(targets, game);
   targets.sort((a, b) => (a === 'saliox') - (b === 'saliox'));
-  for (const n of targets) await pm2(['stop', n]);
+  // stoppedByGame persisté AVANT la boucle d'arrêt : un crash/shutdown pendant
+  // les arrêts (~plusieurs secondes) laissait stoppedByGame=[] sur disque →
+  // bots jamais relancés et watchdog muet indéfiniment. Si la boucle est
+  // interrompue, le tick suivant relancera simplement des bots déjà en ligne
+  // (inoffensif) au moment de la sortie du mode jeu.
   cfg.stoppedByGame = targets;
   saveCfg();
+  for (const n of targets) await pm2(['stop', n]);
   log('mode jeu ON —', game, '— coupés :', targets.join(', '));
   updateTray();
 };
@@ -405,7 +440,14 @@ const exitGameMode = async () => {
 };
 
 // ---------- Boucle de surveillance ----------
+let ticking = false; // anti-réentrance : un tick lent (awaits jusqu'à 60 s) chevauchait
+                     // le suivant et corrompait prevIo/statusCache (débits aberrants)
 const tick = async () => {
+  if (ticking) return;
+  ticking = true;
+  try { await tickBody(); } finally { ticking = false; }
+};
+const tickBody = async () => {
   const procs = await listProcs();
   if (procs) {
     const hit = cfg.games.find((g) => procs.names.has(g.toLowerCase()));
@@ -463,6 +505,10 @@ const bootEnforce = async () => {
   for (const b of list) {
     const c = cfg.bots[b.name];
     if (!c) continue;
+    // ne pas relancer un bot que le mode jeu vient de couper (jeu déjà lancé à
+    // l'ouverture de session) : bootEnforce annulait l'arrêt 8 s après le tick
+    // initial et les bots tournaient pendant toute la partie
+    if (cfg.stoppedByGame.includes(b.name)) { log('boot: skip', b.name, '(coupé par le mode jeu)'); continue; }
     if (c.auto === false && b.status === 'online') { await pm2(['stop', b.name]); log('boot: stop', b.name, '(auto off)'); }
     else if (c.auto !== false && b.status !== 'online') { await pm2(['start', b.name]); log('boot: start', b.name); }
   }
@@ -515,6 +561,7 @@ const trayIcon = () => {
   return nativeImage.createEmpty();
 };
 
+let lastTraySig = '';
 const updateTray = () => {
   if (!tray) return;
   const stopped = cfg.stoppedByGame.filter((n) => n !== '-');
@@ -522,6 +569,11 @@ const updateTray = () => {
     ? `Hasu Panel — 🎮 ${statusCache.game}${statusCache.online ? ' (en ligne)' : ' (solo)'}${stopped.length ? ` · ${stopped.length} bot(s) coupé(s)` : ''}${cfg.lowNetApplied ? ' · 🌐 éco réseau' : ''}`
     : `Hasu Panel — ${statusCache.bots.filter((b) => b.status === 'online').length}/${statusCache.bots.length} bots en ligne`;
   tray.setToolTip(tip);
+  // menu natif reconstruit uniquement quand son contenu change (le rebuild à
+  // chaque tick pouvait désynchroniser un menu ouvert et allouait pour rien)
+  const sig = `${tip}|${cfg.gameMode.enabled}`;
+  if (sig === lastTraySig) return;
+  lastTraySig = sig;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Ouvrir le panel', click: () => showWindow() },
     {
@@ -558,6 +610,14 @@ ipcMain.handle('panel:status', () => ({
   lowNetActive: !!cfg.lowNetApplied,
   updatedAt: statusCache.updatedAt,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
+  // état EFFECTIF de la Rich Presence (l'UI affichait « activée » sur la seule
+  // présence d'un ID en config, même invalide ou supplanté par la variable d'env)
+  rpc: {
+    enabled: cfg.discordRpc !== false,
+    idValid: /^\d{17,20}$/.test(rpcAppId()),
+    fromEnv: !!(process.env.HASU_DISCORD_APP_ID || '').trim(),
+    connected: rpc.status().ready
+  },
   cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
 
@@ -723,7 +783,9 @@ if (process.argv.includes('--selftest')) {
   });
 } else if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  app.on('second-instance', () => showWindow());
+  // guard isReady : un double lancement pendant la ~1 s de démarrage créait
+  // une BrowserWindow avant app ready → exception fatale du main process
+  app.on('second-instance', () => { if (app.isReady()) showWindow(); });
   app.whenReady().then(async () => {
     cfg = loadCfg();
     // Les bots pm2 connus obtiennent une entrée de config par défaut à la première vue.

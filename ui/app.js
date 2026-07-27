@@ -88,7 +88,15 @@ const render = (st) => {
   $('dev-note').textContent = st.cfg.packaged ? '' : '(actif seulement dans la version .exe)';
   $('set-rpc').checked = st.cfg.discordRpc !== false;
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
-  $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.' : (st.cfg.discordAppId ? ' — ✅ activée.' : ' — ⚠️ colle ton Application ID pour l\'activer.');
+  // état EFFECTIF fourni par le main (avant : « activée » sur la seule présence
+  // d'un ID en config, même invalide ou supplanté par la variable d'env)
+  const rpcSt = st.rpc || {};
+  $('rpc-status').textContent = !rpcSt.enabled ? ' — désactivée.'
+    : rpcSt.connected ? (rpcSt.fromEnv ? ' — ✅ connectée (ID fourni par HASU_DISCORD_APP_ID).' : ' — ✅ connectée.')
+    : rpcSt.fromEnv ? ' — ⏳ ID fourni par HASU_DISCORD_APP_ID, en attente de Discord…'
+    : !st.cfg.discordAppId ? ' — ⚠️ colle ton Application ID pour l\'activer.'
+    : !rpcSt.idValid ? ' — ⚠️ ID invalide (attendu : 17 à 20 chiffres, l\'Application ID du portail développeur Discord).'
+    : ' — ⏳ en attente de Discord (lancé ? ID d\'application correct ?)…';
 };
 
 const refresh = async () => {
