@@ -51,7 +51,7 @@ const render = (st) => {
     return `<div class="bot">
       <span class="dot ${dot}" title="${esc(b.status)}"></span>
       <span class="name">${esc(b.name)}</span>
-      <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="Réseau du bot, mesuré via ses entrées/sorties (pour un bot Discord, quasi exclusivement du réseau + un peu de disque SQLite) — ↓ reçu · ↑ envoyé">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? '⏸ coupé par le mode jeu' : esc(b.status)} · ↻ ${b.restarts}</span>
+      <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="Réseau du bot, mesuré via ses entrées/sorties (pour un bot Discord, quasi exclusivement du réseau + un peu de disque SQLite) — ↓ reçu · ↑ envoyé">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>${(st.cpuThrottled || []).includes(b.name) ? ' · <span title="Ce bot dépasse la limite « CPU max » des réglages : priorité abaissée jusqu’à ce qu’il redescende">🐢 bridé (CPU max)</span>' : ''}` : stoppedByGame ? '⏸ coupé par le mode jeu' : esc(b.status)} · ↻ ${b.restarts}</span>
       <label class="chk" title="(Re)mis en ligne à l'ouverture de session Windows"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> Auto boot</label>
       <label class="chk" title="Arrêté quand un jeu est détecté (mode « bots cochés »)"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> Coupé en jeu</label>
       ${b.status === 'online'
@@ -99,12 +99,21 @@ const render = (st) => {
   // Réglages
   $('set-autolaunch').checked = !!st.cfg.autoLaunch;
   if (document.activeElement !== $('set-poll')) $('set-poll').value = st.cfg.pollSec;
+  if (document.activeElement !== $('set-cpumax')) $('set-cpumax').value = st.cfg.cpuMax || 0;
   $('set-scanauto').checked = st.cfg.scanAuto !== false;
   $('set-scaninfo').textContent = st.cfg.lastScanAt ? `(dernier scan : ${new Date(st.cfg.lastScanAt).toLocaleString('fr-FR')})` : '(aucun scan pour l\'instant)';
   $('dev-note').textContent = st.cfg.packaged ? '' : '(actif seulement dans la version .exe)';
   $('set-rpc').checked = st.cfg.discordRpc !== false;
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
-  $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.' : (st.cfg.discordAppId ? ' — ✅ activée.' : ' — ⚠️ colle ton Application ID pour l\'activer.');
+  // état EFFECTIF fourni par le main (avant : « activée » sur la seule présence
+  // d'un ID en config, même invalide ou supplanté par la variable d'env)
+  const rpcSt = st.rpc || {};
+  $('rpc-status').textContent = !rpcSt.enabled ? ' — désactivée.'
+    : rpcSt.connected ? (rpcSt.fromEnv ? ' — ✅ connectée (ID fourni par HASU_DISCORD_APP_ID).' : ' — ✅ connectée.')
+    : rpcSt.fromEnv ? ' — ⏳ ID fourni par HASU_DISCORD_APP_ID, en attente de Discord…'
+    : !st.cfg.discordAppId ? ' — ⚠️ colle ton Application ID pour l\'activer.'
+    : !rpcSt.idValid ? ' — ⚠️ ID invalide (attendu : 17 à 20 chiffres, l\'Application ID du portail développeur Discord).'
+    : ' — ⏳ en attente de Discord (lancé ? ID d\'application correct ?)…';
 
   // Mises à jour
   $('upd-version').textContent = st.cfg.version || '—';
@@ -147,6 +156,18 @@ const aboutHTML = () => {
   <p>Activé, ce mode donne la <b>priorité réseau au jeu en ligne</b> : pendant la partie, les bots repoussent leurs <b>gros téléchargements</b> (listes anti-scam, sauvegardes chiffrées) et passent en <b>priorité basse</b> — d'autant plus strict que ta connexion est lente (mesurée automatiquement). À la fin de la partie, tout revient à la normale. Indépendant du mode jeu : parfait pour garder saliox en ligne <i>sans</i> qu'il fasse laguer.</p>
   <h3>🔗 Le watchdog</h3>
   <p>saliox garde un œil sur les autres bots et t'envoie un MP <b>uniquement</b> si l'un d'eux <b>plante en boucle</b> (crash-loop). Les arrêts/démarrages normaux ne génèrent aucun MP : c'est ici, dans le panel, que tu vois qui est en ligne.</p>
+  <h3>⚙️ Les réglages en détail — et leur impact</h3>
+  <p><b>Mode jeu</b> — active/désactive toute la mécanique « couper les bots pendant une partie ». Désactivé, le panel ne fait qu'afficher l'état : impact machine quasi nul.</p>
+  <p><b>Couper tous les bots / seulement les cochés</b> — « tous » libère le maximum de RAM/CPU pour le jeu ; « cochés » garde en ligne les bots critiques (ex. saliox et son watchdog). Plus tu en coupes, plus le PC respire — mais plus de services s'interrompent pendant la partie.</p>
+  <p><b>Ignorer les jeux solo</b> — le panel ne coupe rien si le jeu n'a pas de vraie connexion Internet. Coché (recommandé) : GTA histoire ne coupe rien, GTA Online oui. Décoché : toute détection coupe les bots, y compris hors-ligne — plus agressif, parfois inutile. La vérification coûte une requête réseau locale par cycle, négligeable.</p>
+  <p><b>Délai de grâce</b> (défaut 60 s) — temps d'attente après la fermeture du jeu avant de relancer les bots. Court (10–30 s) : les bots reviennent vite, mais un simple changement de partie/relance du jeu fait redémarrer les bots pour rien (chaque cycle stop/start coûte du CPU et des reconnexions Discord). Long (2–5 min) : zéro yo-yo entre deux parties, mais les bots restent éteints plus longtemps.</p>
+  <p><b>Faible usage internet</b> — pendant une partie en ligne, les gros transferts des bots sont différés et leur priorité abaissée (d'autant plus que ta connexion est lente, mesurée automatiquement). Améliore ping/stabilité en jeu sans couper les bots ; en contrepartie leurs tâches lourdes (sauvegardes, mises à jour de listes) attendent la fin de la partie.</p>
+  <p><b>Vérifier toutes les X secondes</b> (défaut 10 s) — la cadence de TOUTE la surveillance (détection du jeu, état pm2, débits). Court (5 s) : détection du jeu quasi immédiate, mais ~2× plus de lectures de process et de requêtes pm2 → un peu plus de CPU en continu. Long (30–60 s) : panel quasi invisible pour la machine, mais le jeu peut tourner jusqu'à 1 min avant que les bots soient coupés. Quand le panel est réduit dans le tray, la cadence passe automatiquement en mode ralenti (économie CPU/batterie).</p>
+  <p><b>CPU max par bot</b> (0 = désactivé) — plafond d'utilisation processeur par bot, en % d'un cœur. Un bot qui dépasse durablement passe en <b>priorité basse</b> 🐢 (il n'utilise le CPU que quand rien d'autre n'en veut) puis redevient normal quand il se calme. Bas (10–20 %) : le PC reste toujours fluide, mais un bot légitimement occupé (gros calcul, sauvegarde) sera ralenti. Haut (50–80 %) : ne bride que les emballements réels. Ce n'est <b>pas</b> une limite dure : le bot peut dépasser la valeur si le PC est inactif — c'est voulu, ça ne gaspille rien.</p>
+  <p><b>Chercher de nouveaux jeux 1×/jour</b> — le scan des bibliothèques Steam/Epic lit le disque : c'est la seule opération « lourde » du panel, d'où sa limite à 1×/jour, jamais pendant une partie. Désactivé : zéro lecture disque automatique, tu ajoutes tes jeux à la main ou via le bouton Scanner.</p>
+  <p><b>Lancer le panel au démarrage de Windows</b> — nécessaire pour l'« Auto boot » des bots et pour que le mode jeu marche dès l'allumage. Coût : un process de plus au démarrage (léger, et encore plus discret dans le tray).</p>
+  <p><b>Rich Presence Discord</b> — affiche « gère X bots » sur ton profil. Purement cosmétique : une connexion locale à Discord, aucun impact mesurable. Sans Application ID valide, rien ne se connecte (le statut affiché te le dit).</p>
+  <p><b>Par bot : Auto boot</b> — remis en ligne à l'ouverture de session Windows (décoché = reste éteint). <b>Coupé en jeu</b> — inclut ce bot dans le mode jeu « bots cochés ». Ces deux cases n'ont d'effet qu'aux moments concernés (démarrage / détection de jeu) : aucun coût en continu.</p>
   <h3>📁 Bon à savoir</h3>
   <p>• La croix de la fenêtre <b>réduit dans la zone de notification</b> (à côté de l'horloge). Pour quitter : clic droit sur l'icône → Quitter.<br>• Réglages enregistrés dans <code>%APPDATA%\\hasu-panel\\panel-config.json</code>, journal dans <code>panel.log</code>.<br>• Le panel se lance tout seul avec Windows (désactivable dans ⚙️ Réglages).</p>
   <div class="modal-actions"><button class="btn primary" id="modal-close">Fermer</button></div>`;
@@ -243,6 +264,7 @@ document.addEventListener('change', async (e) => {
   if (t.id === 'gm-lownet') { await window.panel.setSetting('lowNet', t.checked); await refresh(); return; }
   if (t.id === 'set-autolaunch') { await window.panel.setSetting('autoLaunch', t.checked); await refresh(); return; }
   if (t.id === 'set-poll') { await window.panel.setSetting('pollSec', Number(t.value)); await refresh(); return; }
+  if (t.id === 'set-cpumax') { await window.panel.setSetting('cpuMax', Number(t.value)); await refresh(); return; }
   if (t.id === 'set-scanauto') { await window.panel.setSetting('scanAuto', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc') { await window.panel.setSetting('discordRpc', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc-id') { await window.panel.setSetting('discordAppId', t.value.trim()); await refresh(); return; }

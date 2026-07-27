@@ -131,10 +131,16 @@
           <div>Lancer le panel au démarrage de Windows <span id="dev-note" style="color:var(--mut);font-size:11px"></span></div>
         </div>
         <div class="row">
-          <span style="color:var(--mut);font-size:12.5px">Vérifier les jeux / bots toutes les</span>
-          <input type="number" id="set-poll" min="5" max="120" step="5">
+          <span style="color:var(--mut);font-size:12.5px" title="Cadence de toute la surveillance. Court = détection du jeu plus rapide mais un peu plus de CPU en continu ; long = panel quasi invisible mais réaction plus lente. Détails dans ℹ️ À propos.">Vérifier les jeux / bots toutes les</span>
+          <input type="number" id="set-poll" min="5" max="120" step="5" title="5 s = réactif · 10 s = équilibré (défaut) · 30-60 s = économe">
           <span style="color:var(--mut);font-size:12.5px">secondes</span>
         </div>
+        <div class="row">
+          <span style="color:var(--mut);font-size:12.5px" title="Pas une limite dure : le bot bridé garde le CPU disponible quand personne d'autre n'en veut. Bas (10-20 %) = PC toujours fluide mais bots légitimes ralentis ; haut (50-80 %) = ne bride que les emballements. Détails dans ℹ️ À propos.">CPU max par bot</span>
+          <input type="number" id="set-cpumax" min="0" max="95" step="5" title="0 = désactivé · 10-20 % = strict · 50-80 % = anti-emballement">
+          <span style="color:var(--mut);font-size:12.5px">% <b>(0 = désactivé)</b></span>
+        </div>
+        <div class="hint">Un bot qui dépasse durablement cette limite passe en <b>priorité basse</b> (🐢) : il n'utilise le processeur que quand rien d'autre n'en a besoin, et retrouve sa priorité normale dès qu'il redescend. Pratique pour qu'un bot gourmand ne gêne jamais le PC.</div>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-scanauto"><span></span></label>
           <div>Chercher de nouveaux jeux installés <b>1×/jour</b> <span id="set-scaninfo" style="color:var(--mut);font-size:11px"></span></div>

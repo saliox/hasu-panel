@@ -3,7 +3,7 @@
 // Electron, aucune dépendance externe. Sécurité : noms pm2/exe validés par regex (anti-injection),
 // contextIsolation activé, aucun contenu distant chargé.
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell } = require('electron');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -41,7 +41,10 @@ const setupAutoUpdate = () => {
   setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)
 };
 
-const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
+// pm2.cmd : emplacement npm par défaut, sinon résolution via le PATH (préfixe
+// npm personnalisé, nvm-windows…).
+const PM2_DEFAULT = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
+const PM2 = fs.existsSync(PM2_DEFAULT) ? PM2_DEFAULT : 'pm2.cmd';
 const NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/; // noms pm2 autorisés (jamais d'espace ni de quote → sûr avec shell)
 const EXE_RE = /^[A-Za-z0-9 _.()+'-]{1,80}\.exe$/i; // noms de process de jeu autorisés
 // Noms interdits comme clé de cfg.bots (objet simple) : "__proto__" via `cfg.bots[name] = …`
@@ -94,6 +97,8 @@ const DEFAULTS = {
   autoLaunch: true,
   lowNet: false,            // mode « faible usage internet » : priorité réseau au jeu en ligne
   lowNetApplied: false,     // persisté → on sait restaurer les priorités après un crash du panel
+  cpuMax: 0,                // limite CPU par bot en % (0 = désactivé) : au-delà, priorité abaissée
+  cpuThrottled: [],         // persisté → on sait restaurer les priorités après un crash du panel
   stoppedByGame: [],        // persisté → si le panel redémarre pendant une partie, on sait quoi relancer
   imported: [],             // bots importés par l'utilisateur (catégorie à part, retirables du panel)
   scanAuto: true,           // découverte de nouveaux jeux installés : 1×/JOUR max (jamais en continu)
@@ -165,8 +170,10 @@ const probeToolchain = () => new Promise((resolve) => {
 // Le chemin de pm2.cmd est ENTOURÉ DE GUILLEMETS : sous shell, Node ne cite pas le fichier, donc un
 // nom d'utilisateur avec espace (%APPDATA% contient un espace) tronquerait la commande. cmd.exe parse
 // correctement « "C:\...\npm\pm2.cmd" jlist » (et le cas sans espace reste valide).
+let pm2FailLogged = false; // premier échec loggué (sinon un pm2 absent spammait panel.log à chaque tick)
 const pm2Raw = (args) => new Promise((resolve) => {
   execFile(`"${PM2}"`, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
+    if (err && !pm2FailLogged) { pm2FailLogged = true; log('pm2 échec (chemin:', PM2, ') :', err.message.slice(0, 200)); }
     resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
   });
 });
@@ -193,6 +200,66 @@ const pm2List = async () => {
   } catch { return []; }
 };
 
+// ---------- Worker PowerShell persistant ----------
+// Un seul powershell.exe longue durée exécute toutes les sondes (débits E/S,
+// détection en ligne, priorités CPU, débit du lien, programmes ouverts) au
+// lieu d'un démarrage à froid par appel (~8 640/jour à 10 s de tick, ~0,5 s
+// CPU et ~50 Mo chacun). Chaque requête est encodée en Base64 → une seule
+// ligne sur stdin, sortie délimitée par un marqueur unique. En cas de blocage
+// (timeout) ou de crash, le worker est tué et relancé ; l'appel en cours
+// résout null (même sémantique d'échec que les anciens execFile).
+let psProc = null, psJobs = [], psJob = null, psBuf = '', psSeq = 0;
+const psSpawn = () => {
+  const p = spawn('powershell.exe',
+    ['-NoLogo', '-NoExit', '-NoProfile', '-InputFormat', 'Text', '-OutputFormat', 'Text', '-Command', '-'],
+    { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+  p.stdout.setEncoding('utf8');
+  p.stdout.on('data', (d) => { if (psProc === p) { psBuf += d; psDrain(); } });
+  p.on('error', () => { if (psProc === p) psFail(); });
+  p.on('exit', () => { if (psProc === p) psFail(); });
+  return p;
+};
+const psFail = () => {
+  psProc = null; psBuf = '';
+  const j = psJob; psJob = null;
+  if (j) { clearTimeout(j.timer); j.resolve(null); }
+  psNext(); // la file repart sur un worker neuf
+};
+const psDrain = () => {
+  if (!psJob) return;
+  const i = psBuf.indexOf(psJob.marker);
+  if (i < 0) return;
+  const out = psBuf.slice(0, i);
+  psBuf = psBuf.slice(i + psJob.marker.length).replace(/^\r?\n/, '');
+  const j = psJob; psJob = null;
+  clearTimeout(j.timer);
+  j.resolve(out);
+  psNext();
+};
+const psNext = () => {
+  if (psJob || !psJobs.length) return;
+  if (!psProc) { psProc = psSpawn(); psBuf = ''; }
+  const j = psJobs.shift();
+  psJob = j;
+  j.timer = setTimeout(() => { // commande bloquée → worker neuf, la suite de la file continue
+    const p = psProc; psProc = null; psBuf = '';
+    try { if (p) p.kill(); } catch {}
+    const cur = psJob; psJob = null;
+    if (cur) cur.resolve(null);
+    psNext();
+  }, j.timeout);
+  const b64 = Buffer.from(j.script, 'utf16le').toString('base64');
+  try {
+    psProc.stdin.write(`try { iex ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64}'))) } catch {}; Write-Output '${j.marker}'\n`);
+  } catch { psFail(); }
+};
+// psRun(script) → stdout (string) ou null en cas d'échec/timeout.
+const psRun = (script, timeout = 20000) => new Promise((resolve) => {
+  psJobs.push({ script, timeout, resolve, marker: `##PSDONE${psSeq++}##` });
+  psNext();
+});
+const psStop = () => { const p = psProc; psProc = null; try { if (p) p.kill(); } catch {} };
+
 // ---------- Détection de jeu (liste de process + PID) ----------
 const listProcs = () => new Promise((resolve) => {
   execFile('tasklist.exe', ['/fo', 'csv', '/nh'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
@@ -213,65 +280,61 @@ const listProcs = () => new Promise((resolve) => {
 // Jeu EN LIGNE ou solo ? → au moins une connexion TCP établie du process vers une IP publique.
 // Heuristique honnête : couvre les jeux TCP et les jeux « toujours en ligne » (services/lobby) ;
 // un jeu 100 % hors-ligne n'a aucune connexion sortante → mode jeu non déclenché.
-// Une IP « publique » = ni privée/locale/loopback (IPv4 ET IPv6). Sert à distinguer une vraie session
-// multijoueur (connexion vers Internet) d'un jeu solo/LAN.
-const isPublicIp = (raw) => {
-  const ip = String(raw || '').replace(/^\[|\]$/g, '').toLowerCase(); // retire les crochets IPv6
-  if (ip.includes('.') && !ip.includes(':')) { // IPv4
-    if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.|255\.)/.test(ip)) return false;
-    const b2 = Number(ip.split('.')[1]);
-    if (ip.startsWith('172.') && b2 >= 16 && b2 <= 31) return false;
+// Via Get-NetTCPConnection (objets typés) : netstat -p tcp excluait l'IPv6 (préférée par Windows
+// quand le FAI la fournit) et son état « ESTABLISHED » est localisé sur certains Windows —
+// dans les deux cas le mode jeu ne se déclenchait jamais, silencieusement.
+const isPublicAddress = (ip) => {
+  const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const a = Number(v4[1]), b = Number(v4[2]);
+    if (a === 0 || a === 127 || a === 10 || a === 255) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT
     return true;
   }
-  if (ip.includes(':')) { // IPv6
-    if (ip === '::1' || ip === '::') return false;          // loopback / non spécifié
-    if (ip.startsWith('fe80')) return false;                // link-local
-    if (/^f[cd]/.test(ip)) return false;                    // unique-local (fc00::/7)
-    if (ip.startsWith('::ffff:')) return isPublicIp(ip.slice(7)); // IPv4 mappée
-    return true;                                            // adresse IPv6 globale
+  const v6 = ip.toLowerCase().replace(/%.*$/, ''); // retire l'éventuel zone id (fe80::1%12)
+  if (!v6.includes(':')) return false;
+  if (v6 === '::' || v6 === '::1') return false;
+  if (/^fe[89ab]/.test(v6)) return false;              // lien-local fe80::/10
+  if (/^f[cd]/.test(v6)) return false;                 // ULA fc00::/7
+  if (v6.startsWith('::ffff:')) return isPublicAddress(v6.slice(7)); // IPv4 mappée
+  return true;
+};
+
+const hasOnlineActivity = async (pids) => {
+  pids = (Array.isArray(pids) ? pids : []).filter((p) => Number.isInteger(p) && p > 0);
+  if (!pids.length) return false;
+  const out = await psRun(`Get-NetTCPConnection -State Established -OwningProcess ${pids.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RemoteAddress`);
+  if (!out) return false;
+  for (const line of String(out).split('\n')) {
+    const ip = line.trim();
+    if (ip && isPublicAddress(ip)) return true;
   }
   return false;
 };
-
-const hasOnlineActivity = (pids) => new Promise((resolve) => {
-  if (!Array.isArray(pids) || !pids.length) return resolve(false);
-  execFile('netstat.exe', ['-ano', '-p', 'tcp'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
-    if (err || !out) return resolve(false);
-    const set = new Set(pids.map(String));
-    for (const line of String(out).split('\n')) {
-      const t = line.trim().split(/\s+/); // Proto Local Foreign State PID (IPv4 comme IPv6)
-      if (t.length < 5 || t[0].toUpperCase() !== 'TCP' || t[3].toUpperCase() !== 'ESTABLISHED') continue;
-      if (!set.has(t[4])) continue;                          // pas un de nos PID
-      const foreign = t[2].replace(/:[0-9]+$/, '');          // retire le :port final (IPv4 ou [IPv6])
-      if (isPublicIp(foreign)) return resolve(true);
-    }
-    resolve(false);
-  });
-});
 
 // ---------- Débit réseau par bot ----------
 // Octets d'E/S CUMULÉS par process (Win32_Process.ReadTransferCount + WriteTransferCount). Pour un bot Discord,
 // l'E/S est quasi exclusivement du RÉSEAU (gateway websocket + API REST) + un peu de disque (SQLite) : c'est
 // un proxy honnête du réseau, sans admin (le vrai réseau pur par process exigerait de l'ETW + élévation).
 // Le tick transforme ce cumul en DÉBIT (octets/s) via le delta entre deux relevés.
-const ioRawByPid = (pids) => new Promise((resolve) => {
+const ioRawByPid = async (pids) => {
   const m = new Map();
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
-  if (!pids.length) return resolve(m);
+  if (!pids.length) return m;
   const filter = pids.map((p) => `ProcessId=${p}`).join(' OR ');
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    `Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$([int64]$_.ReadTransferCount):$([int64]$_.WriteTransferCount)" }`],
-    { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
-      if (err || !out) return resolve(m);
-      for (const line of String(out).split('\n')) {
-        const p = line.trim().split(':'); // "PID:read:write" (octets cumulés lus / écrits)
-        if (p.length < 3) continue;
-        const pid = Number(p[0]), read = Number(p[1]), write = Number(p[2]);
-        if (pid > 0 && Number.isFinite(read) && Number.isFinite(write)) m.set(pid, { read, write });
-      }
-      resolve(m);
-    });
-});
+  const out = await psRun(`Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$([int64]$_.ReadTransferCount):$([int64]$_.WriteTransferCount)" }`);
+  if (!out) return m;
+  for (const line of String(out).split('\n')) {
+    const p = line.trim().split(':'); // "PID:read:write" (octets cumulés lus / écrits)
+    if (p.length < 3) continue;
+    const pid = Number(p[0]), read = Number(p[1]), write = Number(p[2]);
+    if (pid > 0 && Number.isFinite(read) && Number.isFinite(write)) m.set(pid, { read, write });
+  }
+  return m;
+};
 
 // Enrichit statusCache.bots avec b.net (octets/s) = delta d'E/S cumulée depuis le relevé précédent / temps écoulé.
 const measureNet = async () => {
@@ -295,23 +358,22 @@ const measureNet = async () => {
 // Sans droits admin, on agit sur ce qu'on contrôle VRAIMENT : 1) drapeau lu par saliox → gros
 // transferts différés (phishlist ~Mo, backups chiffrés) ; 2) priorité CPU des bots abaissée
 // (moins de contention pendant la partie). Niveau choisi selon le débit du lien réseau.
-const setBotPriority = (pids, cls) => new Promise((resolve) => {
+const setBotPriority = async (pids, cls) => {
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
-  if (!pids.length || !['Normal', 'BelowNormal', 'Idle'].includes(cls)) return resolve(false);
-  const cmd = `foreach($p in ${pids.join(',')}){ try { (Get-Process -Id $p -ErrorAction Stop).PriorityClass = '${cls}' } catch {} }`;
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true, timeout: 20000 }, () => resolve(true));
-});
+  if (!pids.length || !['Normal', 'BelowNormal', 'Idle'].includes(cls)) return false;
+  await psRun(`foreach($p in ${pids.join(',')}){ try { (Get-Process -Id $p -ErrorAction Stop).PriorityClass = '${cls}' } catch {} }`);
+  return true;
+};
 
-const linkSpeedMbps = () => new Promise((resolve) => {
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    "(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1 -ExpandProperty LinkSpeed)"],
-    { windowsHide: true, timeout: 20000 }, (err, out) => {
-      const m = String(out || '').match(/([\d.]+)\s*(G|M|K)?bps/i);
-      if (!m) return resolve(0);
-      const v = parseFloat(m[1]); const u = (m[2] || '').toUpperCase();
-      resolve(u === 'G' ? v * 1000 : u === 'K' ? v / 1000 : v);
-    });
-});
+const linkSpeedMbps = async () => {
+  // Propriété numérique Speed (bits/s) et non LinkSpeed : LinkSpeed est une
+  // chaîne d'AFFICHAGE formatée selon la culture (« 866,7 Mbps » en français
+  // → la regex capturait « 7 » → bots à tort en priorité Idle sur un lien
+  // rapide). On prend l'adaptateur actif le plus rapide.
+  const out = await psRun("(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Sort-Object -Property Speed -Descending | Select-Object -First 1 -ExpandProperty Speed)");
+  const bps = parseInt(String(out || '').trim(), 10);
+  return Number.isFinite(bps) && bps > 0 ? bps / 1e6 : 0;
+};
 
 const applyLowNet = async (game) => {
   const speed = await linkSpeedMbps();
@@ -478,9 +540,14 @@ const enterGameMode = async (game) => {
   // Drapeau AVANT l'arrêt pour que le watchdog de saliox n'alerte pas ; saliox coupé EN DERNIER (il héberge le watchdog).
   writeFlag(targets, game);
   targets.sort((a, b) => (a === 'saliox') - (b === 'saliox'));
-  for (const n of targets) await pm2(['stop', n]);
+  // stoppedByGame persisté AVANT la boucle d'arrêt : un crash/shutdown pendant
+  // les arrêts (~plusieurs secondes) laissait stoppedByGame=[] sur disque →
+  // bots jamais relancés et watchdog muet indéfiniment. Si la boucle est
+  // interrompue, le tick suivant relancera simplement des bots déjà en ligne
+  // (inoffensif) au moment de la sortie du mode jeu.
   cfg.stoppedByGame = targets;
   saveCfg();
+  for (const n of targets) await pm2(['stop', n]);
   log('mode jeu ON —', game, '— coupés :', targets.join(', '));
   updateTray();
 };
@@ -496,8 +563,59 @@ const exitGameMode = async () => {
   updateTray();
 };
 
+// ---------- Limite CPU par bot (réglage « CPU max ») ----------
+// L'utilisateur fixe un plafond d'utilisation processeur par bot (en % d'un
+// cœur, la mesure de pm2). Windows n'offre pas de plafonnement dur par process
+// sans droits admin/Job Objects : on abaisse la PRIORITÉ du bot qui dépasse
+// durablement (BelowNormal, ou Idle si ≥ 2× la limite) — il ne consomme alors
+// du CPU que quand personne d'autre n'en veut — puis on la restaure quand il
+// redescend. Hystérésis de 3 ticks dans chaque sens pour éviter le ping-pong.
+const cpuThrottle = new Map(); // name -> { over, under, level (0|1|2), pid }
+const CPU_STREAK = 3;
+const CPU_LEVEL_CLS = ['Normal', 'BelowNormal', 'Idle'];
+const enforceCpuMax = async () => {
+  if (cfg.lowNetApplied) return; // lowNet pilote déjà les priorités : pas de conflit
+  const limit = Math.max(0, Number(cfg.cpuMax) || 0);
+  if (!limit) {
+    if (cpuThrottle.size) { // option désactivée → restaurer tout le monde
+      await setBotPriority([...cpuThrottle.values()].filter((t) => t.level > 0).map((t) => t.pid), 'Normal');
+      cpuThrottle.clear();
+      cfg.cpuThrottled = []; saveCfg();
+    }
+    return;
+  }
+  for (const b of statusCache.bots) {
+    if (b.status !== 'online' || !b.pid) { cpuThrottle.delete(b.name); continue; }
+    const t = cpuThrottle.get(b.name) || { over: 0, under: 0, level: 0, pid: b.pid };
+    t.pid = b.pid;
+    if (b.cpu > limit) { t.over++; t.under = 0; } else { t.under++; t.over = 0; }
+    let want = t.level;
+    if (t.over >= CPU_STREAK) want = b.cpu > limit * 2 ? 2 : 1;
+    else if (t.under >= CPU_STREAK) want = 0;
+    if (want !== t.level) {
+      await setBotPriority([b.pid], CPU_LEVEL_CLS[want]);
+      log(`cpu max: ${b.name} à ${Math.round(b.cpu)} % (limite ${limit} %) → priorité ${CPU_LEVEL_CLS[want]}`);
+      t.level = want;
+      t.over = 0; t.under = 0;
+    }
+    if (t.level === 0 && t.under >= CPU_STREAK) cpuThrottle.delete(b.name);
+    else cpuThrottle.set(b.name, t);
+  }
+  const throttledNames = [...cpuThrottle.entries()].filter(([, t]) => t.level > 0).map(([n]) => n);
+  if (JSON.stringify(throttledNames) !== JSON.stringify(cfg.cpuThrottled || [])) {
+    cfg.cpuThrottled = throttledNames; saveCfg(); // persisté → restauration après crash du panel
+  }
+};
+
 // ---------- Boucle de surveillance ----------
+let ticking = false; // anti-réentrance : un tick lent (awaits jusqu'à 60 s) chevauchait
+                     // le suivant et corrompait prevIo/statusCache (débits aberrants)
 const tick = async () => {
+  if (ticking) return;
+  ticking = true;
+  try { await tickBody(); } finally { ticking = false; }
+};
+const tickBody = async () => {
   const procs = await listProcs();
   if (procs) {
     const hit = cfg.games.find((g) => procs.names.has(g.toLowerCase()));
@@ -532,6 +650,7 @@ const tick = async () => {
   }
   statusCache.bots = await pm2List();
   await measureNet().catch(() => {}); // débit réseau (E/S) par bot, affiché à côté du CPU
+  await enforceCpuMax().catch((e) => log('cpuMax', e.message)); // limite CPU par bot (réglage utilisateur)
   statusCache.updatedAt = Date.now();
   updateTray();
   updateRpc(); // met à jour la Rich Presence Discord (« gère X bots en ligne »)
@@ -559,6 +678,10 @@ const bootEnforce = async () => {
   for (const b of list) {
     const c = cfg.bots[b.name];
     if (!c) continue;
+    // ne pas relancer un bot que le mode jeu vient de couper (jeu déjà lancé à
+    // l'ouverture de session) : bootEnforce annulait l'arrêt 8 s après le tick
+    // initial et les bots tournaient pendant toute la partie
+    if (cfg.stoppedByGame.includes(b.name)) { log('boot: skip', b.name, '(coupé par le mode jeu)'); continue; }
     if (c.auto === false && b.status === 'online') { await pm2(['stop', b.name]); log('boot: stop', b.name, '(auto off)'); }
     else if (c.auto !== false && b.status !== 'online') { await pm2(['start', b.name]); log('boot: start', b.name); }
   }
@@ -611,6 +734,7 @@ const trayIcon = () => {
   return nativeImage.createEmpty();
 };
 
+let lastTraySig = '';
 const updateTray = () => {
   if (!tray) return;
   const stopped = cfg.stoppedByGame.filter((n) => n !== '-');
@@ -618,6 +742,11 @@ const updateTray = () => {
     ? `Hasu Panel — 🎮 ${statusCache.game}${statusCache.online ? ' (en ligne)' : ' (solo)'}${stopped.length ? ` · ${stopped.length} bot(s) coupé(s)` : ''}${cfg.lowNetApplied ? ' · 🌐 éco réseau' : ''}`
     : `Hasu Panel — ${statusCache.bots.filter((b) => b.status === 'online').length}/${statusCache.bots.length} bots en ligne`;
   tray.setToolTip(tip);
+  // menu natif reconstruit uniquement quand son contenu change (le rebuild à
+  // chaque tick pouvait désynchroniser un menu ouvert et allouait pour rien)
+  const sig = `${tip}|${cfg.gameMode.enabled}|${updateReady}`;
+  if (sig === lastTraySig) return;
+  lastTraySig = sig;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Ouvrir le panel', click: () => showWindow() },
     {
@@ -666,7 +795,16 @@ ipcMain.handle('panel:status', () => ({
   updateStatus: lastUpdateStatus,
   toolchain,
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
-  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
+  cpuThrottled: cfg.cpuThrottled || [], // bots actuellement bridés par la limite CPU
+  // état EFFECTIF de la Rich Presence (l'UI affichait « activée » sur la seule
+  // présence d'un ID en config, même invalide ou supplanté par la variable d'env)
+  rpc: {
+    enabled: cfg.discordRpc !== false,
+    idValid: /^\d{17,20}$/.test(rpcAppId()),
+    fromEnv: !!(process.env.HASU_DISCORD_APP_ID || '').trim(),
+    connected: rpc.status().ready
+  },
+  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, cpuMax: cfg.cpuMax || 0, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
 
 // Scan disque à la demande (bouton « Scanner ») + gestion des suggestions.
@@ -681,26 +819,23 @@ ipcMain.handle('panel:ignoreGame', (_e, exe) => {
 });
 
 // Liste des programmes ouverts (avec une fenêtre) → pour ajouter un jeu/logiciel inconnu en 1 clic.
-ipcMain.handle('panel:runningApps', () => new Promise((resolve) => {
+ipcMain.handle('panel:runningApps', async () => {
   const SKIP = new Set(['hasupanel', 'explorer', 'applicationframehost', 'systemsettings', 'textinputhost', 'electron', 'searchhost', 'startmenuexperiencehost', 'shellexperiencehost']);
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { $_.ProcessName + '|' + $_.MainWindowTitle }"],
-    { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
-      if (err || !out) return resolve([]);
-      const seen = new Map();
-      for (const line of String(out).split('\n')) {
-        const i = line.indexOf('|');
-        if (i < 1) continue;
-        const name = line.slice(0, i).trim();
-        const title = line.slice(i + 1).trim();
-        if (!name || SKIP.has(name.toLowerCase())) continue;
-        const exe = `${name}.exe`;
-        if (!EXE_RE.test(exe) || seen.has(exe.toLowerCase())) continue;
-        seen.set(exe.toLowerCase(), { exe, title: title.slice(0, 70) });
-      }
-      resolve([...seen.values()].sort((a, b) => a.exe.localeCompare(b.exe)));
-    });
-}));
+  const out = await psRun("Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { $_.ProcessName + '|' + $_.MainWindowTitle }");
+  if (!out) return [];
+  const seen = new Map();
+  for (const line of String(out).split('\n')) {
+    const i = line.indexOf('|');
+    if (i < 1) continue;
+    const name = line.slice(0, i).trim();
+    const title = line.slice(i + 1).trim();
+    if (!name || SKIP.has(name.toLowerCase())) continue;
+    const exe = `${name}.exe`;
+    if (!EXE_RE.test(exe) || seen.has(exe.toLowerCase())) continue;
+    seen.set(exe.toLowerCase(), { exe, title: title.slice(0, 70) });
+  }
+  return [...seen.values()].sort((a, b) => a.exe.localeCompare(b.exe));
+});
 
 // Choisir un .exe sur le disque (jeu pas encore lancé) — seul le NOM du fichier est gardé.
 ipcMain.handle('panel:pickExe', async () => {
@@ -808,6 +943,7 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'autoLaunch') { cfg.autoLaunch = !!value; saveCfg(); applyAutoLaunch(); return { ok: true }; }
   if (key === 'pollSec') { cfg.pollSec = Math.max(5, Math.min(120, Math.floor(Number(value) || 10))); saveCfg(); restartPoll(); return { ok: true }; }
   if (key === 'idlePollSec') { cfg.idlePollSec = Math.max(15, Math.min(300, Math.floor(Number(value) || 30))); saveCfg(); restartPoll(); return { ok: true }; }
+  if (key === 'cpuMax') { cfg.cpuMax = Math.max(0, Math.min(95, Math.floor(Number(value) || 0))); saveCfg(); return { ok: true }; } // 0 = désactivé ; la restauration passe par enforceCpuMax au tick suivant
   if (key === 'lowNet') { cfg.lowNet = !!value; saveCfg(); return { ok: true }; } // le tick applique/retire tout seul
   if (key === 'scanAuto') { cfg.scanAuto = !!value; saveCfg(); return { ok: true }; }
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
@@ -898,7 +1034,9 @@ if (process.argv.includes('--selftest')) {
   });
 } else if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  app.on('second-instance', () => showWindow());
+  // guard isReady : un double lancement pendant la ~1 s de démarrage créait
+  // une BrowserWindow avant app ready → exception fatale du main process
+  app.on('second-instance', () => { if (app.isReady()) showWindow(); });
   app.whenReady().then(async () => {
     cfg = loadCfg();
     // Les bots pm2 connus obtiennent une entrée de config par défaut à la première vue.
@@ -916,6 +1054,13 @@ else {
     }
     // Reprise après crash : des bots coupés par le mode jeu mais plus de jeu → le tick les relancera.
     await tick().catch(() => {});
+    // Reprise après crash (limite CPU) : des priorités abaissées ont pu survivre au panel →
+    // on repart de zéro, enforceCpuMax rebridera au besoin après son hystérésis.
+    if (Array.isArray(cfg.cpuThrottled) && cfg.cpuThrottled.length) {
+      const pids = statusCache.bots.filter((b) => cfg.cpuThrottled.includes(b.name) && b.pid).map((b) => b.pid);
+      if (pids.length) await setBotPriority(pids, 'Normal').catch(() => {});
+      cfg.cpuThrottled = []; saveCfg();
+    }
     // Enregistre les bots découverts dans la config (défaut : auto ON, mode jeu OFF).
     let added = false;
     for (const b of statusCache.bots) if (!cfg.bots[b.name]) { cfg.bots[b.name] = { auto: true, gameStop: false }; added = true; }
@@ -928,11 +1073,12 @@ else {
   let cleanedUp = false;
   app.on('before-quit', (e) => {
     quitting = true;
-    if (cleanedUp) return; // nettoyage déjà fait → on laisse Electron quitter
+    if (cleanedUp) { psStop(); return; } // nettoyage déjà fait → on laisse Electron quitter
     e.preventDefault();
     (async () => {
       try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.length) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
       try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
+      psStop(); // le worker PowerShell n'est plus utile après le nettoyage (clearLowNet s'en sert)
       cleanedUp = true;
       app.quit();
     })();
