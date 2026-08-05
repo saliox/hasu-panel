@@ -209,6 +209,24 @@ const startImport = async (picker) => {
 $('import-btn').addEventListener('click', () => startImport(window.panel.importPick));
 $('import-dir-btn').addEventListener('click', () => startImport(window.panel.importPickDir));
 
+// « Tout arrêter » : double-clic de confirmation (1er clic arme pour 4 s, 2e clic exécute).
+let stopAllArmed = false, stopAllTimer = null;
+$('stop-all-btn').addEventListener('click', async () => {
+  const btn = $('stop-all-btn');
+  if (!stopAllArmed) {
+    stopAllArmed = true;
+    btn.classList.add('armed'); btn.textContent = '⏹ Confirmer ?';
+    stopAllTimer = setTimeout(() => { stopAllArmed = false; btn.classList.remove('armed'); btn.textContent = '⏹ Tout arrêter'; }, 4000);
+    return;
+  }
+  clearTimeout(stopAllTimer); stopAllArmed = false;
+  btn.classList.remove('armed'); btn.disabled = true; btn.textContent = '⏳ Arrêt…';
+  let r; try { r = await window.panel.stopAll(); } catch { r = null; }
+  btn.textContent = (r && r.ok) ? `✅ ${r.stopped} arrêté(s)` : '⚠️ Échec';
+  await refresh();
+  setTimeout(() => { btn.disabled = false; btn.textContent = '⏹ Tout arrêter'; }, 1600);
+});
+
 // Mises à jour : vérification manuelle + application.
 $('upd-check').addEventListener('click', async () => {
   updBusy = true; updMsg = '';

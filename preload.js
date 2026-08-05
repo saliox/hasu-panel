@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('panel', {
   status: () => ipcRenderer.invoke('panel:status'),
   action: (name, action) => ipcRenderer.invoke('panel:action', { name, action }),
+  stopAll: () => ipcRenderer.invoke('panel:stopAll'),
   setBot: (name, key, value) => ipcRenderer.invoke('panel:setBot', { name, key, value }),
   setGameMode: (patch) => ipcRenderer.invoke('panel:setGameMode', patch),
   importPick: () => ipcRenderer.invoke('panel:importPick'),

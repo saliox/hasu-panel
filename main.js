@@ -193,6 +193,67 @@ const pm2List = async () => {
   } catch { return []; }
 };
 
+// ---------- Tree-kill Windows : reap des enfants orphelins après pm2 stop ----------
+// pm2 stop ne tue QUE le node principal ; sous Windows les enfants non-detached (ffmpeg/yt-dlp de
+// hasu-music, npm install / node de +update|+diag…) survivent → process orphelins. On garde l'arrêt
+// GRACIEUX du parent (flush SQLite + déconnexion Discord propre) puis on force-kill les descendants
+// encore vivants. Sécurité : uniquement des PID NUMÉRIQUES, execFile en array-args (zéro injection).
+
+// Descendants récursifs d'un PID via l'arbre ParentProcessId. À capturer AVANT le stop : une fois le
+// parent mort, Windows ne réparente pas → l'arbre devient irrécupérable. Borné (anti recyclage de PID).
+const collectDescendants = (rootPid) => new Promise((resolve) => {
+  const root = Number(rootPid);
+  if (!Number.isInteger(root) || root <= 0) return resolve([]);
+  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId):$($_.ParentProcessId)" }'],
+    { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
+      if (err || !out) return resolve([]);
+      const children = new Map(); // ppid -> [pid,...]
+      for (const line of String(out).split('\n')) {
+        const m = line.trim().match(/^(\d+):(\d+)$/); // PID strictement numériques
+        if (!m) continue;
+        const pid = Number(m[1]), ppid = Number(m[2]);
+        if (!children.has(ppid)) children.set(ppid, []);
+        children.get(ppid).push(pid);
+      }
+      const res = [], seen = new Set([root]), stack = [root];
+      while (stack.length && res.length < 500) { // borne dure
+        for (const c of (children.get(stack.pop()) || [])) {
+          if (seen.has(c) || c <= 0) continue; // anti-cycle (recyclage de PID)
+          seen.add(c); res.push(c); stack.push(c);
+        }
+      }
+      resolve(res);
+    });
+});
+
+// Force-kill de PID déjà capturés. Un PID déjà mort → taskkill no-op (pas d'erreur bloquante).
+const killPids = (pids) => new Promise((resolve) => {
+  const list = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
+  if (!list.length) return resolve();
+  const args = list.flatMap((p) => ['/PID', String(p)]).concat('/F'); // pas de /T : on a déjà tout l'arbre
+  execFile('taskkill.exe', args, { windowsHide: true, timeout: 15000 }, () => resolve());
+});
+
+// Arrêt GRACIEUX + reap de l'arbre. `name` déjà validé isSafeName par l'appelant (et re-validé par pm2()).
+const GRACE_MS = 4000; // > kill_timeout pm2 (~1.6s) : laisse le parent quitter proprement avant le reap
+const stopTree = async (name) => {
+  if (process.platform !== 'win32') return pm2(['stop', name]); // POSIX propage déjà l'arbre
+  let pid = 0;
+  try { pid = (await pm2List()).find((b) => b.name === name && b.status === 'online')?.pid || 0; } catch {}
+  const descendants = pid ? await collectDescendants(pid).catch(() => []) : []; // [] si bot déjà arrêté
+  const r = await pm2(['stop', name]); // toujours l'arrêt gracieux du parent
+  if (descendants.length) {
+    await new Promise((res) => setTimeout(res, GRACE_MS)); // laisse un gracefulShutdown fermer ses enfants
+    await killPids(descendants).catch(() => {}); // ne tue QUE les survivants du snapshot
+    log('tree-kill', name, `pid=${pid}`, `descendants=${descendants.length}`);
+  }
+  return r;
+};
+
+// Variante pour la suppression d'un bot importé : même reap, puis pm2 delete.
+const deleteTree = async (name) => { await stopTree(name); return pm2(['delete', name]); };
+
 // ---------- Détection de jeu (liste de process + PID) ----------
 const listProcs = () => new Promise((resolve) => {
   execFile('tasklist.exe', ['/fo', 'csv', '/nh'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
@@ -363,7 +424,7 @@ const importBot = async (name, script) => {
 
 const removeBot = async (name) => {
   if (!isSafeName(name) || !cfg.imported.includes(name)) return { ok: false, error: 'Seuls les bots importés peuvent être retirés ici' };
-  await pm2(['delete', name]);
+  await deleteTree(name); // arrête l'arbre (enfants orphelins compris) puis delete
   await pm2(['save']);
   cfg.imported = cfg.imported.filter((n) => n !== name);
   delete cfg.bots[name];
@@ -478,7 +539,7 @@ const enterGameMode = async (game) => {
   // Drapeau AVANT l'arrêt pour que le watchdog de saliox n'alerte pas ; saliox coupé EN DERNIER (il héberge le watchdog).
   writeFlag(targets, game);
   targets.sort((a, b) => (a === 'saliox') - (b === 'saliox'));
-  for (const n of targets) await pm2(['stop', n]);
+  for (const n of targets) await stopTree(n);
   cfg.stoppedByGame = targets;
   saveCfg();
   log('mode jeu ON —', game, '— coupés :', targets.join(', '));
@@ -559,7 +620,7 @@ const bootEnforce = async () => {
   for (const b of list) {
     const c = cfg.bots[b.name];
     if (!c) continue;
-    if (c.auto === false && b.status === 'online') { await pm2(['stop', b.name]); log('boot: stop', b.name, '(auto off)'); }
+    if (c.auto === false && b.status === 'online') { await stopTree(b.name); log('boot: stop', b.name, '(auto off)'); }
     else if (c.auto !== false && b.status !== 'online') { await pm2(['start', b.name]); log('boot: start', b.name); }
   }
 };
@@ -763,12 +824,31 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
   if (actionsInFlight.has(name)) return { ok: false, out: 'action en cours' };
   actionsInFlight.add(name);
   try {
-    const r = await pm2([action, name]);
+    // stop/restart : on reape l'arbre (pm2 restart ne tue pas les enfants avant de relancer → orphelins cumulés).
+    let r;
+    if (action === 'stop') r = await stopTree(name);
+    else if (action === 'restart') { await stopTree(name); r = await pm2(['start', name]); }
+    else r = await pm2([action, name]);
     statusCache.bots = await pm2List();
     return { ok: r.ok };
   } finally {
     actionsInFlight.delete(name);
   }
+});
+
+// Stop all : arrête TOUS les bots en ligne d'un coup (bouton à double-clic de confirmation côté UI).
+// Réutilise stopTree → chaque bot est arrêté gracieusement PUIS ses enfants orphelins sont reapés.
+let stopAllInFlight = false;
+ipcMain.handle('panel:stopAll', async () => {
+  if (stopAllInFlight) return { ok: false, error: 'déjà en cours' };
+  stopAllInFlight = true;
+  try {
+    const online = (await pm2List()).filter((b) => b.status === 'online').map((b) => b.name).filter(isSafeName);
+    for (const n of online) await stopTree(n);
+    statusCache.bots = await pm2List();
+    log('stopAll:', online.length, 'bot(s)');
+    return { ok: true, stopped: online.length };
+  } finally { stopAllInFlight = false; }
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {

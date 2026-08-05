@@ -61,6 +61,8 @@
   .modal-box p { color: var(--txt); font-size: 13px; margin: 4px 0; }
   .modal-box code { background: #12141d; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-size: 12px; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  .btn.armed { background: #e5484d; border-color: #e5484d; color: #fff; animation: armpulse 1s ease-in-out infinite; }
+  @keyframes armpulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
 </style>
 </head>
 <body>
@@ -74,6 +76,7 @@
         <div style="display:flex;gap:6px">
           <button class="btn primary" id="import-btn" title="Choisir le fichier principal du bot (index.js, bot.py…)">➕ Importer (fichier)</button>
           <button class="btn" id="import-dir-btn" title="Choisir le DOSSIER du bot — le fichier principal est détecté automatiquement">📁 Importer (dossier)</button>
+          <button class="btn danger" id="stop-all-btn" title="Arrêter TOUS les bots en ligne (clique une 2e fois pour confirmer)">⏹ Tout arrêter</button>
         </div>
       </div>
       <div id="bots"></div>
