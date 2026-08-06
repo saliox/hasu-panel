@@ -126,6 +126,7 @@ const render = (st) => {
   $('dev-note').textContent = st.cfg.packaged ? '' : '(actif seulement dans la version .exe)';
   $('set-rpc').checked = st.cfg.discordRpc !== false;
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
+  $('set-autoupdate').checked = st.autoApplyUpdates !== false;
   $('set-alerts').checked = st.cfg.alerts !== false;
   $('set-alert-toast').checked = st.cfg.alertToast !== false;
   if (document.activeElement !== $('set-alert-webhook')) $('set-alert-webhook').value = st.cfg.alertWebhook || '';
@@ -140,7 +141,16 @@ const render = (st) => {
   $('upd-version').textContent = st.cfg.version || '—';
   const applyBtn = $('upd-apply');
   applyBtn.style.display = st.updateReady ? '' : 'none';
-  if (st.updateReady && !updBusy) $('upd-status').innerHTML = '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».';
+  if (st.updateReady && !updBusy) {
+    // Avec l'installation automatique, on explique POURQUOI elle attend encore (au lieu de laisser croire
+    // qu'il faut absolument cliquer). « fenêtre ouverte » est normal : elle s'installera dès que tu fermes.
+    const bl = st.updateBlockers || [];
+    $('upd-status').innerHTML = st.autoApplyUpdates === false
+      ? '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer » (installation automatique désactivée).'
+      : bl.length
+        ? `✅ <b>Mise à jour prête</b> — elle s'installera toute seule dès que possible.<br><span style="opacity:.75">En attente : ${esc(bl.join(', '))}.</span> Tu peux aussi l'appliquer maintenant.`
+        : '✅ <b>Mise à jour prête</b> — installation automatique imminente…';
+  }
   else if (!updBusy && !st.updateReady && !updMsg) $('upd-status').textContent = st.cfg.packaged ? '' : 'ℹ️ L\'auto-update est actif seulement dans la version installée (Setup.exe).';
 };
 
@@ -402,6 +412,7 @@ document.addEventListener('change', async (e) => {
   if (t.id === 'set-scanauto') { await window.panel.setSetting('scanAuto', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc') { await window.panel.setSetting('discordRpc', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc-id') { await window.panel.setSetting('discordAppId', t.value.trim()); await refresh(); return; }
+  if (t.id === 'set-autoupdate') { await window.panel.setSetting('autoApplyUpdates', t.checked); await refresh(); return; }
   if (t.id === 'set-alerts') { await window.panel.setSetting('alerts', t.checked); await refresh(); return; }
   if (t.id === 'set-alert-toast') { await window.panel.setSetting('alertToast', t.checked); await refresh(); return; }
   if (t.id === 'set-alert-webhook') {

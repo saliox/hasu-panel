@@ -10,7 +10,9 @@ const path = require('path');
 const rpc = require('./discordrpc'); // Rich Presence Discord (IPC natif, sans dépendance)
 
 const IS_STARTUP = process.argv.includes('--startup'); // lancé par l'ouverture de session Windows
-const START_HIDDEN = process.argv.includes('--hidden');
+// `--updated` = relance APRÈS une mise à jour appliquée toute seule : on repart discrètement dans la
+// zone de notification, sinon une fenêtre surgirait sur ton bureau à chaque MAJ (au milieu d'autre chose).
+const START_HIDDEN = process.argv.includes('--hidden') || process.argv.includes('--updated');
 
 // L'interface est une simple liste de texte : le process GPU d'Electron (~100 Mo tenus 24h/24) n'apporte
 // rien ici et prend de la mémoire pendant tes parties. Rendu logiciel = imperceptible pour ce contenu.
@@ -21,6 +23,38 @@ try { app.disableHardwareAcceleration(); } catch {}
 // prochain démarrage du PC, puisqu'il se lance au logon). Pensé pour « installer chez un ami et
 // oublier ». Ne s'active QUE dans la version installée (NSIS) ; ignoré en dev / build « dir ».
 let updateReady = false, updaterRef = null, lastUpdateStatus = null;
+let updateReadyAt = 0, updateReadyVersion = '', updateApplying = false;
+
+// ---------- Application AUTOMATIQUE de la mise à jour (fenêtre sûre) ----------
+// PROBLÈME RÉEL : le panel ne se ferme jamais (il vit dans la zone de notification 24h/24), donc
+// `autoInstallOnAppQuit` ne se déclenchait jamais — constaté : un panel resté en v1.6.1 pendant un mois
+// alors que les MAJ étaient bien téléchargées. On applique donc nous-mêmes, mais SEULEMENT quand ça ne
+// dérange rien : pas en pleine partie, pas pendant une manip sur les bots, pas quand tu regardes l'écran.
+const UPDATE_GRACE_MS = 5 * 60 * 1000; // laisse passer 5 min après le téléchargement (anti-boucle)
+const updateBlockers = () => {
+  const b = [];
+  if (statusCache.game) b.push('jeu en cours');                       // ne jamais couper pendant une partie
+  if (busy) b.push('transition mode jeu');                            // une bascule de bots est en cours
+  if (actionsInFlight.size) b.push('action bot en cours');
+  if (stopAllInFlight) b.push('arrêt global en cours');
+  if (cfg.stoppedByGame.length) b.push('bots coupés par le mode jeu'); // on ne redémarre pas là-dessus
+  if (cfg.lowNetApplied) b.push('éco réseau active');
+  if (win && !win.isDestroyed() && win.isVisible()) b.push('fenêtre ouverte'); // tu es en train de t'en servir
+  if (Date.now() - updateReadyAt < UPDATE_GRACE_MS) b.push('délai de grâce');
+  return b;
+};
+const maybeAutoApplyUpdate = () => {
+  if (!updateReady || updateApplying || !updaterRef || !app.isPackaged) return;
+  if (cfg.autoApplyUpdates === false) return;
+  const blockers = updateBlockers();
+  if (blockers.length) { if (Date.now() % 600000 < 20000) log('MAJ en attente —', blockers.join(', ')); return; }
+  updateApplying = true;
+  cfg.updatedFrom = app.getVersion(); saveCfg();       // pour annoncer « mis à jour vers X » au retour
+  log('MAJ appliquée automatiquement :', app.getVersion(), '→', updateReadyVersion, '(redémarrage silencieux)');
+  quitting = true;                                      // ne pas repartir dans le tray sur ce quit
+  // isSilent=true (installeur oneClick, aucune fenêtre) + isForceRunAfter=true (le panel revient tout seul).
+  setTimeout(() => { try { updaterRef.quitAndInstall(true, true); } catch (e) { log('quitAndInstall', e.message); updateApplying = false; quitting = false; } }, 400);
+};
 // Vrai si a > b en version sémantique X.Y.Z (comparaison numérique champ par champ).
 const semverGt = (a, b) => {
   // Retire un éventuel préfixe "v"/"V" (ex. "v1.8.0") : sinon parseInt("v1", 10) vaut NaN||0 = 0,
@@ -45,7 +79,7 @@ const setupAutoUpdate = () => {
   autoUpdater.on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version }); log('MAJ disponible :', i?.version); });
   autoUpdater.on('update-not-available', () => { pushUpd({ state: 'uptodate' }); });
   autoUpdater.on('download-progress', (p) => { pushUpd({ state: 'downloading', percent: Math.round(p?.percent || 0), bps: p?.bytesPerSecond || 0, transferred: p?.transferred || 0, total: p?.total || 0, version: lastUpdateStatus?.version }); });
-  autoUpdater.on('update-downloaded', (i) => { updateReady = true; pushUpd({ state: 'downloaded', version: i?.version }); log('MAJ téléchargée :', i?.version, '→ appliquée au prochain démarrage'); updateTray(); });
+  autoUpdater.on('update-downloaded', (i) => { updateReady = true; updateReadyAt = Date.now(); updateReadyVersion = i?.version || ''; pushUpd({ state: 'downloaded', version: i?.version }); log('MAJ téléchargée :', i?.version, '→ sera appliquée dès que ce sera sans risque'); updateTray(); });
   autoUpdater.on('error', (e) => { pushUpd({ state: 'error', message: e?.message || String(e) }); log('updater erreur :', e?.message || e); });
   const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
   setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
@@ -125,7 +159,9 @@ const DEFAULTS = {
   alerts: true,             // prévenir quand un bot tombe / redémarre en boucle
   alertToast: true,         // notification Windows (utile seulement si tu es devant le PC)
   alertWebhook: '',         // URL de webhook Discord (te touche même en jeu ou absent) — https://discord.com/api/webhooks/…
-  lastSaveAt: 0             // dernier « pm2 save » réussi (ce qui reviendra au prochain démarrage)
+  lastSaveAt: 0,            // dernier « pm2 save » réussi (ce qui reviendra au prochain démarrage)
+  autoApplyUpdates: true,   // installer la MAJ tout seul dès que c'est sans risque (jamais en pleine partie)
+  updatedFrom: ''           // version quittée lors d'une MAJ auto → sert à annoncer « mis à jour » au retour
 };
 
 let win = null, tray = null, quitting = false;
@@ -198,6 +234,8 @@ const loadCfg = () => {
       autoLaunch: raw.autoLaunch !== false, lowNet: raw.lowNet === true, lowNetApplied: raw.lowNetApplied === true,
       scanAuto: raw.scanAuto !== false, discordRpc: raw.discordRpc !== false,
       alerts: raw.alerts !== false, alertToast: raw.alertToast !== false,
+      autoApplyUpdates: raw.autoApplyUpdates !== false,
+      updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
       games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : DEFAULT_GAMES,
@@ -894,6 +932,7 @@ const tick = async () => {
   // fenêtre est visible. En tray ça épargne un spawn PowerShell/CIM par tick = moins de CPU/batterie.
   if (win && !win.isDestroyed() && win.isVisible()) await measureNet().catch(() => {});
   if (pm2Health.ok) await checkAlerts(statusCache.bots).catch((e) => log('checkAlerts', e.message));
+  maybeAutoApplyUpdate(); // s'installe tout seul dès que c'est sans risque (plus besoin de fermer le panel à la main)
   statusCache.updatedAt = Date.now();
   updateTray();
   updateRpc(); // met à jour la Rich Presence Discord (« gère X bots en ligne »)
@@ -1084,6 +1123,8 @@ ipcMain.handle('panel:status', () => ({
   updateStatus: lastUpdateStatus,
   toolchain,
   pm2Health,                      // { ok, since, reason } → l'UI dit « pm2 ne répond plus » au lieu de « aucun bot »
+  updateBlockers: updateReady ? updateBlockers() : [], // pourquoi la MAJ prête n'est pas encore appliquée
+  autoApplyUpdates: cfg.autoApplyUpdates !== false,
   lastSaveAt: cfg.lastSaveAt || 0, // dernier `pm2 save` (ce qui reviendra au reboot)
   needFix: needFix(),             // bots « Auto boot » éteints sans que tu l'aies demandé
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
@@ -1309,6 +1350,7 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'scanAuto') { cfg.scanAuto = !!value; saveCfg(); return { ok: true }; }
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
   if (key === 'discordAppId') { cfg.discordAppId = String(value || '').trim().slice(0, 40); saveCfg(); startRpc(); return { ok: true }; }
+  if (key === 'autoApplyUpdates') { cfg.autoApplyUpdates = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alerts') { cfg.alerts = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertToast') { cfg.alertToast = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertWebhook') {
@@ -1431,6 +1473,14 @@ else {
     applyAutoLaunch();
     startRpc(); // Rich Presence Discord (si activée + App ID configuré)
     setupAutoUpdate(); // auto-update en fond (version installee uniquement)
+    // Retour après une MAJ appliquée toute seule : on te le dit (discrètement) au lieu d'un changement muet.
+    if (cfg.updatedFrom && cfg.updatedFrom !== app.getVersion()) {
+      const from = cfg.updatedFrom; cfg.updatedFrom = ''; saveCfg();
+      log('retour après MAJ auto :', from, '→', app.getVersion());
+      setTimeout(() => {
+        try { const { Notification } = require('electron'); if (Notification.isSupported()) new Notification({ title: 'Hasu Panel mis à jour', body: `Version ${from} → ${app.getVersion()}. Rien à faire, tout a repris tout seul.` }).show(); } catch {}
+      }, 4000);
+    }
     probeToolchain().then((t) => { toolchain = t; }).catch(() => {}); // détecte Node/pm2 (guide si absent)
     if (!START_HIDDEN) showWindow();
 
