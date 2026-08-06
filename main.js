@@ -21,8 +21,11 @@ let updateReady = false, updaterRef = null, lastUpdateStatus = null;
 const semverGt = (a, b) => {
   // Retire un éventuel préfixe "v"/"V" (ex. "v1.8.0") : sinon parseInt("v1", 10) vaut NaN||0 = 0,
   // et une version distante réellement plus récente pouvait s'afficher comme plus ancienne/égale.
-  const pa = String(a || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
-  const pb = String(b || '').trim().replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  // Retire "v", puis la pré-release/metadata (-rc.1, +build) avant de parser : sinon parseInt("5-rc")=5
+  // faisait passer "1.7.5-rc.1" pour égal à "1.7.5" (mauvais libellé « à jour »). Label d'affichage only.
+  const core = (s) => String(s || '').trim().replace(/^v/i, '').split(/[-+]/)[0];
+  const pa = core(a).split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = core(b).split('.').map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
   return false;
 };
@@ -62,6 +65,11 @@ const RESERVED_NAMES = new Set([
 ]);
 const isSafeName = (n) => typeof n === 'string' && NAME_RE.test(n) && !RESERVED_NAMES.has(n.toLowerCase());
 
+// Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
+// avant le PATH → un binaire planté (powershell.exe/taskkill.exe…) dans le CWD pourrait être exécuté.
+// On qualifie donc explicitement les outils système. SystemRoot est fixé par Windows (non modifiable par un user standard).
+const SYS = (e) => path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', e);
+
 // Dossier « data » du bot saliox (drapeaux de coordination panel ↔ bot). Par défaut : <profil>\Desktop\saliox bot\data
 // (résolu via os.homedir → aucun nom d'utilisateur codé en dur). Personnalisable via la variable d'env HASU_SALIOX_DATA.
 const SALIOX_DATA = process.env.HASU_SALIOX_DATA || path.join(require('os').homedir(), 'Desktop', 'saliox bot', 'data');
@@ -69,6 +77,10 @@ const SALIOX_DATA = process.env.HASU_SALIOX_DATA || path.join(require('os').home
 const WATCHDOG_FLAG = path.join(SALIOX_DATA, 'panel_maintenance.json');
 // Drapeau « faible usage internet » lu par saliox (systems/lownet.js) : gros transferts différés pendant le jeu.
 const LOWNET_FLAG = path.join(SALIOX_DATA, 'lownet.json');
+// Crée data\ s'il manque, SINON les écritures de drapeaux ENOENT en silence (mode jeu / faible usage internet
+// deviennent des no-op alors que l'UI les montre actifs). On ne crée QUE si le dossier « saliox bot » parent
+// existe → on évite de fabriquer un dossier fantôme au mauvais endroit (Desktop redirigé OneDrive).
+try { if (fs.existsSync(path.dirname(SALIOX_DATA))) fs.mkdirSync(SALIOX_DATA, { recursive: true }); } catch {}
 
 const DEFAULT_GAMES = [
   'FortniteClient-Win64-Shipping.exe',
@@ -118,26 +130,65 @@ let busy = false; // évite deux bascules mode jeu simultanées
 // dans le tray, IPC panel:setGameMode) — avant, seul tick() posait `busy`, donc un clic manuel
 // pendant un tick en cours pouvait s'entrelacer avec lui (état pm2 final incohérent avec le
 // choix réel de l'utilisateur). `fn` est sauté silencieusement si une transition est déjà en cours.
+let pendingGameFn = null;
 const withGameLock = async (fn) => {
-  if (busy) return;
+  // Coalesce : si une transition est déjà en cours, on MÉMORISE la dernière demande au lieu de la jeter.
+  // Sinon « désactiver le mode jeu » cliqué pendant un enterGameMode en cours était perdu → bots coupés
+  // jusqu'à la fermeture du jeu. La demande en attente est rejouée dès que le verrou se libère.
+  if (busy) { pendingGameFn = fn; return; }
   busy = true;
-  try { await fn(); } finally { busy = false; }
+  try { await fn(); } finally {
+    busy = false;
+    const next = pendingGameFn; pendingGameFn = null;
+    if (next) withGameLock(next);
+  }
 };
 let prevIo = new Map(); // pid -> { read, write, at } : relevé E/S précédent, pour calculer les DÉBITS (octets/s) par delta
 
 const log = (...a) => {
-  try { fs.appendFileSync(path.join(app.getPath('userData'), 'panel.log'), `${new Date().toISOString()} ${a.join(' ')}\n`); } catch {}
+  try {
+    const f = path.join(app.getPath('userData'), 'panel.log');
+    // Rotation : au-delà de ~2 Mo on repart d'un fichier neuf (garde panel.log.1) — sinon une erreur
+    // récurrente (pm2 cassé, updater en échec toutes les 6 h) ferait grossir le log sans fin.
+    try { if (fs.statSync(f).size > 2 * 1024 * 1024) fs.renameSync(f, f + '.1'); } catch {}
+    fs.appendFileSync(f, `${new Date().toISOString()} ${a.join(' ')}\n`);
+  } catch {}
 };
 
 // ---------- Config ----------
 const cfgPath = () => path.join(app.getPath('userData'), 'panel-config.json');
+// Entier borné : un scalaire corrompu/édité à la main (ex. pollSec="10x" → NaN) transformerait la
+// boucle de sondage en boucle folle (spawn continu de tasklist/pm2). On coerce + clamp comme les setters.
+const clampInt = (v, lo, hi, def) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def; };
 const loadCfg = () => {
+  const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+  let raw;
+  try { raw = read(cfgPath()); }
+  catch { try { raw = read(cfgPath() + '.bak'); log('config: fichier principal illisible → repli sur .bak'); } catch { return JSON.parse(JSON.stringify(DEFAULTS)); } }
   try {
-    const raw = JSON.parse(fs.readFileSync(cfgPath(), 'utf8'));
+    // bots : RECONSTRUIT depuis {} — on ne garde que les clés sûres avec une valeur-objet (anti type-confusion :
+    // un tableau ou une chaîne passait le typeof==='object' d'avant et corrompait les lookups par bot).
+    const gm = raw.gameMode && typeof raw.gameMode === 'object' ? raw.gameMode : {};
+    const bots = {};
+    if (raw.bots && typeof raw.bots === 'object' && !Array.isArray(raw.bots)) {
+      for (const k of Object.keys(raw.bots)) {
+        const v = raw.bots[k];
+        if (isSafeName(k) && v && typeof v === 'object' && !Array.isArray(v)) bots[k] = { auto: v.auto !== false, gameStop: !!v.gameStop };
+      }
+    }
     return {
       ...DEFAULTS, ...raw,
-      bots: raw.bots && typeof raw.bots === 'object' ? raw.bots : {},
-      gameMode: { ...DEFAULTS.gameMode, ...(raw.gameMode || {}) },
+      bots,
+      gameMode: {
+        enabled: gm.enabled === true, stopAll: gm.stopAll === true, soloSkip: gm.soloSkip !== false,
+        graceSec: clampInt(gm.graceSec, 10, 3600, DEFAULTS.gameMode.graceSec),
+      },
+      // Scalaires bornés (mêmes bornes que setSetting/setGameMode) — un NaN ne peut plus casser la boucle.
+      pollSec: clampInt(raw.pollSec, 5, 120, DEFAULTS.pollSec),
+      idlePollSec: clampInt(raw.idlePollSec, 15, 300, DEFAULTS.idlePollSec),
+      lastScanAt: clampInt(raw.lastScanAt, 0, Number.MAX_SAFE_INTEGER, 0),
+      autoLaunch: raw.autoLaunch !== false, lowNet: raw.lowNet === true, lowNetApplied: raw.lowNetApplied === true,
+      scanAuto: raw.scanAuto !== false, discordRpc: raw.discordRpc !== false,
       games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : DEFAULT_GAMES,
       stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
       imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
@@ -147,7 +198,16 @@ const loadCfg = () => {
     };
   } catch { return JSON.parse(JSON.stringify(DEFAULTS)); }
 };
-const saveCfg = () => { try { fs.writeFileSync(cfgPath(), JSON.stringify(cfg, null, 2)); } catch (e) { log('saveCfg', e.message); } };
+// Écriture ATOMIQUE : temp + rename (jamais de fichier tronqué si crash/coupure en plein write), + un .bak
+// restauré par loadCfg si le principal devient illisible. Sinon un write interrompu réinitialisait TOUT aux DEFAULTS.
+const saveCfg = () => {
+  try {
+    const file = cfgPath(), tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+    try { if (fs.existsSync(file)) fs.copyFileSync(file, file + '.bak'); } catch {}
+    fs.renameSync(tmp, file); // atomique sur NTFS
+  } catch (e) { log('saveCfg', e.message); }
+};
 
 // ---------- Détection de la chaîne d'outils (Node + pm2) ----------
 // Chez un ami, pm2 (voire Node) peut ne pas être installé → le panel affichait juste « Aucun process »,
@@ -207,7 +267,7 @@ const pm2List = async () => {
 // À capturer AVANT le stop : une fois le parent mort, Windows ne réparente pas → l'arbre est perdu.
 // Réutilisable pour arrêter plusieurs bots sans redemander la table à chaque fois.
 const processTree = () => new Promise((resolve) => {
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
     'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId):$($_.ParentProcessId):$($_.CreationDate.Ticks)" }'],
     { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
       const children = new Map(); // ppid -> [pid,...]
@@ -242,7 +302,7 @@ const killPids = (pids) => new Promise((resolve) => {
   const list = [...new Set((pids || []).filter((p) => Number.isInteger(p) && p > 0))];
   if (!list.length) return resolve();
   const args = list.flatMap((p) => ['/PID', String(p)]).concat('/F'); // pas de /T : on a déjà tout l'arbre
-  execFile('taskkill.exe', args, { windowsHide: true, timeout: 15000 }, () => resolve());
+  execFile(SYS('taskkill.exe'), args, { windowsHide: true, timeout: 15000 }, () => resolve());
 });
 
 // Anti-recyclage de PID : avant de force-kill après la grâce, on re-vérifie que chaque PID capturé est
@@ -254,7 +314,7 @@ const verifyStillSame = (pids, born) => new Promise((resolve) => {
   const list = [...new Set((pids || []).filter((p) => Number.isInteger(p) && p > 0))];
   if (!list.length || !born || !born.size) return resolve(list); // rien à vérifier → inchangé
   const filter = list.map((p) => `ProcessId=${p}`).join(' OR ');
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
     `Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$($_.CreationDate.Ticks)" }`],
     { windowsHide: true, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
       if (err) return resolve(list); // requête en ÉCHEC → comportement d'origine (ne pas laisser d'orphelins)
@@ -315,7 +375,7 @@ const deleteTree = async (name) => { await stopTree(name); return pm2(['delete',
 
 // ---------- Détection de jeu (liste de process + PID) ----------
 const listProcs = () => new Promise((resolve) => {
-  execFile('tasklist.exe', ['/fo', 'csv', '/nh'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
+  execFile(SYS('tasklist.exe'), ['/fo', 'csv', '/nh'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
     if (err || !out) return resolve(null);
     const names = new Set(); const pids = new Map();
     for (const line of String(out).split('\n')) {
@@ -379,7 +439,7 @@ const ioRawByPid = (pids) => new Promise((resolve) => {
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
   if (!pids.length) return resolve(m);
   const filter = pids.map((p) => `ProcessId=${p}`).join(' OR ');
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
     `Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$([int64]$_.ReadTransferCount):$([int64]$_.WriteTransferCount)" }`],
     { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
       if (err || !out) return resolve(m);
@@ -419,11 +479,11 @@ const setBotPriority = (pids, cls) => new Promise((resolve) => {
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
   if (!pids.length || !['Normal', 'BelowNormal', 'Idle'].includes(cls)) return resolve(false);
   const cmd = `foreach($p in ${pids.join(',')}){ try { (Get-Process -Id $p -ErrorAction Stop).PriorityClass = '${cls}' } catch {} }`;
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true, timeout: 20000 }, () => resolve(true));
+  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true, timeout: 20000 }, () => resolve(true));
 });
 
 const linkSpeedMbps = () => new Promise((resolve) => {
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
     "(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1 -ExpandProperty LinkSpeed)"],
     { windowsHide: true, timeout: 20000 }, (err, out) => {
       const m = String(out || '').match(/([\d.]+)\s*(G|M|K)?bps/i);
@@ -457,10 +517,15 @@ const clearLowNet = async () => {
 // Confie un projet perso (lancé d'habitude à la main / via Visual Studio) à pm2 : il devient
 // gérable comme les autres (auto boot, mode jeu, start/stop) et survit aux redémarrages (pm2 save).
 const BAD_SHELL_RE = /[&|<>^"%!\r\n`;]/; // métacaractères cmd interdits dans un chemin (shell:true)
+// Provenance : seuls les chemins RÉELLEMENT choisis via un dialogue natif (importPick/importPickDir) sont
+// exécutables. Un renderer compromis ne peut donc pas faire lancer un chemin ARBITRAIRE par pm2 — au pire il
+// relancerait un script que l'utilisateur a lui-même sélectionné au dialogue pendant cette session.
+const approvedScripts = new Set();
 
 const importBot = async (name, script) => {
   if (!isSafeName(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
   script = path.resolve(String(script || ''));
+  if (!approvedScripts.has(script)) return { ok: false, error: 'Sélectionne le fichier via le bouton d\'import (chemin non approuvé)' };
   if (BAD_SHELL_RE.test(script)) return { ok: false, error: 'Chemin non pris en charge (caractères spéciaux)' };
   if (!/\.(js|mjs|cjs|py)$/i.test(script) || !fs.existsSync(script)) return { ok: false, error: 'Fichier introuvable (attendu : .js, .mjs, .cjs ou .py)' };
   const existing = await pm2List();
@@ -618,7 +683,11 @@ const exitGameMode = async () => {
 };
 
 // ---------- Boucle de surveillance ----------
+let tickRunning = false;
 const tick = async () => {
+  if (tickRunning) return; // un tick est déjà en cours (ex. restartPoll(true) au show pendant un tick lent) → évite un double fan-out de spawns
+  tickRunning = true;
+  try {
   const procs = await listProcs();
   if (procs) {
     const hit = cfg.games.find((g) => procs.names.has(g.toLowerCase()));
@@ -641,6 +710,8 @@ const tick = async () => {
           await enterGameMode(hit);
         } else if (cfg.stoppedByGame.length > 0 && !gameRunning && graceOver) {
           await exitGameMode(); // couvre aussi la reprise après crash/redémarrage du panel
+        } else if (cfg.stoppedByGame.length > 0 && !cfg.gameMode.enabled) {
+          await exitGameMode(); // mode jeu désactivé pendant une partie → relance les bots sans attendre la fin du jeu (self-heal)
         }
         // Faible usage internet : indépendant du mode jeu (utile pour les bots qu'on laisse tourner).
         if (cfg.lowNet && gameRunning && sessionOnline && !cfg.lowNetApplied) {
@@ -661,6 +732,7 @@ const tick = async () => {
   if (cfg.scanAuto !== false && !statusCache.game && Date.now() - (cfg.lastScanAt || 0) > SCAN_MS) {
     runScan().catch(() => {});
   }
+  } finally { tickRunning = false; }
 };
 
 // ---------- Application au démarrage de Windows ----------
@@ -681,7 +753,12 @@ const bootEnforce = async () => {
     const c = cfg.bots[b.name];
     if (!c) continue;
     if (c.auto === false && b.status === 'online') { await stopTree(b.name); log('boot: stop', b.name, '(auto off)'); }
-    else if (c.auto !== false && b.status !== 'online') { await pm2(['start', b.name]); log('boot: start', b.name); }
+    else if (c.auto !== false && b.status !== 'online') {
+      // Ne PAS ressusciter un bot que le mode jeu vient de couper (jeu déjà lancé au logon → tick a rempli
+      // stoppedByGame avant ce bootEnforce à +8s) : sinon on relance ce que le mode jeu a intentionnellement stoppé.
+      if (cfg.stoppedByGame.includes(b.name)) { log('boot: skip', b.name, '(coupé par le mode jeu)'); continue; }
+      await pm2(['start', b.name]); log('boot: start', b.name);
+    }
   }
 };
 
@@ -691,19 +768,33 @@ const bootEnforce = async () => {
 // admin, réversible). Best-effort : si l'écriture échoue, la clé Run lance le panel quand même (retardé).
 // NB : on N'utilise PAS de tâche planifiée — Register-ScheduledTask exige l'admin sur des postes durcis
 // (testé : « Accès refusé » même pour créer une tâche utilisateur) → inadapté à un lancement en fond.
+const REG_SERIALIZE = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize';
 const disableStartupDelay = () => {
   if (process.platform !== 'win32' || !app.isPackaged) return;
-  execFile('reg', ['add', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize',
-    '/v', 'StartupDelayInMSec', '/t', 'REG_DWORD', '/d', '0', '/f'],
+  execFile(SYS('reg.exe'), ['add', REG_SERIALIZE, '/v', 'StartupDelayInMSec', '/t', 'REG_DWORD', '/d', '0', '/f'],
     { windowsHide: true, timeout: 10000 }, (err) => { if (err) log('startupDelay', err.message); });
 };
+// Retire notre tweak quand l'auto-démarrage est désactivé : StartupDelayInMSec est GLOBAL (tous les apps
+// de démarrage) → on ne le laisse pas traîner après un « désactiver ». reg delete restaure le défaut Windows.
+const restoreStartupDelay = () => {
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+  execFile(SYS('reg.exe'), ['delete', REG_SERIALIZE, '/v', 'StartupDelayInMSec', '/f'],
+    { windowsHide: true, timeout: 10000 }, () => {});
+};
 
-const applyAutoLaunch = () => {
+const applyAutoLaunch = (fromToggle = false) => {
   if (!app.isPackaged) return; // en dev, ne pas enregistrer electron.exe
   const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
-  // Clé Run (HKCU, sans admin) : visible dans le gestionnaire des tâches Windows + nettoyée à la désinstallation.
-  app.setLoginItemSettings({ openAtLogin: !!cfg.autoLaunch, path: exe, args: ['--hidden', '--startup'] });
-  if (cfg.autoLaunch) disableStartupDelay(); // lancement PROMPT au boot (contourne le délai de démarrage Win11)
+  if (fromToggle || !cfg.autoLaunchInit) {
+    // Bascule EXPLICITE (panel) ou 1er lancement → on (dé)pose la clé Run (HKCU, sans admin, nettoyée à la désinstallation).
+    app.setLoginItemSettings({ openAtLogin: !!cfg.autoLaunch, path: exe, args: ['--hidden', '--startup'] });
+    cfg.autoLaunchInit = true; saveCfg();
+  } else {
+    // Lancements suivants : l'OS fait foi → on respecte un « désactivé » fait dans Gestionnaire des tâches
+    // > Démarrage (avant, on ré-imposait openAtLogin=true à chaque démarrage, écrasant le choix de l'user).
+    try { const st = app.getLoginItemSettings(); if (typeof st.openAtLogin === 'boolean' && st.openAtLogin !== cfg.autoLaunch) { cfg.autoLaunch = st.openAtLogin; saveCfg(); } } catch {}
+  }
+  if (cfg.autoLaunch) disableStartupDelay(); else restoreStartupDelay();
 };
 
 // ---------- Rich Presence Discord ----------
@@ -770,9 +861,16 @@ const showWindow = () => {
     backgroundColor: '#0f1117',
     title: 'Hasu Panel',
     icon: path.join(__dirname, 'icon.png'),
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: false }
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
   win.removeMenu();
+  // Refuse toute permission de périphérique (caméra/micro/géoloc/notif…) : le panel n'en a aucun besoin.
+  try { win.webContents.session.setPermissionRequestHandler((_wc, _perm, cb) => cb(false)); } catch {}
+  // Interdit toute navigation hors du fichier local : une nav de la fenêtre principale vers un site distant
+  // hériterait du pont window.panel (le CSP meta ne voyage pas). On garde le contenu 100 % local.
+  const stayLocal = (e, url) => { if (!/^file:\/\//i.test(url)) { e.preventDefault(); if (/^https?:\/\//i.test(url)) shell.openExternal(url); } };
+  win.webContents.on('will-navigate', stayLocal);
+  win.webContents.on('will-redirect', stayLocal);
   // window.open('https://...') (ex. lien « Télécharger Node.js ») ouvrait sinon une SECONDE
   // BrowserWindow Electron chargeant le contenu distant EN INTERNE — contraire au commentaire
   // d'en-tête du fichier ("aucun contenu distant chargé") et à l'anti-pattern documenté par
@@ -782,6 +880,9 @@ const showWindow = () => {
     return { action: 'deny' };
   });
   win.loadFile(path.join(__dirname, 'ui', 'index.html'));
+  // Rejoue le dernier état MAJ à la fenêtre qui s'ouvre : au démarrage caché, la progression du téléchargement
+  // partait dans le vide (pas de fenêtre) → en ouvrant le panel en plein téléchargement, aucune barre/erreur.
+  win.webContents.once('did-finish-load', () => { try { if (lastUpdateStatus) win.webContents.send('update-status', lastUpdateStatus); } catch {} });
   win.on('close', (e) => { if (!quitting) { e.preventDefault(); win.hide(); } }); // fermer = réduire dans le tray
   win.on('minimize', (e) => { e.preventDefault(); win.hide(); }); // minimiser = réduire dans le tray (comme Hasu ftn)
   win.on('closed', () => { win = null; });
@@ -815,7 +916,7 @@ ipcMain.handle('panel:ignoreGame', (_e, exe) => {
 // Liste des programmes ouverts (avec une fenêtre) → pour ajouter un jeu/logiciel inconnu en 1 clic.
 ipcMain.handle('panel:runningApps', () => new Promise((resolve) => {
   const SKIP = new Set(['hasupanel', 'explorer', 'applicationframehost', 'systemsettings', 'textinputhost', 'electron', 'searchhost', 'startmenuexperiencehost', 'shellexperiencehost']);
-  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
     "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { $_.ProcessName + '|' + $_.MainWindowTitle }"],
     { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
       if (err || !out) return resolve([]);
@@ -853,6 +954,7 @@ ipcMain.handle('panel:importPick', async () => {
   });
   if (r.canceled || !r.filePaths[0]) return { ok: false };
   const script = r.filePaths[0];
+  approvedScripts.add(path.resolve(script)); // provenance : ce chemin vient d'un dialogue natif → exécutable
   // Nom proposé = dossier du script, nettoyé pour pm2.
   const suggested = path.basename(path.dirname(script)).replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'mon-bot';
   return { ok: true, script, suggested };
@@ -880,6 +982,7 @@ ipcMain.handle('panel:importPickDir', async () => {
   const dir = r.filePaths[0];
   const script = await findEntryScript(dir);
   if (!script) return { ok: false, error: 'Aucun fichier principal trouvé dans ce dossier (attendu : package.json « main », ou index.js / main.js / bot.js / app.js / *.py).' };
+  approvedScripts.add(path.resolve(script)); // provenance : détecté depuis un dossier choisi au dialogue → exécutable
   const suggested = path.basename(dir).replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'mon-bot';
   return { ok: true, script, suggested };
 });
@@ -956,7 +1059,7 @@ ipcMain.handle('panel:removeGame', (_e, exe) => {
 });
 
 ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
-  if (key === 'autoLaunch') { cfg.autoLaunch = !!value; saveCfg(); applyAutoLaunch(); return { ok: true }; }
+  if (key === 'autoLaunch') { cfg.autoLaunch = !!value; saveCfg(); applyAutoLaunch(true); return { ok: true }; }
   if (key === 'pollSec') { cfg.pollSec = Math.max(5, Math.min(120, Math.floor(Number(value) || 10))); saveCfg(); restartPoll(); return { ok: true }; }
   if (key === 'idlePollSec') { cfg.idlePollSec = Math.max(15, Math.min(300, Math.floor(Number(value) || 30))); saveCfg(); restartPoll(); return { ok: true }; }
   if (key === 'lowNet') { cfg.lowNet = !!value; saveCfg(); return { ok: true }; } // le tick applique/retire tout seul
@@ -1083,7 +1186,12 @@ else {
     quitting = true;
     if (cleanedUp) return; // nettoyage déjà fait → on laisse Electron quitter
     e.preventDefault();
+    // Coupe la boucle de sondage AVANT le nettoyage (bump d'époque + clear du timer) : sinon un tick
+    // pourrait piloter les mêmes bots (pm2 start/stop) en même temps que exitGameMode = état final indéterminé.
+    pollEpoch++; if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     (async () => {
+      // Laisse une transition de mode jeu déjà en cours se terminer (max ~6 s) avant de nettoyer.
+      for (let i = 0; i < 30 && busy; i++) await new Promise((r) => setTimeout(r, 200));
       try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.length) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
       try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
       cleanedUp = true;
