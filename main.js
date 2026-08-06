@@ -173,7 +173,7 @@ const loadCfg = () => {
     if (raw.bots && typeof raw.bots === 'object' && !Array.isArray(raw.bots)) {
       for (const k of Object.keys(raw.bots)) {
         const v = raw.bots[k];
-        if (isSafeName(k) && v && typeof v === 'object' && !Array.isArray(v)) bots[k] = { auto: v.auto !== false, gameStop: !!v.gameStop };
+        if (isSafeName(k) && v && typeof v === 'object' && !Array.isArray(v)) bots[k] = { auto: v.auto !== false, gameStop: !!v.gameStop, manualStop: v.manualStop === true };
       }
     }
     return {
@@ -759,6 +759,10 @@ const bootEnforce = async () => {
       // Ne PAS ressusciter un bot que le mode jeu vient de couper (jeu déjà lancé au logon → tick a rempli
       // stoppedByGame avant ce bootEnforce à +8s) : sinon on relance ce que le mode jeu a intentionnellement stoppé.
       if (cfg.stoppedByGame.includes(b.name)) { log('boot: skip', b.name, '(coupé par le mode jeu)'); continue; }
+      // Ni un bot que TU as arrêté toi-même depuis le panel : « Auto boot » veut dire « rallumé au
+      // démarrage du PC », pas « impossible à laisser éteint ». Avant, chaque relance du panel (y compris
+      // après une mise à jour auto) rallumait tout seul les bots volontairement arrêtés.
+      if (c.manualStop) { log('boot: skip', b.name, '(arrêté manuellement)'); continue; }
       await pm2(['start', b.name]); log('boot: start', b.name);
     }
   }
@@ -1002,6 +1006,11 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
   try {
     // stop/restart : on reape l'arbre (pm2 restart ne tue pas les enfants avant de relancer → orphelins cumulés).
     let r;
+    // Mémorise une décision MANUELLE : un bot que TU arrêtes ne doit pas se relancer tout seul au
+    // prochain démarrage du panel (bootEnforce). Un start/restart manuel lève le drapeau.
+    const b = cfg.bots[name] || (cfg.bots[name] = { auto: true, gameStop: false });
+    if (action === 'stop') b.manualStop = true; else b.manualStop = false;
+    saveCfg();
     if (action === 'stop') r = await stopTree(name);
     else if (action === 'restart') { await stopTree(name); r = await pm2(['start', name]); }
     else r = await pm2([action, name]);
@@ -1020,6 +1029,9 @@ ipcMain.handle('panel:stopAll', async () => {
   stopAllInFlight = true;
   try {
     const online = (await pm2List()).filter((b) => b.status === 'online' && isSafeName(b.name));
+    // Arrêt VOLONTAIRE → ces bots ne doivent pas se rallumer seuls au prochain démarrage du panel.
+    for (const b of online) { const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false }); c.manualStop = true; }
+    if (online.length) saveCfg();
     await stopBotsTree(online.map((b) => ({ name: b.name, pid: b.pid }))); // 1 snapshot + 1 grâce pour tous
     statusCache.bots = await pm2List();
     log('stopAll:', online.length, 'bot(s)');

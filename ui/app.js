@@ -157,8 +157,6 @@ const aboutHTML = () => {
   <p>Option « Rich Presence » : ton profil Discord peut afficher <b>« 🤖 Gère X bots en ligne »</b> (et le jeu en cours). Purement décoratif, désactivable dans ⚙️ Réglages.</p>
   <h3>🧰 Sur un PC neuf (chez un ami)</h3>
   <p>Les bots ont besoin de <b>Node.js</b> et <b>pm2</b>. Si l'un des deux manque, le panel le <b>détecte</b> et propose le bouton qui va bien (« Télécharger Node.js » ou « Installer pm2 ») au lieu d'afficher une liste vide.</p>
-  <h3>🔗 Le watchdog</h3>
-  <p>saliox garde un œil sur les autres bots et t'envoie un MP <b>uniquement</b> si l'un d'eux <b>plante en boucle</b> (crash-loop). Les arrêts/démarrages normaux ne génèrent aucun MP : c'est ici, dans le panel, que tu vois qui est en ligne.</p>
   <h3>📁 Bon à savoir</h3>
   <p>• La croix de la fenêtre <b>réduit dans la zone de notification</b> (à côté de l'horloge). Pour quitter : clic droit sur l'icône → Quitter.<br>• Réglages enregistrés dans <code>%APPDATA%\\hasu-panel\\panel-config.json</code>, journal dans <code>panel.log</code>.<br>• Le panel se lance tout seul avec Windows (désactivable dans ⚙️ Réglages).</p>
   <div class="modal-actions"><button class="btn primary" id="modal-close">Fermer</button></div>`;
