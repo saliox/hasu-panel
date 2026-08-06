@@ -480,11 +480,22 @@ const deleteTree = async (name) => { await stopTree(name); return pm2(['delete',
 // d'écrire à chaque clic) et un GARDE-FOU : jamais pendant un mode jeu / lowNet, sinon on graverait
 // « bots coupés » comme état de démarrage voulu.
 let saveTimer = null;
+let saveRetries = 0;
 const schedulePm2Save = (delayMs = 15000) => {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     saveTimer = null;
-    if (cfg.stoppedByGame.length || cfg.lowNetApplied) { log('pm2 save différé (mode jeu / éco réseau actif)'); return; }
+    // « Différé » doit vouloir dire RÉESSAYÉ, pas abandonné : avant, un simple `return` jetait la
+    // sauvegarde, donc tout démarrage/arrêt fait pendant une partie n'atteignait JAMAIS pm2 save et le
+    // reboot suivant restaurait une liste périmée. Le marqueur '-' (mode jeu sans aucune cible) est
+    // filtré comme partout ailleurs, sinon il bloquait la sauvegarde toute la partie pour rien.
+    const parked = cfg.stoppedByGame.filter((n) => n !== '-');
+    if (parked.length || cfg.lowNetApplied) {
+      if (saveRetries < 20) { saveRetries++; log('pm2 save reporté (mode jeu / éco réseau) — nouvelle tentative dans 2 min'); schedulePm2Save(120000); }
+      else log('pm2 save abandonné après 20 tentatives');
+      return;
+    }
+    saveRetries = 0;
     const r = await pm2(['save']);
     if (r.ok) { cfg.lastSaveAt = Date.now(); saveCfg(); log('pm2 save auto OK'); } else log('pm2 save auto échec');
   }, delayMs);
@@ -1192,7 +1203,10 @@ ipcMain.handle('panel:status', () => ({
   lastSaveAt: cfg.lastSaveAt || 0, // dernier `pm2 save` (ce qui reviendra au reboot)
   needFix: needFix(),             // bots « Auto boot » éteints sans que tu l'aies demandé
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
-  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
+  cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '',
+    // Réglages d'alertes : SANS eux, l'UI lisait `undefined` → l'interrupteur se recochait tout seul
+    // (undefined !== false) et le champ webhook se vidait au premier rafraîchissement.
+    alerts: cfg.alerts !== false, alertToast: cfg.alertToast !== false, alertWebhook: cfg.alertWebhook || '' }
 }));
 
 // Scan disque à la demande (bouton « Scanner ») + gestion des suggestions.
@@ -1526,7 +1540,12 @@ else {
     cfg = loadCfg();
     resolvePm2Runner(); // node.exe + pm2/bin/pm2 → appels pm2 sans cmd.exe (zéro process fantôme)
     // Sans AppUserModelId, Windows 10/11 n'affiche AUCUNE notification d'une app Electron.
-    try { app.setAppUserModelId('com.saliox.hasupanel'); } catch {}
+    // DOIT être identique au `build.appId` du package.json ('hasu.panel') : c'est cet identifiant que
+    // Windows associe au raccourci installé. S'ils diffèrent, AUCUN toast ne s'affiche — en silence,
+    // et le bouton « Tester » répond quand même « envoyé » (l'API Electron, elle, ne se plaint pas).
+    // ⚠️ Ne PAS « corriger » l'inverse en changeant build.appId : ça déplacerait %APPDATA%\hasu-panel
+    // et ferait perdre leurs réglages à toutes les installations existantes.
+    try { app.setAppUserModelId(app.isPackaged ? 'hasu.panel' : 'com.saliox.hasupanel'); } catch {}
     // Au réveil du PC, tout paraît « tombé » quelques instants (réseau pas encore revenu) → on se tait
     // le temps que la machine se remette, sinon rafale d'alertes bidon à chaque sortie de veille.
     try { require('electron').powerMonitor.on('resume', () => { quietUntil = Date.now() + ALERT_QUIET_RESUME_MS; log('réveil PC → alertes en silence 2 min'); }); } catch {}

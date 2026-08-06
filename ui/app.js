@@ -399,6 +399,20 @@ const renderUpdateStatus = (s) => {
   }
 };
 if (window.panel.onUpdate) window.panel.onUpdate(renderUpdateStatus);
+// Le webhook s'enregistre AUSSI à la frappe (anti-perte) : `change` ne se déclenche qu'à la perte de
+// focus, donc coller l'URL puis fermer la fenêtre directement ne sauvegardait rien.
+let webhookTimer = null;
+document.addEventListener('input', (e) => {
+  if (e.target?.id !== 'set-alert-webhook') return;
+  clearTimeout(webhookTimer);
+  const val = e.target.value.trim();
+  webhookTimer = setTimeout(async () => {
+    const r = await window.panel.setSetting('alertWebhook', val);
+    const s = $('alert-status');
+    if (s) s.textContent = val ? (r && r.ok ? ' ✅ enregistré' : ` ❌ ${(r && r.error) || 'refusé'}`) : '';
+  }, 800);
+});
+
 document.addEventListener('change', async (e) => {
   const t = e.target;
   if (t.dataset?.bot && t.dataset?.key) { await window.panel.setBot(t.dataset.bot, t.dataset.key, t.checked); await refresh(); return; }
