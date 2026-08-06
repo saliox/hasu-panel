@@ -203,49 +203,54 @@ const pm2List = async () => {
 // GRACIEUX du parent (flush SQLite + déconnexion Discord propre) puis on force-kill les descendants
 // encore vivants. Sécurité : uniquement des PID NUMÉRIQUES, execFile en array-args (zéro injection).
 
-// Descendants récursifs d'un PID via l'arbre ParentProcessId. À capturer AVANT le stop : une fois le
-// parent mort, Windows ne réparente pas → l'arbre devient irrécupérable. Borné (anti recyclage de PID).
-const collectDescendants = (rootPid) => new Promise((resolve) => {
-  const root = Number(rootPid);
-  if (!Number.isInteger(root) || root <= 0) return resolve([]);
+// Un SEUL instantané de tout l'arbre de process (pid -> [enfants]) via un seul appel PowerShell.
+// À capturer AVANT le stop : une fois le parent mort, Windows ne réparente pas → l'arbre est perdu.
+// Réutilisable pour arrêter plusieurs bots sans redemander la table à chaque fois.
+const processTree = () => new Promise((resolve) => {
   execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
     'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId):$($_.ParentProcessId)" }'],
     { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
-      if (err || !out) return resolve([]);
       const children = new Map(); // ppid -> [pid,...]
-      for (const line of String(out).split('\n')) {
+      if (!err && out) for (const line of String(out).split('\n')) {
         const m = line.trim().match(/^(\d+):(\d+)$/); // PID strictement numériques
         if (!m) continue;
         const pid = Number(m[1]), ppid = Number(m[2]);
         if (!children.has(ppid)) children.set(ppid, []);
         children.get(ppid).push(pid);
       }
-      const res = [], seen = new Set([root]), stack = [root];
-      while (stack.length && res.length < 500) { // borne dure
-        for (const c of (children.get(stack.pop()) || [])) {
-          if (seen.has(c) || c <= 0) continue; // anti-cycle (recyclage de PID)
-          seen.add(c); res.push(c); stack.push(c);
-        }
-      }
-      resolve(res);
+      resolve(children);
     });
 });
+// Descendants d'un PID dans un arbre déjà capturé (borné + anti-cycle contre le recyclage de PID).
+const descendantsOf = (children, rootPid) => {
+  const root = Number(rootPid);
+  if (!Number.isInteger(root) || root <= 0) return [];
+  const res = [], seen = new Set([root]), stack = [root];
+  while (stack.length && res.length < 500) { // borne dure
+    for (const c of (children.get(stack.pop()) || [])) {
+      if (seen.has(c) || c <= 0) continue;
+      seen.add(c); res.push(c); stack.push(c);
+    }
+  }
+  return res;
+};
 
 // Force-kill de PID déjà capturés. Un PID déjà mort → taskkill no-op (pas d'erreur bloquante).
 const killPids = (pids) => new Promise((resolve) => {
-  const list = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
+  const list = [...new Set((pids || []).filter((p) => Number.isInteger(p) && p > 0))];
   if (!list.length) return resolve();
   const args = list.flatMap((p) => ['/PID', String(p)]).concat('/F'); // pas de /T : on a déjà tout l'arbre
   execFile('taskkill.exe', args, { windowsHide: true, timeout: 15000 }, () => resolve());
 });
 
-// Arrêt GRACIEUX + reap de l'arbre. `name` déjà validé isSafeName par l'appelant (et re-validé par pm2()).
 const GRACE_MS = 4000; // > kill_timeout pm2 (~1.6s) : laisse le parent quitter proprement avant le reap
+
+// Arrêt GRACIEUX d'UN bot + reap de ses enfants orphelins. `name` déjà validé isSafeName par l'appelant.
 const stopTree = async (name) => {
   if (process.platform !== 'win32') return pm2(['stop', name]); // POSIX propage déjà l'arbre
   let pid = 0;
   try { pid = (await pm2List()).find((b) => b.name === name && b.status === 'online')?.pid || 0; } catch {}
-  const descendants = pid ? await collectDescendants(pid).catch(() => []) : []; // [] si bot déjà arrêté
+  const descendants = pid ? descendantsOf(await processTree().catch(() => new Map()), pid) : []; // [] si déjà arrêté
   const r = await pm2(['stop', name]); // toujours l'arrêt gracieux du parent
   if (descendants.length) {
     await new Promise((res) => setTimeout(res, GRACE_MS)); // laisse un gracefulShutdown fermer ses enfants
@@ -253,6 +258,25 @@ const stopTree = async (name) => {
     log('tree-kill', name, `pid=${pid}`, `descendants=${descendants.length}`);
   }
   return r;
+};
+
+// Arrête PLUSIEURS bots efficacement (mode jeu, « Tout arrêter ») : UN seul instantané d'arbre pour
+// tous, arrêts gracieux, puis UNE seule grâce avant de reaper tous les orphelins d'un coup — au lieu
+// d'un dump PowerShell + une grâce de 4 s PAR bot. `entries` = [{ name, pid }] déjà connus de l'appelant.
+const stopBotsTree = async (entries) => {
+  const list = (entries || []).filter((e) => e && isSafeName(e.name));
+  if (!list.length) return;
+  if (process.platform !== 'win32') { for (const e of list) await pm2(['stop', e.name]); return; }
+  const roots = list.map((e) => Number(e.pid)).filter((p) => Number.isInteger(p) && p > 0);
+  const tree = roots.length ? await processTree().catch(() => new Map()) : new Map();
+  const toKill = new Set();
+  for (const r of roots) for (const d of descendantsOf(tree, r)) toKill.add(d);
+  for (const e of list) await pm2(['stop', e.name]); // arrêts gracieux
+  if (toKill.size) {
+    await new Promise((res) => setTimeout(res, GRACE_MS));
+    await killPids([...toKill]).catch(() => {});
+    log('tree-kill lot', list.map((e) => e.name).join(','), `reap=${toKill.size}`);
+  }
 };
 
 // Variante pour la suppression d'un bot importé : même reap, puis pm2 delete.
@@ -543,7 +567,8 @@ const enterGameMode = async (game) => {
   // Drapeau AVANT l'arrêt pour que le watchdog de saliox n'alerte pas ; saliox coupé EN DERNIER (il héberge le watchdog).
   writeFlag(targets, game);
   targets.sort((a, b) => (a === 'saliox') - (b === 'saliox'));
-  for (const n of targets) await stopTree(n);
+  const pidByName = new Map(list.map((b) => [b.name, b.pid]));
+  await stopBotsTree(targets.map((n) => ({ name: n, pid: pidByName.get(n) || 0 }))); // 1 snapshot + 1 grâce pour tous
   cfg.stoppedByGame = targets;
   saveCfg();
   log('mode jeu ON —', game, '— coupés :', targets.join(', '));
@@ -630,13 +655,24 @@ const bootEnforce = async () => {
 };
 
 // ---------- Lancement auto du panel ----------
+// Windows 11 RETARDE les apps de la clé Run (~11 min après le logon) → sur une install neuve le panel
+// « ne se lance pas » au démarrage. On neutralise ce délai via la clé HKCU StartupDelayInMSec=0 (SANS
+// admin, réversible). Best-effort : si l'écriture échoue, la clé Run lance le panel quand même (retardé).
+// NB : on N'utilise PAS de tâche planifiée — Register-ScheduledTask exige l'admin sur des postes durcis
+// (testé : « Accès refusé » même pour créer une tâche utilisateur) → inadapté à un lancement en fond.
+const disableStartupDelay = () => {
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+  execFile('reg', ['add', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize',
+    '/v', 'StartupDelayInMSec', '/t', 'REG_DWORD', '/d', '0', '/f'],
+    { windowsHide: true, timeout: 10000 }, (err) => { if (err) log('startupDelay', err.message); });
+};
+
 const applyAutoLaunch = () => {
   if (!app.isPackaged) return; // en dev, ne pas enregistrer electron.exe
-  app.setLoginItemSettings({
-    openAtLogin: !!cfg.autoLaunch,
-    path: process.env.PORTABLE_EXECUTABLE_FILE || process.execPath,
-    args: ['--hidden', '--startup']
-  });
+  const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  // Clé Run (HKCU, sans admin) : visible dans le gestionnaire des tâches Windows + nettoyée à la désinstallation.
+  app.setLoginItemSettings({ openAtLogin: !!cfg.autoLaunch, path: exe, args: ['--hidden', '--startup'] });
+  if (cfg.autoLaunch) disableStartupDelay(); // lancement PROMPT au boot (contourne le délai de démarrage Win11)
 };
 
 // ---------- Rich Presence Discord ----------
@@ -982,7 +1018,9 @@ if (process.argv.includes('--selftest')) {
   });
 } else if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
-  app.on('second-instance', () => showWindow());
+  // On n'ouvre la fenêtre QUE si la 2e instance n'est pas un lancement --hidden (démarrage Windows) :
+  // sinon les deux déclencheurs de démarrage (clé Run + tâche planifiée) feraient surgir la fenêtre au boot.
+  app.on('second-instance', (_e, argv) => { if (!Array.isArray(argv) || !argv.includes('--hidden')) showWindow(); });
   app.whenReady().then(async () => {
     cfg = loadCfg();
     // Les bots pm2 connus obtiennent une entrée de config par défaut à la première vue.
