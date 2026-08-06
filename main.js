@@ -559,6 +559,11 @@ const checkAlerts = async (bots) => {
     if (!prev) continue;
     const fell = prev.status === 'online' && b.status !== 'online';
     const looping = b.restarts > prev.restarts + 2; // redémarre en boucle
+    // Un bot qui revient en ligne n'est plus « arrêté volontairement » — quel que soit l'endroit d'où
+    // tu l'as relancé (panel ou terminal) : sinon il resterait exclu de l'auto-démarrage et du bandeau.
+    if (prev.status !== 'online' && b.status === 'online' && cfg.bots[b.name]?.manualStop) {
+      cfg.bots[b.name].manualStop = false; saveCfg();
+    }
     // Retour à la normale : on clôt l'alerte précédente (sinon tu ne sais jamais si c'est reparti).
     if (prev.status !== 'online' && b.status === 'online' && lastAlertAt.has(b.name)) {
       lastAlertAt.delete(b.name);
@@ -566,8 +571,18 @@ const checkAlerts = async (bots) => {
       continue;
     }
     if (!fell && !looping) continue;
-    // Silencieux si c'est NOUS qui l'avons arrêté (mode jeu, arrêt manuel).
+    // Silencieux si c'est NOUS qui l'avons arrêté (mode jeu, bouton stop du panel).
     if (cfg.stoppedByGame.includes(b.name) || cfg.bots[b.name]?.manualStop) continue;
+    // …et aussi si l'arrêt vient d'AILLEURS mais qu'il est manifestement VOLONTAIRE (tu coupes souvent
+    // tes bots depuis un terminal : `pm2 stop <bot>`). Signal fiable : un arrêt propre laisse le statut
+    // 'stopped' SANS faire grimper le compteur de redémarrages, alors qu'un plantage passe par des
+    // relances pm2 (compteur +1) ou finit en 'errored'. On le mémorise pour que le bot ne soit ni
+    // ré-alerté, ni ressuscité au prochain démarrage, ni signalé par le bandeau.
+    if (fell && !looping && b.status === 'stopped' && b.restarts <= prev.restarts) {
+      const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false });
+      if (!c.manualStop) { c.manualStop = true; saveCfg(); log('arrêt volontaire détecté (hors panel) :', b.name, '→ pas d\'alerte'); }
+      continue;
+    }
     const lastAt = lastAlertAt.get(b.name) || 0;
     if (now - lastAt < ALERT_DEDUP_MS) continue;
     lastAlertAt.set(b.name, now);
