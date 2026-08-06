@@ -12,6 +12,10 @@ const rpc = require('./discordrpc'); // Rich Presence Discord (IPC natif, sans d
 const IS_STARTUP = process.argv.includes('--startup'); // lancé par l'ouverture de session Windows
 const START_HIDDEN = process.argv.includes('--hidden');
 
+// L'interface est une simple liste de texte : le process GPU d'Electron (~100 Mo tenus 24h/24) n'apporte
+// rien ici et prend de la mémoire pendant tes parties. Rendu logiciel = imperceptible pour ce contenu.
+try { app.disableHardwareAcceleration(); } catch {}
+
 // ---------- Auto-update (electron-updater, releases GitHub saliox/hasu-panel) ----------
 // Sans écran : télécharge en fond et applique la MAJ au prochain redémarrage du panel (donc au
 // prochain démarrage du PC, puisqu'il se lance au logon). Pensé pour « installer chez un ami et
@@ -117,7 +121,11 @@ const DEFAULTS = {
   ignoredExes: [],          // suggestions écartées par l'utilisateur (ne plus proposer)
   discovered: [],           // suggestions du dernier scan, persistées
   discordRpc: true,         // Rich Presence Discord (affiche « gère X bots en ligne » sur ton profil)
-  discordAppId: ''          // Application ID Discord (Rich Presence) — à coller dans les réglages, ou via l'env HASU_DISCORD_APP_ID
+  discordAppId: '',         // Application ID Discord (Rich Presence) — à coller dans les réglages, ou via l'env HASU_DISCORD_APP_ID
+  alerts: true,             // prévenir quand un bot tombe / redémarre en boucle
+  alertToast: true,         // notification Windows (utile seulement si tu es devant le PC)
+  alertWebhook: '',         // URL de webhook Discord (te touche même en jeu ou absent) — https://discord.com/api/webhooks/…
+  lastSaveAt: 0             // dernier « pm2 save » réussi (ce qui reviendra au prochain démarrage)
 };
 
 let win = null, tray = null, quitting = false;
@@ -189,6 +197,9 @@ const loadCfg = () => {
       lastScanAt: clampInt(raw.lastScanAt, 0, Number.MAX_SAFE_INTEGER, 0),
       autoLaunch: raw.autoLaunch !== false, lowNet: raw.lowNet === true, lowNetApplied: raw.lowNetApplied === true,
       scanAuto: raw.scanAuto !== false, discordRpc: raw.discordRpc !== false,
+      alerts: raw.alerts !== false, alertToast: raw.alertToast !== false,
+      alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
+      lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
       games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : DEFAULT_GAMES,
       stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
       imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
@@ -225,14 +236,39 @@ const probeToolchain = () => new Promise((resolve) => {
 });
 
 // ---------- pm2 ----------
-// shell:true nécessaire pour lancer un .cmd → chaque argument est validé AVANT (aucune injection possible).
-// Le chemin de pm2.cmd est ENTOURÉ DE GUILLEMETS : sous shell, Node ne cite pas le fichier, donc un
-// nom d'utilisateur avec espace (%APPDATA% contient un espace) tronquerait la commande. cmd.exe parse
-// correctement « "C:\...\npm\pm2.cmd" jlist » (et le cas sans espace reste valide).
+// On appelle pm2 SANS cmd.exe quand c'est possible : `node.exe <pm2/bin/pm2> …`. Passer par le .cmd
+// impose shell:true, et si l'appel se bloque Windows tue le cmd mais PAS le pm2 derrière → un process
+// fantôme par sondage (et le panel sonde toutes les 10-30 s, 24h/24). En direct : pas de shell, pas de
+// quoting, l'arbre est tuable proprement.
+// ⚠️ JAMAIS process.execPath (Electron) même avec ELECTRON_RUN_AS_NODE : le démon pm2 hériterait de
+// HasuPanel.exe, et une mise à jour du panel tuerait TOUS les bots. On veut un vrai node.exe.
+const PM2_JS = path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'pm2', 'bin', 'pm2');
+const findNodeExe = () => {
+  const cands = [
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
+    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'nodejs', 'node.exe'),
+    ...String(process.env.PATH || '').split(';').filter(Boolean).map((d) => path.join(d.trim(), 'node.exe')),
+  ];
+  for (const p of cands) { try { if (p && fs.existsSync(p)) return p; } catch {} }
+  return null;
+};
+let NODE_EXE = null, pm2Direct = false;
+const resolvePm2Runner = () => {
+  try { NODE_EXE = findNodeExe(); pm2Direct = !!(NODE_EXE && fs.existsSync(PM2_JS)); } catch { pm2Direct = false; }
+  log('pm2 runner :', pm2Direct ? `direct (${NODE_EXE})` : 'repli cmd.exe');
+};
+// Repli cmd.exe : Node ne cite RIEN sous shell:true → on cite nous-mêmes les arguments à espaces
+// (un chemin finissant par « \ » casserait le parsing de cmd → on ajoute un point : D:\ → D:\.).
+const quoteForShell = (a) => {
+  const s = String(a);
+  if (!/[ \t]/.test(s)) return s;
+  return `"${s.endsWith('\\') ? s + '.' : s}"`;
+};
 const pm2Raw = (args) => new Promise((resolve) => {
-  execFile(`"${PM2}"`, args, { shell: true, windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (err, out, errOut) => {
-    resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
-  });
+  const done = (err, out, errOut) => resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
+  const opts = { windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 };
+  if (pm2Direct) return execFile(NODE_EXE, [PM2_JS, ...args.map(String)], opts, done);
+  execFile(`"${PM2}"`, args.map(quoteForShell), { ...opts, shell: true }, done);
 });
 // Variante courante : uniquement des mots-clés/noms sûrs (start/stop/restart/jlist/save/… + noms pm2).
 const pm2 = (args) => {
@@ -240,21 +276,37 @@ const pm2 = (args) => {
   return pm2Raw(args);
 };
 
+// Santé de pm2 : un tableau VIDE peut vouloir dire « aucun bot » OU « pm2 ne répond pas ». Avant, les
+// deux cas se ressemblaient et l'écran affichait « Aucun bot géré » alors que TOUS les bots étaient
+// peut-être morts. On distingue désormais, et le tick garde le dernier état connu quand pm2 est muet.
+let pm2Health = { ok: true, since: 0, reason: '', lastOkAt: 0 };
 const pm2List = async () => {
-  const { out } = await pm2(['jlist']);
+  const { ok, out } = await pm2(['jlist']);
   try {
     const i = out.indexOf('['); // pm2 peut afficher des lignes de log avant le JSON
-    if (i < 0) return [];
-    return JSON.parse(out.slice(i)).map((p) => ({
+    if (i < 0) throw new Error(ok ? 'sortie illisible' : 'pm2 injoignable');
+    const arr = JSON.parse(out.slice(i));
+    pm2Health = { ok: true, since: 0, reason: '', lastOkAt: Date.now() };
+    return arr.map((p) => ({
       name: p.name,
       status: p.pm2_env?.status || 'unknown',
       uptime: p.pm2_env?.pm_uptime || 0,
       restarts: p.pm2_env?.restart_time ?? 0,
       memory: p.monit?.memory || 0,
       cpu: p.monit?.cpu || 0,
-      pid: Number(p.pid) || 0
+      pid: Number(p.pid) || 0,
+      // Métadonnées déjà fournies par pm2 et jusqu'ici jetées : chemins de logs (lecture directe,
+      // idée « logs en direct ») et dossier/script du bot (bouton « ouvrir le dossier », fiche bot).
+      outLog: p.pm2_env?.pm_out_log_path || '',
+      errLog: p.pm2_env?.pm_err_log_path || '',
+      cwd: p.pm2_env?.pm_cwd || '',
+      script: p.pm2_env?.pm_exec_path || '',
+      interpreter: p.pm2_env?.exec_interpreter || ''
     })).filter((b) => isSafeName(b.name));
-  } catch { return []; }
+  } catch (e) {
+    if (pm2Health.ok) pm2Health = { ok: false, since: Date.now(), reason: e.message, lastOkAt: pm2Health.lastOkAt };
+    return null; // null = pm2 muet (≠ [] qui veut dire « vraiment aucun bot »)
+  }
 };
 
 // ---------- Tree-kill Windows : reap des enfants orphelins après pm2 stop ----------
@@ -335,7 +387,7 @@ const GRACE_MS = 4000; // > kill_timeout pm2 (~1.6s) : laisse le parent quitter 
 const stopTree = async (name) => {
   if (process.platform !== 'win32') return pm2(['stop', name]); // POSIX propage déjà l'arbre
   let pid = 0;
-  try { pid = (await pm2List()).find((b) => b.name === name && b.status === 'online')?.pid || 0; } catch {}
+  try { pid = (await pm2List() || []).find((b) => b.name === name && b.status === 'online')?.pid || 0; } catch {}
   const empty = { children: new Map(), born: new Map() };
   const tree = pid ? await processTree().catch(() => empty) : empty;
   const descendants = pid ? descendantsOf(tree.children, pid) : []; // [] si déjà arrêté
@@ -372,6 +424,121 @@ const stopBotsTree = async (entries) => {
 
 // Variante pour la suppression d'un bot importé : même reap, puis pm2 delete.
 const deleteTree = async (name) => { await stopTree(name); return pm2(['delete', name]); };
+
+// ---------- pm2 save automatique ----------
+// « pm2 save » fige la liste qui sera restaurée au prochain démarrage du PC. Sans ça, le dump vieillit
+// (constaté : périmé de 5 jours) et un reboot ressuscite un état faux — d'où la plaie « après reboot,
+// le bot est offline ». On sauvegarde donc après chaque start/stop volontaire, avec un délai (on évite
+// d'écrire à chaque clic) et un GARDE-FOU : jamais pendant un mode jeu / lowNet, sinon on graverait
+// « bots coupés » comme état de démarrage voulu.
+let saveTimer = null;
+const schedulePm2Save = (delayMs = 15000) => {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    if (cfg.stoppedByGame.length || cfg.lowNetApplied) { log('pm2 save différé (mode jeu / éco réseau actif)'); return; }
+    const r = await pm2(['save']);
+    if (r.ok) { cfg.lastSaveAt = Date.now(); saveCfg(); log('pm2 save auto OK'); } else log('pm2 save auto échec');
+  }, delayMs);
+  saveTimer.unref?.();
+};
+
+// ---------- Alertes : un bot tombe → tu es prévenu MÊME hors du panel ----------
+// Constat qui a motivé la feature : 4 bots sont restés morts 5 jours (coupure DNS) sans que personne
+// ne le signale. Le webhook Discord porte l'essentiel (il te touche même en jeu / absent) ; le toast
+// Windows ne sert que si tu es devant le PC. Garde-fous : silence au démarrage et après un réveil du
+// PC (sinon une rafale de faux positifs), anti-doublon par bot, et plafond horaire.
+const ALERT_QUIET_BOOT_MS = 90 * 1000;
+const ALERT_QUIET_RESUME_MS = 2 * 60 * 1000;
+const ALERT_DEDUP_MS = 30 * 60 * 1000;
+const ALERT_MAX_PER_HOUR = 6;
+const startedAt = Date.now();
+let quietUntil = 0, alertTimes = [], lastAlertAt = new Map(), prevStatus = new Map(), alertsPrimed = false;
+
+// Traduit la vraie cause en français depuis les dernières lignes du log d'erreurs du bot.
+const diagnoseFr = (bot) => {
+  const t = bot && bot.errLog ? tailFile(bot.errLog, 8 * 1024) : '';
+  if (!t) return '';
+  const last = t.split('\n').filter((l) => l.trim()).slice(-40).join('\n');
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(last)) return 'Internet/DNS injoignable (discord.com introuvable)';
+  if (/ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENETUNREACH/i.test(last)) return 'Connexion réseau refusée ou coupée';
+  if (/TOKEN_INVALID|Unauthorized|401|Privileged intent/i.test(last)) return 'Token invalide ou intents Discord manquants';
+  if (/Cannot find module|MODULE_NOT_FOUND/i.test(last)) return 'Module manquant (npm install à refaire)';
+  if (/SyntaxError/i.test(last)) return 'Erreur de syntaxe dans le code';
+  if (/EADDRINUSE/i.test(last)) return 'Port déjà utilisé';
+  if (/heap out of memory|ENOMEM/i.test(last)) return 'Mémoire saturée';
+  const line = last.split('\n').pop() || '';
+  return line.slice(0, 120);
+};
+
+const postWebhook = (url, payload) => new Promise((resolve) => {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:' || !/(^|\.)discord\.com$/i.test(u.hostname)) return resolve(false); // webhook Discord uniquement
+    const body = Buffer.from(JSON.stringify(payload), 'utf8');
+    const req = require('https').request({ method: 'POST', hostname: u.hostname, path: u.pathname + u.search,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length }, timeout: 10000 },
+      (res) => { res.resume(); resolve(res.statusCode >= 200 && res.statusCode < 300); });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end(body);
+  } catch { resolve(false); }
+});
+
+const sendAlert = async (title, body, colorHex) => {
+  const now = Date.now();
+  alertTimes = alertTimes.filter((t) => now - t < 3600 * 1000);
+  if (alertTimes.length >= ALERT_MAX_PER_HOUR) return; // plafond anti-spam
+  alertTimes.push(now);
+  if (cfg.alertToast !== false) {
+    try { const { Notification } = require('electron'); if (Notification.isSupported()) new Notification({ title, body }).show(); } catch {}
+  }
+  const url = (cfg.alertWebhook || '').trim();
+  if (url) await postWebhook(url, { embeds: [{ title, description: body, color: colorHex, timestamp: new Date(now).toISOString(), footer: { text: 'Hasu Panel' } }] });
+  log('alerte :', title, '—', body.replace(/\n/g, ' ').slice(0, 160));
+};
+
+// Compare l'état courant au précédent et alerte sur les transitions qui comptent.
+const checkAlerts = async (bots) => {
+  const now = Date.now();
+  const snapshot = new Map(bots.map((b) => [b.name, { status: b.status, restarts: b.restarts }]));
+  if (!alertsPrimed) { prevStatus = snapshot; alertsPrimed = true; return; } // 1er tick : on amorce en silence
+  if (now < quietUntil || now - startedAt < ALERT_QUIET_BOOT_MS) { prevStatus = snapshot; return; }
+  if (cfg.alerts === false) { prevStatus = snapshot; return; }
+
+  for (const b of bots) {
+    const prev = prevStatus.get(b.name);
+    if (!prev) continue;
+    const fell = prev.status === 'online' && b.status !== 'online';
+    const looping = b.restarts > prev.restarts + 2; // redémarre en boucle
+    if (!fell && !looping) continue;
+    // Silencieux si c'est NOUS qui l'avons arrêté (mode jeu, arrêt manuel).
+    if (cfg.stoppedByGame.includes(b.name) || cfg.bots[b.name]?.manualStop) continue;
+    const lastAt = lastAlertAt.get(b.name) || 0;
+    if (now - lastAt < ALERT_DEDUP_MS) continue;
+    lastAlertAt.set(b.name, now);
+    const cause = diagnoseFr(b);
+    await sendAlert(
+      looping ? `🔁 ${b.name} redémarre en boucle` : `⚠️ ${b.name} est tombé`,
+      (cause ? `**Cause probable :** ${cause}\n` : '') + `État : ${b.status} · redémarrages : ${b.restarts}`,
+      looping ? 0xE67E22 : 0xED4245);
+  }
+  prevStatus = snapshot;
+};
+
+// ---------- « X bots devraient être en ligne » ----------
+// bootEnforce ne tourne qu'une fois, au démarrage. Un bot qui meurt à 3 h du matin reste mort. On
+// calcule ici l'écart entre l'intention (Auto boot coché, pas arrêté à la main, pas coupé par le jeu)
+// et la réalité — l'UI en fait un bandeau avec un bouton, PAS une réparation automatique (un bot que
+// pm2 a abandonné après ses tentatives ne doit pas être relancé en boucle).
+const needFix = () => {
+  if (!cfg || !cfg.bots || !pm2Health.ok) return [];
+  return statusCache.bots
+    .filter((b) => b.status !== 'online'
+      && cfg.bots[b.name] && cfg.bots[b.name].auto !== false && !cfg.bots[b.name].manualStop
+      && !cfg.stoppedByGame.includes(b.name))
+    .map((b) => b.name);
+};
 
 // ---------- Détection de jeu (liste de process + PID) ----------
 const listProcs = () => new Promise((resolve) => {
@@ -497,7 +664,7 @@ const applyLowNet = async (game) => {
   const speed = await linkSpeedMbps();
   const level = speed && speed < 100 ? 2 : 1; // petit débit → différer + priorité Idle ; sinon BelowNormal
   try { fs.writeFileSync(LOWNET_FLAG, JSON.stringify({ active: true, level, game, since: Date.now() })); } catch (e) { log('lownet flag', e.message); }
-  const bots = await pm2List();
+  const bots = await pm2List() || [];
   await setBotPriority(bots.filter((b) => b.status === 'online').map((b) => b.pid), level === 2 ? 'Idle' : 'BelowNormal');
   cfg.lowNetApplied = true; saveCfg();
   log(`faible usage internet ON (lien ~${Math.round(speed)} Mbps → niveau ${level}) — jeu : ${game}`);
@@ -506,7 +673,7 @@ const applyLowNet = async (game) => {
 
 const clearLowNet = async () => {
   try { fs.unlinkSync(LOWNET_FLAG); } catch {}
-  const bots = await pm2List();
+  const bots = await pm2List() || [];
   await setBotPriority(bots.map((b) => b.pid), 'Normal');
   cfg.lowNetApplied = false; saveCfg();
   log('faible usage internet OFF — priorités restaurées');
@@ -528,21 +695,20 @@ const importBot = async (name, script) => {
   if (!approvedScripts.has(script)) return { ok: false, error: 'Sélectionne le fichier via le bouton d\'import (chemin non approuvé)' };
   if (BAD_SHELL_RE.test(script)) return { ok: false, error: 'Chemin non pris en charge (caractères spéciaux)' };
   if (!/\.(js|mjs|cjs|py)$/i.test(script) || !fs.existsSync(script)) return { ok: false, error: 'Fichier introuvable (attendu : .js, .mjs, .cjs ou .py)' };
-  const existing = await pm2List();
+  const existing = await pm2List() || [];
   if (existing.some((b) => b.name.toLowerCase() === name.toLowerCase())) return { ok: false, error: `« ${name} » existe déjà dans pm2 — choisis un autre nom` };
   const dir = path.dirname(script);
-  // Un script à la racine d'un disque (D:\bot.js) donne dir = « D:\ » : cité tel quel → « "D:\" »,
-  // et cmd.exe interprète le \" final comme un guillemet échappé (fusion de jetons). On ajoute un « . »
-  // à un backslash final (D:\ → D:\.) pour que --cwd désigne bien la racine sans casser le parsing.
-  const cwd = dir.endsWith('\\') ? `${dir}.` : dir;
-  const r = await pm2Raw(['start', `"${script}"`, '--name', name, '--cwd', `"${cwd}"`]);
+  // Arguments BRUTS : en direct (node.exe) execFile les passe tels quels, et pour le repli cmd.exe
+  // c'est quoteForShell qui cite et corrige le backslash final. Ne PAS citer ici : sans shell, les
+  // guillemets deviendraient des caractères du chemin et l'import échouerait.
+  const r = await pm2Raw(['start', script, '--name', name, '--cwd', dir]);
   if (!r.ok) { log('import ÉCHEC:', name, script, '—', r.out.slice(0, 400)); return { ok: false, error: 'pm2 a refusé le démarrage — vérifie le fichier (détails dans panel.log)' }; }
   await pm2(['save']); // survivra au redémarrage du PC (pm2 resurrect)
   if (!cfg.imported.includes(name)) cfg.imported.push(name);
   cfg.bots[name] = { auto: true, gameStop: false, ...(cfg.bots[name] || {}) };
   saveCfg();
   log('import OK:', name, '←', script);
-  statusCache.bots = await pm2List();
+  { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
   return { ok: true };
 };
 
@@ -555,7 +721,7 @@ const removeBot = async (name) => {
   cfg.stoppedByGame = cfg.stoppedByGame.filter((n) => n !== name);
   saveCfg();
   log('retrait:', name);
-  statusCache.bots = await pm2List();
+  { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
   return { ok: true };
 };
 
@@ -656,6 +822,7 @@ const clearFlag = () => { try { fs.unlinkSync(WATCHDOG_FLAG); } catch {} };
 // ---------- Mode jeu ----------
 const enterGameMode = async (game) => {
   const list = await pm2List();
+  if (!list) return; // pm2 muet : on ne coupe rien sur une lecture ratée (on réessaiera au tick suivant)
   const targets = list
     .filter((b) => b.status === 'online' && (cfg.gameMode.stopAll || cfg.bots[b.name]?.gameStop))
     .map((b) => b.name);
@@ -722,10 +889,11 @@ const tick = async () => {
       } catch (e) { log('tick', e.message); }
     });
   }
-  statusCache.bots = await pm2List();
+  { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
   // Débit réseau = affichage UI UNIQUEMENT (aucune logique n'en dépend) → on ne le mesure QUE si la
   // fenêtre est visible. En tray ça épargne un spawn PowerShell/CIM par tick = moins de CPU/batterie.
   if (win && !win.isDestroyed() && win.isVisible()) await measureNet().catch(() => {});
+  if (pm2Health.ok) await checkAlerts(statusCache.bots).catch((e) => log('checkAlerts', e.message));
   statusCache.updatedAt = Date.now();
   updateTray();
   updateRpc(); // met à jour la Rich Presence Discord (« gère X bots en ligne »)
@@ -739,7 +907,7 @@ const tick = async () => {
 
 // ---------- Application au démarrage de Windows ----------
 const bootEnforce = async () => {
-  let list = await pm2List();
+  let list = await pm2List() || [];
   if (!list.length) { // le .cmd « pm2 resurrect » de la Startup n'est peut-être pas encore passé
     // Boot lent : au lieu d'abandonner après un seul délai de 5 s, on réessaie resurrect + relecture
     // plusieurs fois avec des délais croissants (~40 s cumulés) jusqu'à voir des process.
@@ -747,7 +915,7 @@ const bootEnforce = async () => {
     for (let i = 0; i < delays.length && !list.length; i++) {
       await pm2(['resurrect']);
       await new Promise((r) => setTimeout(r, delays[i]));
-      list = await pm2List();
+      list = await pm2List() || [];
     }
     if (!list.length) log('bootEnforce: aucun process pm2 après plusieurs resurrect — auto-démarrage abandonné pour cette session');
   }
@@ -834,15 +1002,26 @@ const updateRpc = (force) => {
 };
 
 // ---------- Tray ----------
-const trayIcon = () => {
-  const p = path.join(__dirname, 'icon.png');
-  try { const img = nativeImage.createFromPath(p); if (!img.isEmpty()) return img.resize({ width: 16, height: 16 }); } catch {}
+let trayBad = false;
+const trayIcon = (bad) => {
+  const p = path.join(__dirname, bad ? 'icon-alert.png' : 'icon.png');
+  try {
+    let img = nativeImage.createFromPath(p);
+    if (img.isEmpty() && bad) img = nativeImage.createFromPath(path.join(__dirname, 'icon.png')); // pas d'icône d'alerte → icône normale
+    if (!img.isEmpty()) return img.resize({ width: 16, height: 16 });
+  } catch {}
   return nativeImage.createEmpty();
 };
 
 const updateTray = () => {
   if (!tray) return;
   const stopped = cfg.stoppedByGame.filter((n) => n !== '-');
+  // Pastille rouge sur l'icône quand quelque chose ne va pas (bot à relancer ou pm2 muet) : visible
+  // d'un coup d'œil dans la barre des tâches, sans ouvrir le panel.
+  try {
+    const bad = !pm2Health.ok || needFix().length > 0;
+    if (bad !== trayBad) { trayBad = bad; tray.setImage(trayIcon(bad)); }
+  } catch {}
   const tip = statusCache.game
     ? `Hasu Panel — 🎮 ${statusCache.game}${statusCache.online ? ' (en ligne)' : ' (solo)'}${stopped.length ? ` · ${stopped.length} bot(s) coupé(s)` : ''}${cfg.lowNetApplied ? ' · 🌐 éco réseau' : ''}`
     : `Hasu Panel — ${statusCache.bots.filter((b) => b.status === 'online').length}/${statusCache.bots.length} bots en ligne`;
@@ -904,6 +1083,9 @@ ipcMain.handle('panel:status', () => ({
   updateReady,
   updateStatus: lastUpdateStatus,
   toolchain,
+  pm2Health,                      // { ok, since, reason } → l'UI dit « pm2 ne répond plus » au lieu de « aucun bot »
+  lastSaveAt: cfg.lastSaveAt || 0, // dernier `pm2 save` (ce qui reviendra au reboot)
+  needFix: needFix(),             // bots « Auto boot » éteints sans que tu l'aies demandé
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
   cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '' }
 }));
@@ -1014,7 +1196,8 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
     if (action === 'stop') r = await stopTree(name);
     else if (action === 'restart') { await stopTree(name); r = await pm2(['start', name]); }
     else r = await pm2([action, name]);
-    statusCache.bots = await pm2List();
+    schedulePm2Save(); // ce que tu vois = ce qui reviendra au prochain démarrage du PC
+    { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
     return { ok: r.ok };
   } finally {
     actionsInFlight.delete(name);
@@ -1028,23 +1211,61 @@ ipcMain.handle('panel:stopAll', async () => {
   if (stopAllInFlight) return { ok: false, error: 'déjà en cours' };
   stopAllInFlight = true;
   try {
-    const online = (await pm2List()).filter((b) => b.status === 'online' && isSafeName(b.name));
+    const online = (await pm2List() || []).filter((b) => b.status === 'online' && isSafeName(b.name));
     // Arrêt VOLONTAIRE → ces bots ne doivent pas se rallumer seuls au prochain démarrage du panel.
     for (const b of online) { const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false }); c.manualStop = true; }
     if (online.length) saveCfg();
     await stopBotsTree(online.map((b) => ({ name: b.name, pid: b.pid }))); // 1 snapshot + 1 grâce pour tous
-    statusCache.bots = await pm2List();
+    { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
     log('stopAll:', online.length, 'bot(s)');
     return { ok: true, stopped: online.length };
   } finally { stopAllInFlight = false; }
 });
 
-// Logs récents d'un bot (bouton « 📄 Logs ») : voir un crash sans ouvrir un terminal. Lecture seule.
-// Nom validé isSafeName ; --lines/--nostream sont des littéraux (pm2Raw n'exécute pas de shell arbitraire).
-ipcMain.handle('panel:logs', async (_e, { name } = {}) => {
+// Logs d'un bot : on LIT LES FICHIERS directement (pm2 nous donne déjà leurs chemins dans le jlist)
+// au lieu de relancer le CLI pm2 — instantané, aucun process lancé, et ça marche encore quand le démon
+// pm2 est malade (justement le moment où on a besoin des logs). `which` sépare sortie et erreurs.
+// SÉCURITÉ : l'IPC reçoit un NOM (validé), jamais un chemin ; le chemin vient de pm2, pas du renderer.
+const tailFile = (file, maxBytes = 64 * 1024) => {
+  try {
+    const st = fs.statSync(file);
+    const start = Math.max(0, st.size - maxBytes);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(Math.min(maxBytes, st.size));
+      fs.readSync(fd, buf, 0, buf.length, start);
+      let s = buf.toString('utf8');
+      if (start > 0) { const nl = s.indexOf('\n'); if (nl >= 0) s = s.slice(nl + 1); } // évite une 1re ligne coupée
+      return s;
+    } finally { fs.closeSync(fd); }
+  } catch (e) { return ''; }
+};
+ipcMain.handle('panel:logs', async (_e, { name, which } = {}) => {
   if (!isSafeName(String(name || ''))) return { ok: false, out: '' };
-  const r = await pm2Raw(['logs', name, '--lines', '150', '--nostream']);
-  return { ok: r.ok, out: String(r.out || '').slice(-12000) }; // borne l'affichage (fin = le plus récent)
+  const bot = statusCache.bots.find((b) => b.name === name);
+  const file = which === 'err' ? bot?.errLog : bot?.outLog;
+  if (!file) return { ok: false, out: '', error: 'Chemin de log inconnu (pm2 ne l\'a pas fourni).' };
+  const out = tailFile(file);
+  return { ok: true, out, file, empty: !out.trim() };
+});
+
+// Ouvre le dossier du bot dans l'Explorateur. Le chemin vient de pm2 (pm_cwd), jamais du renderer.
+ipcMain.handle('panel:openFolder', (_e, { name, what } = {}) => {
+  if (!isSafeName(String(name || ''))) return { ok: false };
+  const bot = statusCache.bots.find((b) => b.name === name);
+  const target = what === 'logs' ? path.dirname(bot?.outLog || '') : (bot?.cwd || '');
+  if (!target) return { ok: false };
+  try { shell.openPath(target); return { ok: true }; } catch { return { ok: false }; }
+});
+
+// « Remettre en ordre » : relance les bots qui DEVRAIENT être en ligne (bandeau). Volontaire, borné.
+ipcMain.handle('panel:fixAll', async () => {
+  const names = needFix();
+  for (const n of names) { const c = cfg.bots[n]; if (c) c.manualStop = false; await pm2(['start', n]); }
+  if (names.length) { saveCfg(); schedulePm2Save(5000); }
+  { const _l = await pm2List(); if (_l) statusCache.bots = _l; }
+  log('remise en ordre :', names.join(', ') || '(rien)');
+  return { ok: true, started: names.length };
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {
@@ -1088,7 +1309,25 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'scanAuto') { cfg.scanAuto = !!value; saveCfg(); return { ok: true }; }
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
   if (key === 'discordAppId') { cfg.discordAppId = String(value || '').trim().slice(0, 40); saveCfg(); startRpc(); return { ok: true }; }
+  if (key === 'alerts') { cfg.alerts = !!value; saveCfg(); return { ok: true }; }
+  if (key === 'alertToast') { cfg.alertToast = !!value; saveCfg(); return { ok: true }; }
+  if (key === 'alertWebhook') {
+    const v = String(value || '').trim().slice(0, 300);
+    // Vide = désactivé ; sinon on n'accepte QUE des webhooks Discord (rien d'autre ne doit recevoir tes données).
+    if (v && !/^https:\/\/(canary\.|ptb\.)?discord\.com\/api\/webhooks\//i.test(v)) return { ok: false, error: 'URL de webhook Discord attendue (https://discord.com/api/webhooks/…)' };
+    cfg.alertWebhook = v; saveCfg(); return { ok: true };
+  }
   return { ok: false };
+});
+
+// Bouton « Tester » des alertes : envoie une alerte de démonstration (toast + webhook) pour vérifier
+// la configuration sans attendre qu'un bot tombe vraiment.
+ipcMain.handle('panel:testAlert', async () => {
+  const had = cfg.alerts; cfg.alerts = true;           // un test doit partir même si les alertes sont coupées
+  alertTimes = [];                                      // et ne doit pas être bloqué par le plafond horaire
+  await sendAlert('✅ Test des alertes — Hasu Panel', 'Si tu lis ceci, les alertes fonctionnent : tu seras prévenu quand un bot tombera.', 0x57F287);
+  cfg.alerts = had;
+  return { ok: true, webhook: !!(cfg.alertWebhook || '').trim(), toast: cfg.alertToast !== false };
 });
 
 // Vérification MANUELLE des mises à jour (bouton « Vérifier les mises à jour »).
@@ -1159,7 +1398,7 @@ if (process.argv.includes('--selftest')) {
   // Auto-test sans interface : vérifie pm2, la détection de process et la config, puis quitte.
   app.whenReady().then(async () => {
     cfg = loadCfg();
-    const bots = await pm2List();
+    const bots = await pm2List() || [];
     console.log('SELFTEST bots :', bots.map((b) => `${b.name}=${b.status}`).join(', ') || 'AUCUN');
     const procs = await listProcs();
     console.log('SELFTEST process visibles :', procs ? procs.names.size : 'ÉCHEC tasklist');
@@ -1179,8 +1418,14 @@ else {
   app.on('second-instance', (_e, argv) => { if (!Array.isArray(argv) || !argv.includes('--hidden')) showWindow(); });
   app.whenReady().then(async () => {
     cfg = loadCfg();
+    resolvePm2Runner(); // node.exe + pm2/bin/pm2 → appels pm2 sans cmd.exe (zéro process fantôme)
+    // Sans AppUserModelId, Windows 10/11 n'affiche AUCUNE notification d'une app Electron.
+    try { app.setAppUserModelId('com.saliox.hasupanel'); } catch {}
+    // Au réveil du PC, tout paraît « tombé » quelques instants (réseau pas encore revenu) → on se tait
+    // le temps que la machine se remette, sinon rafale d'alertes bidon à chaque sortie de veille.
+    try { require('electron').powerMonitor.on('resume', () => { quietUntil = Date.now() + ALERT_QUIET_RESUME_MS; log('réveil PC → alertes en silence 2 min'); }); } catch {}
     // Les bots pm2 connus obtiennent une entrée de config par défaut à la première vue.
-    tray = new Tray(trayIcon());
+    tray = new Tray(trayIcon(false));
     tray.on('double-click', () => showWindow());
     updateTray();
     applyAutoLaunch();

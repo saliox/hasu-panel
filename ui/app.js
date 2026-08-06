@@ -20,6 +20,10 @@ const fmtNet = (b) => {
 };
 
 let cur = null; // dernier statut reçu
+// Bots dont une action est en cours : render() réécrit tout le HTML toutes les 3 s, donc un bouton
+// désactivé redevenait actif AVANT la fin de l'action (on recliquait, le verrou refusait en silence).
+// On garde l'état ici pour afficher « ⏳ » tant que l'action tourne.
+const pendingBots = new Set();
 let pending = false;
 let updBusy = false, updMsg = ''; // état du bouton « Vérifier les mises à jour »
 
@@ -54,10 +58,13 @@ const render = (st) => {
       <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="Réseau du bot, mesuré via ses entrées/sorties (pour un bot Discord, quasi exclusivement du réseau + un peu de disque SQLite) — ↓ reçu · ↑ envoyé">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? '⏸ coupé par le mode jeu' : esc(b.status)} · ↻ ${b.restarts}</span>
       <label class="chk" title="(Re)mis en ligne à l'ouverture de session Windows"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> Auto boot</label>
       <label class="chk" title="Arrêté quand un jeu est détecté (mode « bots cochés »)"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> Coupé en jeu</label>
-      ${b.status === 'online'
+      ${pendingBots.has(b.name)
+        ? '<button class="btn" disabled>⏳…</button>'
+        : b.status === 'online'
         ? `<button class="btn" data-act="restart" data-bot="${esc(b.name)}">⟳</button><button class="btn danger" data-act="stop" data-bot="${esc(b.name)}">⏹</button>`
         : `<button class="btn primary" data-act="start" data-bot="${esc(b.name)}">▶</button>`}
       <button class="btn" data-logs="${esc(b.name)}" title="Voir les logs récents (crash, erreurs…)">📄</button>
+      <button class="btn" data-folder="${esc(b.name)}" title="Ouvrir le dossier du bot dans l'Explorateur">📂</button>
       ${isImp ? `<button class="btn danger" data-remove="${esc(b.name)}" title="Arrêter et retirer ce bot de pm2 (ses fichiers ne sont pas touchés)">🗑</button>` : ''}
     </div>`;
   };
@@ -78,10 +85,24 @@ const render = (st) => {
   } else {
     empty = '<div class="hint">Aucun bot géré par pm2 pour l\'instant. Importe un bot avec « ➕ Importer » ci-dessus.</div>';
   }
-  $('bots').innerHTML = (
+  // pm2 muet : ne PAS afficher « aucun bot » (l'écran mentirait alors que tes bots sont peut-être tous morts).
+  const health = st.pm2Health || { ok: true };
+  if (!health.ok) {
+    const mins = health.since ? Math.max(1, Math.round((Date.now() - health.since) / 60000)) : 1;
+    empty = `<div class="tc-warn"><b>⚠️ pm2 ne répond plus depuis ~${mins} min.</b><br>`
+      + `L'état ci-dessous est le <b>dernier connu</b>, il n'est plus rafraîchi.${health.reason ? ` <span style="opacity:.7">(${esc(health.reason)})</span>` : ''}</div>`;
+  }
+  // Bandeau « X bots devraient être en ligne » (Auto boot coché, pas arrêtés par toi ni par le mode jeu).
+  const nf = st.needFix || [];
+  const fixBanner = nf.length
+    ? `<div class="tc-warn" style="border-color:#e2b341"><b>⚠️ ${nf.length} bot(s) devraient être en ligne :</b> ${esc(nf.join(', '))}`
+      + '<div class="row" style="margin-top:8px"><button class="btn primary" id="fix-all">Remettre en ordre</button>'
+      + '<span id="fix-status" style="color:var(--mut);font-size:12px"></span></div></div>'
+    : '';
+  $('bots').innerHTML = (!health.ok ? empty : '') + fixBanner + (
     main.map(botRow).join('') +
     (imps.length ? `<div class="sechead">🧩 Bots importés</div>${imps.map(botRow).join('')}` : '')
-  ) || empty;
+  ) || (fixBanner + empty);
 
   // Mode jeu
   $('gm-enabled').checked = !!st.cfg.gameMode.enabled;
@@ -105,6 +126,14 @@ const render = (st) => {
   $('dev-note').textContent = st.cfg.packaged ? '' : '(actif seulement dans la version .exe)';
   $('set-rpc').checked = st.cfg.discordRpc !== false;
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
+  $('set-alerts').checked = st.cfg.alerts !== false;
+  $('set-alert-toast').checked = st.cfg.alertToast !== false;
+  if (document.activeElement !== $('set-alert-webhook')) $('set-alert-webhook').value = st.cfg.alertWebhook || '';
+  // Dernière sauvegarde pm2 = ce qui reviendra vraiment au prochain démarrage du PC.
+  const sv = $('save-info');
+  if (sv) sv.textContent = st.lastSaveAt
+    ? `Dernière sauvegarde pm2 : ${new Date(st.lastSaveAt).toLocaleString('fr-FR')}`
+    : 'Aucune sauvegarde pm2 depuis ce panel.';
   $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.' : (st.cfg.discordAppId ? ' — ✅ activée.' : ' — ⚠️ colle ton Application ID pour l\'activer.');
 
   // Mises à jour
@@ -171,6 +200,45 @@ const importFormHTML = (script, suggested) => `
   <p id="imp-err" style="color:var(--err);font-size:12.5px"></p>
   <div class="modal-actions"><button class="btn" id="modal-close">Annuler</button><button class="btn primary" id="imp-go">Importer</button></div>`;
 
+// Modale des logs : lecture DIRECTE des fichiers (instantané, marche même si pm2 est malade),
+// deux onglets Sortie/Erreurs, filtre par mot-clé, copier, ouvrir le dossier des logs.
+let logsFilter = '';
+const renderLogsBody = (text) => {
+  const pre = $('logs-pre');
+  if (!pre) return;
+  const f = logsFilter.trim().toLowerCase();
+  const lines = String(text || '').split('\n');
+  const shown = f ? lines.filter((l) => l.toLowerCase().includes(f)) : lines;
+  pre.textContent = shown.join('\n').trim() || (f ? `Aucune ligne ne contient « ${logsFilter} ».` : 'Aucun log pour l\'instant.');
+  pre.scrollTop = pre.scrollHeight; // le plus récent est en bas
+};
+let logsRaw = '';
+const openLogs = async (name, which) => {
+  which = which === 'err' ? 'err' : 'out';
+  const tab = (id, label) => `<button class="btn${which === id ? ' primary' : ''}" data-logtab="${esc(name)}" data-which="${id}">${label}</button>`;
+  openModal(`<h3 style="margin:0 0 8px">📄 Logs — ${esc(name)}</h3>
+    <div class="row" style="gap:6px;margin-bottom:8px;flex-wrap:wrap">
+      ${tab('out', 'Sortie')}${tab('err', '⚠️ Erreurs')}
+      <input type="text" id="logs-filter" placeholder="Filtrer…" style="flex:1;min-width:120px">
+      <button class="btn" id="logs-copy">📋 Copier</button>
+      <button class="btn" id="logs-folder" data-bot="${esc(name)}" title="Ouvrir le dossier des logs">📂</button>
+    </div>
+    <pre id="logs-pre" style="max-height:56vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.5 Consolas,monospace;background:#0b0e16;color:#cdd6f4;padding:10px;border-radius:8px;margin:0">Chargement…</pre>
+    <div class="modal-actions"><button class="btn primary" id="modal-close">Fermer</button></div>`);
+  const inp = $('logs-filter');
+  if (inp) { inp.value = logsFilter; inp.addEventListener('input', () => { logsFilter = inp.value; renderLogsBody(logsRaw); }); }
+  try {
+    const r = await window.panel.logs(name, which);
+    if (!$('logs-pre')) return; // modale refermée entre-temps
+    logsRaw = (r && r.ok) ? r.out : '';
+    if (r && !r.ok) { $('logs-pre').textContent = r.error || 'Impossible de lire les logs.'; return; }
+    renderLogsBody(logsRaw);
+  } catch { if ($('logs-pre')) $('logs-pre').textContent = 'Échec de lecture des logs.'; }
+};
+
+// Échap ferme la modale (removeMenu() a supprimé les raccourcis Electron par défaut → aucun n'existait).
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('modal').classList.contains('hidden')) closeModal(); });
+
 // Délégation d'événements (le HTML est re-rendu régulièrement)
 document.addEventListener('click', async (e) => {
   const t = e.target;
@@ -190,15 +258,38 @@ document.addEventListener('click', async (e) => {
   if (t.dataset?.scanadd) { await window.panel.addGame(t.dataset.scanadd); document.querySelector(`[data-scanrow="${CSS.escape(t.dataset.scanadd.toLowerCase())}"]`)?.remove(); await refresh(); return; }
   if (t.dataset?.ignore) { await window.panel.ignoreGame(t.dataset.ignore); document.querySelector(`[data-scanrow="${CSS.escape(t.dataset.ignore.toLowerCase())}"]`)?.remove(); await refresh(); return; }
   if (t.id === 'game-suggest-btn') { openScanModal(cur?.cfg?.discovered || [], 'Jeux repérés par le dernier scan (1×/jour).'); return; }
-  if (t.dataset?.act && t.dataset?.bot) { t.disabled = true; await window.panel.action(t.dataset.bot, t.dataset.act); await refresh(); return; }
-  if (t.dataset?.logs) {
-    const name = t.dataset.logs;
-    openModal(`<h3 style="margin:0 0 8px">📄 Logs — ${esc(name)}</h3><pre id="logs-pre" style="max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.5 Consolas,monospace;background:#0b0e16;color:#cdd6f4;padding:10px;border-radius:8px;margin:0">Chargement…</pre><div class="modal-actions"><button class="btn primary" id="modal-close">Fermer</button></div>`);
-    try {
-      const r = await window.panel.logs(name);
-      const pre = document.getElementById('logs-pre'); // peut être null si la modale a été refermée
-      if (pre) { pre.textContent = (r && r.out && r.out.trim()) ? r.out : 'Aucun log disponible.'; pre.scrollTop = pre.scrollHeight; }
-    } catch { const pre = document.getElementById('logs-pre'); if (pre) pre.textContent = 'Échec de lecture des logs.'; }
+  if (t.dataset?.act && t.dataset?.bot) {
+    const name = t.dataset.bot;
+    t.disabled = true; pendingBots.add(name); render(cur); // ⏳ visible même après un re-rendu
+    try { await window.panel.action(name, t.dataset.act); } finally { pendingBots.delete(name); }
+    await refresh();
+    return;
+  }
+  if (t.dataset?.folder) { await window.panel.openFolder(t.dataset.folder); return; }
+  if (t.id === 'fix-all') {
+    t.disabled = true;
+    const s = $('fix-status'); if (s) s.textContent = ' ⏳ relance en cours…';
+    let r; try { r = await window.panel.fixAll(); } catch { r = null; }
+    if (s) s.textContent = r && r.ok ? ` ✅ ${r.started} relancé(s)` : ' ⚠️ échec';
+    setTimeout(refresh, 1200);
+    return;
+  }
+  if (t.dataset?.logs) { openLogs(t.dataset.logs, 'out'); return; }
+  if (t.dataset?.logtab) { openLogs(t.dataset.logtab, t.dataset.which); return; }
+  if (t.id === 'logs-copy') {
+    const pre = $('logs-pre');
+    if (pre) { try { await navigator.clipboard.writeText(pre.textContent || ''); t.textContent = '✅ Copié'; setTimeout(() => { t.textContent = '📋 Copier'; }, 1400); } catch {} }
+    return;
+  }
+  if (t.id === 'logs-folder') { await window.panel.openFolder(t.dataset.bot, 'logs'); return; }
+  if (t.id === 'alert-test') {
+    t.disabled = true;
+    const s = $('alert-status'); if (s) s.textContent = ' ⏳ envoi…';
+    let r; try { r = await window.panel.testAlert(); } catch { r = null; }
+    if (s) s.textContent = r && r.ok
+      ? ` ✅ envoyé (${r.webhook ? 'webhook Discord' : 'pas de webhook'}${r.toast ? ' + notification Windows' : ''})`
+      : ' ❌ échec';
+    t.disabled = false;
     return;
   }
   if (t.dataset?.remove) {
@@ -311,6 +402,13 @@ document.addEventListener('change', async (e) => {
   if (t.id === 'set-scanauto') { await window.panel.setSetting('scanAuto', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc') { await window.panel.setSetting('discordRpc', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc-id') { await window.panel.setSetting('discordAppId', t.value.trim()); await refresh(); return; }
+  if (t.id === 'set-alerts') { await window.panel.setSetting('alerts', t.checked); await refresh(); return; }
+  if (t.id === 'set-alert-toast') { await window.panel.setSetting('alertToast', t.checked); await refresh(); return; }
+  if (t.id === 'set-alert-webhook') {
+    const r = await window.panel.setSetting('alertWebhook', t.value.trim());
+    const s = $('alert-status'); if (s) s.textContent = r && r.ok ? ' ✅ enregistré' : ` ❌ ${(r && r.error) || 'refusé'}`;
+    await refresh(); return;
+  }
 });
 $('game-add-btn').addEventListener('click', async () => {
   const v = $('game-add').value.trim();

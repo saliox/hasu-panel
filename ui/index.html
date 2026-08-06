@@ -146,6 +146,23 @@
         </div>
         <div class="hint">La vérification ci-dessus ne lit que la liste des process (très léger). Le scan disque des jeux, lui, ne tourne <b>jamais en continu</b> : 1×/jour maximum, ou via le bouton « 🔍 Scanner ».</div>
 
+        <div class="hint" id="save-info" title="pm2 restaure cette liste au démarrage du PC — elle est réenregistrée après chaque démarrage/arrêt fait ici."></div>
+
+        <h2 style="margin-top:16px">🔔 Alertes (bot qui tombe)</h2>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="set-alerts"><span></span></label>
+          <div>Me prévenir quand un bot <b>tombe</b> ou <b>redémarre en boucle</b></div>
+        </div>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="set-alert-toast"><span></span></label>
+          <div>Notification Windows (utile seulement si je suis devant le PC)</div>
+        </div>
+        <div class="row">
+          <input type="text" id="set-alert-webhook" placeholder="https://discord.com/api/webhooks/… (te prévient même en jeu)" style="flex:1" maxlength="300">
+          <button class="btn" id="alert-test">Tester</button>
+        </div>
+        <div class="hint">Le <b>webhook Discord</b> est le plus utile : il te touche même en pleine partie ou absent du PC. Dans Discord : <b>Paramètres du salon → Intégrations → Webhooks → Nouveau webhook → Copier l'URL</b>. L'alerte indique <b>la cause en français</b> (Internet coupé, token invalide, module manquant…).<span id="alert-status"></span></div>
+
         <h2 style="margin-top:16px">🎮 Rich Presence Discord</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-rpc"><span></span></label>
