@@ -208,17 +208,19 @@ const pm2List = async () => {
 // Réutilisable pour arrêter plusieurs bots sans redemander la table à chaque fois.
 const processTree = () => new Promise((resolve) => {
   execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId):$($_.ParentProcessId)" }'],
+    'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId):$($_.ParentProcessId):$($_.CreationDate.Ticks)" }'],
     { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
       const children = new Map(); // ppid -> [pid,...]
+      const born = new Map();     // pid -> date de création (Ticks) : signature pour repérer un PID recyclé
       if (!err && out) for (const line of String(out).split('\n')) {
-        const m = line.trim().match(/^(\d+):(\d+)$/); // PID strictement numériques
+        const m = line.trim().match(/^(\d+):(\d+):(\d*)$/); // pid:ppid:ticks (ticks vide pour certains process système)
         if (!m) continue;
         const pid = Number(m[1]), ppid = Number(m[2]);
         if (!children.has(ppid)) children.set(ppid, []);
         children.get(ppid).push(pid);
+        born.set(pid, m[3]); // '' si indisponible (jamais un enfant de bot)
       }
-      resolve(children);
+      resolve({ children, born });
     });
 });
 // Descendants d'un PID dans un arbre déjà capturé (borné + anti-cycle contre le recyclage de PID).
@@ -243,6 +245,30 @@ const killPids = (pids) => new Promise((resolve) => {
   execFile('taskkill.exe', args, { windowsHide: true, timeout: 15000 }, () => resolve());
 });
 
+// Anti-recyclage de PID : avant de force-kill après la grâce, on re-vérifie que chaque PID capturé est
+// TOUJOURS le même process (date de création inchangée depuis l'instantané). Windows réattribue les PID —
+// un enfant qui meurt pendant la grâce peut voir son PID réutilisé par un process INNOCENT (jeu, éditeur…) ;
+// sans ce contrôle, taskkill /F tuerait ce dernier. En cas d'échec de la vérif (powershell indispo/timeout),
+// on retombe sur le comportement d'origine (reap de tout le lot) → on ne laisse jamais d'orphelins.
+const verifyStillSame = (pids, born) => new Promise((resolve) => {
+  const list = [...new Set((pids || []).filter((p) => Number.isInteger(p) && p > 0))];
+  if (!list.length || !born || !born.size) return resolve(list); // rien à vérifier → inchangé
+  const filter = list.map((p) => `ProcessId=${p}`).join(' OR ');
+  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    `Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$($_.CreationDate.Ticks)" }`],
+    { windowsHide: true, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
+      if (err) return resolve(list); // requête en ÉCHEC → comportement d'origine (ne pas laisser d'orphelins)
+      // Requête réussie mais VIDE = tous ces PID ont disparu (un PID recyclé, lui, serait ressorti) → rien à tuer.
+      const nowBorn = new Map();
+      for (const line of String(out || '').split('\n')) {
+        const m = line.trim().match(/^(\d+):(\d*)$/);
+        if (m) nowBorn.set(Number(m[1]), m[2]);
+      }
+      // On ne tue QUE les PID encore présents ET de même date de création qu'au moment du snapshot.
+      resolve(list.filter((pid) => nowBorn.has(pid) && nowBorn.get(pid) === born.get(pid)));
+    });
+});
+
 const GRACE_MS = 4000; // > kill_timeout pm2 (~1.6s) : laisse le parent quitter proprement avant le reap
 
 // Arrêt GRACIEUX d'UN bot + reap de ses enfants orphelins. `name` déjà validé isSafeName par l'appelant.
@@ -250,12 +276,15 @@ const stopTree = async (name) => {
   if (process.platform !== 'win32') return pm2(['stop', name]); // POSIX propage déjà l'arbre
   let pid = 0;
   try { pid = (await pm2List()).find((b) => b.name === name && b.status === 'online')?.pid || 0; } catch {}
-  const descendants = pid ? descendantsOf(await processTree().catch(() => new Map()), pid) : []; // [] si déjà arrêté
+  const empty = { children: new Map(), born: new Map() };
+  const tree = pid ? await processTree().catch(() => empty) : empty;
+  const descendants = pid ? descendantsOf(tree.children, pid) : []; // [] si déjà arrêté
   const r = await pm2(['stop', name]); // toujours l'arrêt gracieux du parent
   if (descendants.length) {
     await new Promise((res) => setTimeout(res, GRACE_MS)); // laisse un gracefulShutdown fermer ses enfants
-    await killPids(descendants).catch(() => {}); // ne tue QUE les survivants du snapshot
-    log('tree-kill', name, `pid=${pid}`, `descendants=${descendants.length}`);
+    const safe = await verifyStillSame(descendants, tree.born); // épargne un PID recyclé pendant la grâce
+    await killPids(safe).catch(() => {}); // ne tue QUE les survivants du snapshot, identité re-vérifiée
+    log('tree-kill', name, `pid=${pid}`, `descendants=${descendants.length}`, `reap=${safe.length}`);
   }
   return r;
 };
@@ -268,14 +297,16 @@ const stopBotsTree = async (entries) => {
   if (!list.length) return;
   if (process.platform !== 'win32') { for (const e of list) await pm2(['stop', e.name]); return; }
   const roots = list.map((e) => Number(e.pid)).filter((p) => Number.isInteger(p) && p > 0);
-  const tree = roots.length ? await processTree().catch(() => new Map()) : new Map();
+  const empty = { children: new Map(), born: new Map() };
+  const tree = roots.length ? await processTree().catch(() => empty) : empty;
   const toKill = new Set();
-  for (const r of roots) for (const d of descendantsOf(tree, r)) toKill.add(d);
+  for (const r of roots) for (const d of descendantsOf(tree.children, r)) toKill.add(d);
   for (const e of list) await pm2(['stop', e.name]); // arrêts gracieux
   if (toKill.size) {
     await new Promise((res) => setTimeout(res, GRACE_MS));
-    await killPids([...toKill]).catch(() => {});
-    log('tree-kill lot', list.map((e) => e.name).join(','), `reap=${toKill.size}`);
+    const safe = await verifyStillSame([...toKill], tree.born); // épargne les PID recyclés pendant la grâce
+    await killPids(safe).catch(() => {});
+    log('tree-kill lot', list.map((e) => e.name).join(','), `reap=${safe.length}/${toKill.size}`);
   }
 };
 
