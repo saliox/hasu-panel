@@ -107,6 +107,15 @@ const isSafeName = (n) => typeof n === 'string' && NAME_RE.test(n) && !RESERVED_
 // avant le PATH → un binaire planté (powershell.exe/taskkill.exe…) dans le CWD pourrait être exécuté.
 // On qualifie donc explicitement les outils système. SystemRoot est fixé par Windows (non modifiable par un user standard).
 const SYS = (e) => path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', e);
+// ⚠️ powershell.exe n'est PAS dans System32 mais dans System32\WindowsPowerShell\v1.0\ — le résoudre
+// comme les autres donnait un ENOENT SILENCIEUX (les appels échouaient dans des try/catch : tree-kill des
+// orphelins, priorités éco réseau, débit par bot, liste des programmes ouverts… tous morts sans un bruit).
+// On vérifie l'existence, avec repli sur le nom simple (résolution par le PATH) si l'emplacement change.
+const PS_EXE = (() => {
+  const p = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  try { if (fs.existsSync(p)) return p; } catch {}
+  return 'powershell.exe';
+})();
 
 // Dossier « data » du bot saliox (drapeaux de coordination panel ↔ bot). Par défaut : <profil>\Desktop\saliox bot\data
 // (résolu via os.homedir → aucun nom d'utilisateur codé en dur). Personnalisable via la variable d'env HASU_SALIOX_DATA.
@@ -324,6 +333,7 @@ const pm2List = async () => {
     const i = out.indexOf('['); // pm2 peut afficher des lignes de log avant le JSON
     if (i < 0) throw new Error(ok ? 'sortie illisible' : 'pm2 injoignable');
     const arr = JSON.parse(out.slice(i));
+    if (!pm2Health.ok && pm2DownAlerted) { pm2DownAlerted = false; sendAlert('✅ pm2 répond de nouveau', 'La surveillance des bots a repris normalement.', 0x57F287).catch(() => {}); }
     pm2Health = { ok: true, since: 0, reason: '', lastOkAt: Date.now() };
     return arr.map((p) => ({
       name: p.name,
@@ -357,7 +367,7 @@ const pm2List = async () => {
 // À capturer AVANT le stop : une fois le parent mort, Windows ne réparente pas → l'arbre est perdu.
 // Réutilisable pour arrêter plusieurs bots sans redemander la table à chaque fois.
 const processTree = () => new Promise((resolve) => {
-  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command',
     'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId):$($_.ParentProcessId):$($_.CreationDate.Ticks)" }'],
     { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
       const children = new Map(); // ppid -> [pid,...]
@@ -404,7 +414,7 @@ const verifyStillSame = (pids, born) => new Promise((resolve) => {
   const list = [...new Set((pids || []).filter((p) => Number.isInteger(p) && p > 0))];
   if (!list.length || !born || !born.size) return resolve(list); // rien à vérifier → inchangé
   const filter = list.map((p) => `ProcessId=${p}`).join(' OR ');
-  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command',
     `Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$($_.CreationDate.Ticks)" }`],
     { windowsHide: true, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
       if (err) return resolve(list); // requête en ÉCHEC → comportement d'origine (ne pas laisser d'orphelins)
@@ -549,6 +559,12 @@ const checkAlerts = async (bots) => {
     if (!prev) continue;
     const fell = prev.status === 'online' && b.status !== 'online';
     const looping = b.restarts > prev.restarts + 2; // redémarre en boucle
+    // Retour à la normale : on clôt l'alerte précédente (sinon tu ne sais jamais si c'est reparti).
+    if (prev.status !== 'online' && b.status === 'online' && lastAlertAt.has(b.name)) {
+      lastAlertAt.delete(b.name);
+      await sendAlert(`✅ ${b.name} est de retour`, 'Le bot est de nouveau en ligne.', 0x57F287);
+      continue;
+    }
     if (!fell && !looping) continue;
     // Silencieux si c'est NOUS qui l'avons arrêté (mode jeu, arrêt manuel).
     if (cfg.stoppedByGame.includes(b.name) || cfg.bots[b.name]?.manualStop) continue;
@@ -562,6 +578,19 @@ const checkAlerts = async (bots) => {
       looping ? 0xE67E22 : 0xED4245);
   }
   prevStatus = snapshot;
+};
+
+// pm2 injoignable = TOUS les bots sont potentiellement à terre, et aucune alerte « bot tombé » ne peut
+// partir (on ne lit plus rien). C'était l'angle mort de la surveillance → on alerte sur pm2 lui-même,
+// une seule fois par panne, et on annonce le retour.
+let pm2DownAlerted = false;
+const alertPm2Down = async () => {
+  if (cfg.alerts === false || pm2DownAlerted) return;
+  const now = Date.now();
+  if (now < quietUntil || now - startedAt < ALERT_QUIET_BOOT_MS) return;
+  if (!pm2Health.since || now - pm2Health.since < 2 * 60 * 1000) return; // muet depuis > 2 min (évite un simple hoquet)
+  pm2DownAlerted = true;
+  await sendAlert('🛑 pm2 ne répond plus', `Impossible de lire l'état des bots depuis ~2 min${pm2Health.reason ? ` (${pm2Health.reason})` : ''}. Tes bots ne sont peut-être plus surveillés.`, 0xED4245);
 };
 
 // ---------- « X bots devraient être en ligne » ----------
@@ -644,7 +673,7 @@ const ioRawByPid = (pids) => new Promise((resolve) => {
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
   if (!pids.length) return resolve(m);
   const filter = pids.map((p) => `ProcessId=${p}`).join(' OR ');
-  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command',
     `Get-CimInstance Win32_Process -Filter "${filter}" | ForEach-Object { "$($_.ProcessId):$([int64]$_.ReadTransferCount):$([int64]$_.WriteTransferCount)" }`],
     { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
       if (err || !out) return resolve(m);
@@ -684,11 +713,11 @@ const setBotPriority = (pids, cls) => new Promise((resolve) => {
   pids = (pids || []).filter((p) => Number.isInteger(p) && p > 0);
   if (!pids.length || !['Normal', 'BelowNormal', 'Idle'].includes(cls)) return resolve(false);
   const cmd = `foreach($p in ${pids.join(',')}){ try { (Get-Process -Id $p -ErrorAction Stop).PriorityClass = '${cls}' } catch {} }`;
-  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true, timeout: 20000 }, () => resolve(true));
+  execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command', cmd], { windowsHide: true, timeout: 20000 }, () => resolve(true));
 });
 
 const linkSpeedMbps = () => new Promise((resolve) => {
-  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command',
     "(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1 -ExpandProperty LinkSpeed)"],
     { windowsHide: true, timeout: 20000 }, (err, out) => {
       const m = String(out || '').match(/([\d.]+)\s*(G|M|K)?bps/i);
@@ -858,8 +887,10 @@ const writeFlag = (bots, game) => {
 const clearFlag = () => { try { fs.unlinkSync(WATCHDOG_FLAG); } catch {} };
 
 // ---------- Mode jeu ----------
-const enterGameMode = async (game) => {
-  const list = await pm2List();
+const enterGameMode = async (game, known) => {
+  // `known` = liste déjà lue par le tick juste avant : on évite un 2e `pm2 jlist` (spawn complet) pile
+  // au lancement d'un jeu, c'est-à-dire au pire moment pour la fluidité.
+  const list = known || await pm2List();
   if (!list) return; // pm2 muet : on ne coupe rien sur une lecture ratée (on réessaiera au tick suivant)
   const targets = list
     .filter((b) => b.status === 'online' && (cfg.gameMode.stopAll || cfg.bots[b.name]?.gameStop))
@@ -893,7 +924,18 @@ const tick = async () => {
   if (tickRunning) return; // un tick est déjà en cours (ex. restartPoll(true) au show pendant un tick lent) → évite un double fan-out de spawns
   tickRunning = true;
   try {
-  const procs = await listProcs();
+  // La détection de jeu (tasklist, ~400 ms + un process lancé) ne sert QU'À deux choses : déclencher le
+  // mode jeu et l'éco réseau. Si les deux sont coupés ET que personne ne regarde l'écran (panel dans la
+  // zone de notification), on saute complètement ce scan : c'est le plus gros coût du tick au repos.
+  // Dès qu'on rouvre la fenêtre, restartPoll(true) relance un tick immédiat qui rescanne.
+  const needProcScan = cfg.gameMode.enabled || cfg.lowNet || cfg.lowNetApplied || cfg.stoppedByGame.length > 0
+    || !!(win && !win.isDestroyed() && win.isVisible());
+  const procs = needProcScan ? await listProcs() : null;
+  if (!needProcScan && statusCache.game) statusCache.game = null; // rien ne le rafraîchit → ne pas laisser une info périmée
+  // UNE seule lecture pm2 par tick, faite AVANT le bloc mode jeu : elle sert et à la bascule et à
+  // l'affichage. Avant, un lancement de jeu déclenchait deux `pm2 jlist` coup sur coup (tick + enterGameMode).
+  const freshBots = await pm2List();
+  if (freshBots) statusCache.bots = freshBots; // pm2 muet → on garde le dernier état connu
   if (procs) {
     const hit = cfg.games.find((g) => procs.names.has(g.toLowerCase()));
     const now = Date.now();
@@ -912,7 +954,7 @@ const tick = async () => {
     await withGameLock(async () => {
       try {
         if (cfg.gameMode.enabled && gameRunning && sessionOnline && cfg.stoppedByGame.length === 0) {
-          await enterGameMode(hit);
+          await enterGameMode(hit, freshBots); // réutilise la lecture pm2 de CE tick (fraîche, pas le cache)
         } else if (cfg.stoppedByGame.length > 0 && !gameRunning && graceOver) {
           await exitGameMode(); // couvre aussi la reprise après crash/redémarrage du panel
         } else if (cfg.stoppedByGame.length > 0 && !cfg.gameMode.enabled) {
@@ -927,11 +969,12 @@ const tick = async () => {
       } catch (e) { log('tick', e.message); }
     });
   }
-  { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
+  // (la lecture pm2 de ce tick a déjà été faite plus haut — une seule par tick)
   // Débit réseau = affichage UI UNIQUEMENT (aucune logique n'en dépend) → on ne le mesure QUE si la
   // fenêtre est visible. En tray ça épargne un spawn PowerShell/CIM par tick = moins de CPU/batterie.
   if (win && !win.isDestroyed() && win.isVisible()) await measureNet().catch(() => {});
   if (pm2Health.ok) await checkAlerts(statusCache.bots).catch((e) => log('checkAlerts', e.message));
+  else await alertPm2Down().catch(() => {}); // pm2 lui-même muet = TOUS les bots en danger, il faut le dire
   maybeAutoApplyUpdate(); // s'installe tout seul dès que c'est sans risque (plus besoin de fermer le panel à la main)
   statusCache.updatedAt = Date.now();
   updateTray();
@@ -1041,7 +1084,7 @@ const updateRpc = (force) => {
 };
 
 // ---------- Tray ----------
-let trayBad = false;
+let trayBad = false, lastMenuSig = '';
 const trayIcon = (bad) => {
   const p = path.join(__dirname, bad ? 'icon-alert.png' : 'icon.png');
   try {
@@ -1065,6 +1108,12 @@ const updateTray = () => {
     ? `Hasu Panel — 🎮 ${statusCache.game}${statusCache.online ? ' (en ligne)' : ' (solo)'}${stopped.length ? ` · ${stopped.length} bot(s) coupé(s)` : ''}${cfg.lowNetApplied ? ' · 🌐 éco réseau' : ''}`
     : `Hasu Panel — ${statusCache.bots.filter((b) => b.status === 'online').length}/${statusCache.bots.length} bots en ligne`;
   tray.setToolTip(tip);
+  // Le menu du tray ne change QUE si son contenu change (mode jeu, MAJ prête). Avant, on reconstruisait
+  // un Menu natif à CHAQUE tick (toutes les 10-30 s, 24h/24) pour un résultat identique — travail inutile
+  // côté Windows, et ça pouvait refermer le menu sous le curseur pile au moment où tu cliquais.
+  const menuSig = `${cfg.gameMode.enabled}|${updateReady}`;
+  if (menuSig === lastMenuSig) return;
+  lastMenuSig = menuSig;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Ouvrir le panel', click: () => showWindow() },
     {
@@ -1145,7 +1194,7 @@ ipcMain.handle('panel:ignoreGame', (_e, exe) => {
 // Liste des programmes ouverts (avec une fenêtre) → pour ajouter un jeu/logiciel inconnu en 1 clic.
 ipcMain.handle('panel:runningApps', () => new Promise((resolve) => {
   const SKIP = new Set(['hasupanel', 'explorer', 'applicationframehost', 'systemsettings', 'textinputhost', 'electron', 'searchhost', 'startmenuexperiencehost', 'shellexperiencehost']);
-  execFile(SYS('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
+  execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command',
     "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { $_.ProcessName + '|' + $_.MainWindowTitle }"],
     { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => {
       if (err || !out) return resolve([]);
