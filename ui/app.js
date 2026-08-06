@@ -57,6 +57,7 @@ const render = (st) => {
       ${b.status === 'online'
         ? `<button class="btn" data-act="restart" data-bot="${esc(b.name)}">⟳</button><button class="btn danger" data-act="stop" data-bot="${esc(b.name)}">⏹</button>`
         : `<button class="btn primary" data-act="start" data-bot="${esc(b.name)}">▶</button>`}
+      <button class="btn" data-logs="${esc(b.name)}" title="Voir les logs récents (crash, erreurs…)">📄</button>
       ${isImp ? `<button class="btn danger" data-remove="${esc(b.name)}" title="Arrêter et retirer ce bot de pm2 (ses fichiers ne sont pas touchés)">🗑</button>` : ''}
     </div>`;
   };
@@ -181,6 +182,16 @@ document.addEventListener('click', async (e) => {
   if (t.dataset?.ignore) { await window.panel.ignoreGame(t.dataset.ignore); document.querySelector(`[data-scanrow="${CSS.escape(t.dataset.ignore.toLowerCase())}"]`)?.remove(); await refresh(); return; }
   if (t.id === 'game-suggest-btn') { openScanModal(cur?.cfg?.discovered || [], 'Jeux repérés par le dernier scan (1×/jour).'); return; }
   if (t.dataset?.act && t.dataset?.bot) { t.disabled = true; await window.panel.action(t.dataset.bot, t.dataset.act); await refresh(); return; }
+  if (t.dataset?.logs) {
+    const name = t.dataset.logs;
+    openModal(`<h3 style="margin:0 0 8px">📄 Logs — ${esc(name)}</h3><pre id="logs-pre" style="max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.5 Consolas,monospace;background:#0b0e16;color:#cdd6f4;padding:10px;border-radius:8px;margin:0">Chargement…</pre><div class="modal-actions"><button class="btn primary" id="modal-close">Fermer</button></div>`);
+    try {
+      const r = await window.panel.logs(name);
+      const pre = document.getElementById('logs-pre'); // peut être null si la modale a été refermée
+      if (pre) { pre.textContent = (r && r.out && r.out.trim()) ? r.out : 'Aucun log disponible.'; pre.scrollTop = pre.scrollHeight; }
+    } catch { const pre = document.getElementById('logs-pre'); if (pre) pre.textContent = 'Échec de lecture des logs.'; }
+    return;
+  }
   if (t.dataset?.remove) {
     if (confirm(`Arrêter « ${t.dataset.remove} » et le retirer du panel ?\n(Ses fichiers ne sont pas touchés — tu pourras le réimporter.)`)) {
       const r = await window.panel.removeBot(t.dataset.remove);

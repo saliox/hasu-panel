@@ -723,7 +723,9 @@ const tick = async () => {
     });
   }
   statusCache.bots = await pm2List();
-  await measureNet().catch(() => {}); // débit réseau (E/S) par bot, affiché à côté du CPU
+  // Débit réseau = affichage UI UNIQUEMENT (aucune logique n'en dépend) → on ne le mesure QUE si la
+  // fenêtre est visible. En tray ça épargne un spawn PowerShell/CIM par tick = moins de CPU/batterie.
+  if (win && !win.isDestroyed() && win.isVisible()) await measureNet().catch(() => {});
   statusCache.updatedAt = Date.now();
   updateTray();
   updateRpc(); // met à jour la Rich Presence Discord (« gère X bots en ligne »)
@@ -1023,6 +1025,14 @@ ipcMain.handle('panel:stopAll', async () => {
     log('stopAll:', online.length, 'bot(s)');
     return { ok: true, stopped: online.length };
   } finally { stopAllInFlight = false; }
+});
+
+// Logs récents d'un bot (bouton « 📄 Logs ») : voir un crash sans ouvrir un terminal. Lecture seule.
+// Nom validé isSafeName ; --lines/--nostream sont des littéraux (pm2Raw n'exécute pas de shell arbitraire).
+ipcMain.handle('panel:logs', async (_e, { name } = {}) => {
+  if (!isSafeName(String(name || ''))) return { ok: false, out: '' };
+  const r = await pm2Raw(['logs', name, '--lines', '150', '--nostream']);
+  return { ok: r.ok, out: String(r.out || '').slice(-12000) }; // borne l'affichage (fin = le plus récent)
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {
