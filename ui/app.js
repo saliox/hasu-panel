@@ -251,6 +251,33 @@ $('upd-apply').addEventListener('click', async () => {
   $('upd-status').textContent = '🔄 Application de la mise à jour et redémarrage…';
   await window.panel.applyUpdate();
 });
+
+// Progression du téléchargement de la MAJ, poussée EN DIRECT par le main (event update-status).
+const fmtBps = (b) => b >= 1e6 ? (b / 1e6).toFixed(1) + ' Mo/s' : Math.max(0, Math.round(b / 1e3)) + ' Ko/s';
+const renderUpdateStatus = (s) => {
+  if (!s) return;
+  const st = $('upd-status');
+  if (s.state === 'downloading') {
+    const pct = Math.max(0, Math.min(100, s.percent || 0));
+    const speed = s.bps ? ` · ${fmtBps(s.bps)}` : '';
+    const size = (s.transferred && s.total) ? ` · ${(s.transferred / 1e6).toFixed(0)}/${(s.total / 1e6).toFixed(0)} Mo` : '';
+    st.innerHTML = `⬇️ Téléchargement de la mise à jour… <b>${pct}%</b>${speed}${size}`
+      + `<div class="upd-bar"><div class="upd-bar-fill" style="width:${pct}%"></div></div>`;
+    $('upd-check').disabled = true;
+    $('upd-apply').style.display = 'none';
+  } else if (s.state === 'downloaded') {
+    st.innerHTML = '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».';
+    $('upd-check').disabled = false;
+    $('upd-apply').style.display = '';
+  } else if (s.state === 'available') {
+    st.innerHTML = `⬇️ Nouvelle version <b>${s.version || ''}</b> trouvée — téléchargement…`;
+    $('upd-check').disabled = true;
+  } else if (s.state === 'error') {
+    st.innerHTML = `⚠️ MàJ : ${s.message || 'erreur'}`;
+    $('upd-check').disabled = false;
+  }
+};
+if (window.panel.onUpdate) window.panel.onUpdate(renderUpdateStatus);
 document.addEventListener('change', async (e) => {
   const t = e.target;
   if (t.dataset?.bot && t.dataset?.key) { await window.panel.setBot(t.dataset.bot, t.dataset.key, t.checked); await refresh(); return; }

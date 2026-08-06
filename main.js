@@ -32,10 +32,14 @@ const setupAutoUpdate = () => {
   const autoUpdater = updaterRef;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;      // la MAJ s'installe à la fermeture (donc au reboot)
-  autoUpdater.on('update-available', (i) => { lastUpdateStatus = { state: 'available', version: i?.version }; log('MAJ disponible :', i?.version); });
-  autoUpdater.on('update-not-available', () => { lastUpdateStatus = { state: 'uptodate' }; });
-  autoUpdater.on('update-downloaded', (i) => { updateReady = true; lastUpdateStatus = { state: 'downloaded', version: i?.version }; log('MAJ téléchargée :', i?.version, '→ appliquée au prochain démarrage'); updateTray(); });
-  autoUpdater.on('error', (e) => { lastUpdateStatus = { state: 'error', message: e?.message || String(e) }; log('updater erreur :', e?.message || e); });
+  // Pousse chaque changement d'état MAJ au renderer EN DIRECT (progression du téléchargement
+  // sans attendre le prochain sondage) + garde lastUpdateStatus pour le polling/panel:status.
+  const pushUpd = (s) => { lastUpdateStatus = s; try { if (win && !win.isDestroyed()) win.webContents.send('update-status', s); } catch {} };
+  autoUpdater.on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version }); log('MAJ disponible :', i?.version); });
+  autoUpdater.on('update-not-available', () => { pushUpd({ state: 'uptodate' }); });
+  autoUpdater.on('download-progress', (p) => { pushUpd({ state: 'downloading', percent: Math.round(p?.percent || 0), bps: p?.bytesPerSecond || 0, transferred: p?.transferred || 0, total: p?.total || 0, version: lastUpdateStatus?.version }); });
+  autoUpdater.on('update-downloaded', (i) => { updateReady = true; pushUpd({ state: 'downloaded', version: i?.version }); log('MAJ téléchargée :', i?.version, '→ appliquée au prochain démarrage'); updateTray(); });
+  autoUpdater.on('error', (e) => { pushUpd({ state: 'error', message: e?.message || String(e) }); log('updater erreur :', e?.message || e); });
   const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
   setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
   setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)

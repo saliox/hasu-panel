@@ -20,5 +20,6 @@ contextBridge.exposeInMainWorld('panel', {
   setSetting: (key, value) => ipcRenderer.invoke('panel:setSetting', { key, value }),
   checkUpdate: () => ipcRenderer.invoke('panel:checkUpdate'),
   applyUpdate: () => ipcRenderer.invoke('panel:applyUpdate'),
+  onUpdate: (cb) => ipcRenderer.on('update-status', (_e, d) => cb(d)),
   installPm2: () => ipcRenderer.invoke('panel:installPm2')
 });
