@@ -883,8 +883,8 @@ ipcMain.handle('panel:stopAll', async () => {
   if (stopAllInFlight) return { ok: false, error: 'déjà en cours' };
   stopAllInFlight = true;
   try {
-    const online = (await pm2List()).filter((b) => b.status === 'online').map((b) => b.name).filter(isSafeName);
-    for (const n of online) await stopTree(n);
+    const online = (await pm2List()).filter((b) => b.status === 'online' && isSafeName(b.name));
+    await stopBotsTree(online.map((b) => ({ name: b.name, pid: b.pid }))); // 1 snapshot + 1 grâce pour tous
     statusCache.bots = await pm2List();
     log('stopAll:', online.length, 'bot(s)');
     return { ok: true, stopped: online.length };
