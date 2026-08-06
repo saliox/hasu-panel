@@ -132,10 +132,13 @@ const aboutHTML = () => {
   <h2>🛡️ Hasu Panel ${esc(v)} — c'est quoi ?</h2>
   <p>Un panneau de contrôle pour <b>tous tes bots</b> : ils tournent en arrière-plan grâce à <b>pm2</b>, et tu les gères ici sans toucher à la console.</p>
   <h3>🤖 La liste des bots</h3>
-  <p>Chaque ligne = un bot. Pastille <b style="color:#3ba55d">verte</b> = en ligne, grise = arrêté, <b style="color:#ed4245">rouge</b> = en erreur. Boutons : ▶ démarrer · ⏹ arrêter · ⟳ redémarrer.</p>
+  <p>Chaque ligne = un bot. Pastille <b style="color:#3ba55d">verte</b> = en ligne, grise = arrêté, <b style="color:#ed4245">rouge</b> = en erreur. Boutons : ▶ démarrer · ⏹ arrêter · ⟳ redémarrer · <b>📄 Logs</b>.</p>
+  <p><b>📄 Logs</b> : affiche les <b>dernières lignes du bot</b> (erreurs, plantage…) — pratique pour comprendre pourquoi il est tombé, <b>sans ouvrir de terminal</b>.</p>
   <p><b>Auto boot</b> : coché → le bot est remis en ligne tout seul quand tu allumes le PC. Décoché → il reste éteint au démarrage.</p>
+  <p><b>⏹ Tout arrêter</b> (en haut de la liste) coupe <b>tous les bots en ligne</b> d'un coup. Sécurité : il faut cliquer <b>deux fois</b> pour confirmer.</p>
+  <p>À chaque arrêt, le panel fait le ménage : les <b>petits programmes lancés par un bot</b> (ffmpeg de la musique, installations en cours…) qui survivaient et encombraient le PC sont <b>fermés proprement</b> eux aussi.</p>
   <h3>➕ Importer un bot</h3>
-  <p>Tu as un bot que tu lances d'habitude à la main (par exemple depuis <b>Visual Studio</b> avec <code>node index.js</code>) ? Clique « Importer un bot », choisis son <b>fichier principal</b> (index.js, main.js, bot.py…), donne-lui un nom, et c'est tout :</p>
+  <p>Tu as un bot que tu lances d'habitude à la main (par exemple depuis <b>Visual Studio</b> avec <code>node index.js</code>) ? Clique « Importer un bot » (<b>fichier</b> ou <b>dossier entier</b> — dans ce cas le fichier principal est détecté tout seul), donne-lui un nom, et c'est tout :</p>
   <p>• il tourne <b>en arrière-plan</b>, même Visual Studio fermé ;<br>• il <b>redémarre tout seul</b> s'il plante ;<br>• il <b>survit aux redémarrages du PC</b> ;<br>• il se gère ici <b>comme les autres</b> (auto boot, mode jeu…).</p>
   <p>Le bouton 🗑 arrête le bot et le retire de pm2 — <b>ses fichiers ne sont jamais touchés</b>.</p>
   <h3>🎮 Le mode jeu</h3>
@@ -146,6 +149,14 @@ const aboutHTML = () => {
   <p>Le scan disque ne tourne <b>jamais en continu</b> : automatiquement <b>1×/jour</b> maximum (désactivable dans ⚙️ Réglages), ou quand tu cliques « Scanner ». La surveillance permanente, elle, ne fait que lire la liste des process — quasi gratuit.</p>
   <h3>🌐 Faible usage internet</h3>
   <p>Activé, ce mode donne la <b>priorité réseau au jeu en ligne</b> : pendant la partie, les bots repoussent leurs <b>gros téléchargements</b> (listes anti-scam, sauvegardes chiffrées) et passent en <b>priorité basse</b> — d'autant plus strict que ta connexion est lente (mesurée automatiquement). À la fin de la partie, tout revient à la normale. Indépendant du mode jeu : parfait pour garder saliox en ligne <i>sans</i> qu'il fasse laguer.</p>
+  <h3>🔄 Mises à jour automatiques</h3>
+  <p>Le panel <b>se met à jour tout seul</b> : il vérifie au lancement puis toutes les 6 h, télécharge en fond (tu vois la <b>progression</b> dans ⚙️ Réglages) et applique la nouvelle version au <b>prochain démarrage</b>. Rien à réinstaller. Tu peux forcer une vérification avec le bouton « Vérifier les mises à jour ».</p>
+  <h3>🔋 Économe en ressources</h3>
+  <p>Le panel tourne 24h/24 sans se faire remarquer : quand il est <b>réduit dans la zone de notification</b>, il <b>ralentit sa surveillance</b> et arrête de calculer l'affichage inutile. Dès que tu rouvres la fenêtre, tout redevient instantané. (Si le mode jeu ou le faible usage internet est actif, il reste réactif pour ne rien rater.)</p>
+  <h3>🎮 Ta présence Discord</h3>
+  <p>Option « Rich Presence » : ton profil Discord peut afficher <b>« 🤖 Gère X bots en ligne »</b> (et le jeu en cours). Purement décoratif, désactivable dans ⚙️ Réglages.</p>
+  <h3>🧰 Sur un PC neuf (chez un ami)</h3>
+  <p>Les bots ont besoin de <b>Node.js</b> et <b>pm2</b>. Si l'un des deux manque, le panel le <b>détecte</b> et propose le bouton qui va bien (« Télécharger Node.js » ou « Installer pm2 ») au lieu d'afficher une liste vide.</p>
   <h3>🔗 Le watchdog</h3>
   <p>saliox garde un œil sur les autres bots et t'envoie un MP <b>uniquement</b> si l'un d'eux <b>plante en boucle</b> (crash-loop). Les arrêts/démarrages normaux ne génèrent aucun MP : c'est ici, dans le panel, que tu vois qui est en ligne.</p>
   <h3>📁 Bon à savoir</h3>
