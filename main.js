@@ -170,7 +170,9 @@ const DEFAULTS = {
   alertWebhook: '',         // URL de webhook Discord (te touche même en jeu ou absent) — https://discord.com/api/webhooks/…
   lastSaveAt: 0,            // dernier « pm2 save » réussi (ce qui reviendra au prochain démarrage)
   autoApplyUpdates: true,   // installer la MAJ tout seul dès que c'est sans risque (jamais en pleine partie)
-  updatedFrom: ''           // version quittée lors d'une MAJ auto → sert à annoncer « mis à jour » au retour
+  updatedFrom: '',          // version quittée lors d'une MAJ auto → sert à annoncer « mis à jour » au retour
+  winBounds: null,          // taille/position mémorisées de la fenêtre (null = calculées d'après l'écran)
+  winMaximized: false       // la fenêtre était-elle en plein écran à la dernière fermeture ?
 };
 
 let win = null, tray = null, quitting = false;
@@ -244,6 +246,11 @@ const loadCfg = () => {
       scanAuto: raw.scanAuto !== false, discordRpc: raw.discordRpc !== false,
       alerts: raw.alerts !== false, alertToast: raw.alertToast !== false,
       autoApplyUpdates: raw.autoApplyUpdates !== false,
+      // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
+      // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
+      winBounds: (raw.winBounds && ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(raw.winBounds[k])))
+        ? { x: raw.winBounds.x, y: raw.winBounds.y, width: raw.winBounds.width, height: raw.winBounds.height } : null,
+      winMaximized: raw.winMaximized === true,
       updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
@@ -1153,15 +1160,65 @@ const updateTray = () => {
 };
 
 // ---------- Fenêtre ----------
+// Taille d'ouverture : 1020x760 en dur, c'était minuscule sur un grand écran (et immense sur un petit
+// portable). On dimensionne donc d'après l'écran RÉEL : ~82 % de la zone de travail (barre des tâches
+// exclue), borné pour rester lisible. Si tu redimensionnes/déplaces la fenêtre, on retient ton choix.
+const defaultBounds = () => {
+  try {
+    const { screen } = require('electron');
+    const wa = screen.getPrimaryDisplay().workArea; // exclut la barre des tâches
+    const w = Math.max(1100, Math.min(1800, Math.round(wa.width * 0.82)));
+    const h = Math.max(760, Math.min(1150, Math.round(wa.height * 0.86)));
+    return { width: Math.min(w, wa.width), height: Math.min(h, wa.height),
+      x: wa.x + Math.round((wa.width - Math.min(w, wa.width)) / 2), y: wa.y + Math.round((wa.height - Math.min(h, wa.height)) / 2) };
+  } catch { return { width: 1280, height: 860 }; }
+};
+// Des bornes mémorisées ne sont réutilisées que si elles restent VISIBLES sur un écran actuellement
+// branché (sinon la fenêtre s'ouvrirait hors champ après avoir débranché un second moniteur).
+const savedBounds = () => {
+  const b = cfg.winBounds;
+  if (!b || !Number.isFinite(b.width) || !Number.isFinite(b.height) || b.width < 860 || b.height < 560) return null;
+  try {
+    const { screen } = require('electron');
+    const visible = screen.getAllDisplays().some((d) => {
+      const a = d.workArea;
+      return Number.isFinite(b.x) && Number.isFinite(b.y)
+        && b.x + b.width > a.x + 80 && b.x < a.x + a.width - 80 && b.y + 40 > a.y && b.y < a.y + a.height - 40;
+    });
+    return visible ? b : null;
+  } catch { return null; }
+};
 const showWindow = () => {
   if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); restartPoll(true); return; } // restaure depuis le tray + rafraîchit tout de suite
+  const b = savedBounds() || defaultBounds();
   win = new BrowserWindow({
-    width: 1020, height: 760, minWidth: 860, minHeight: 560,
+    ...b, minWidth: 900, minHeight: 600,
     backgroundColor: '#0f1117',
     title: 'Hasu Panel',
     icon: path.join(__dirname, 'icon.png'),
+    show: false, // on affiche seulement quand la page est prête → pas de fenêtre blanche qui clignote
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
+  if (cfg.winMaximized) win.maximize();
+  win.once('ready-to-show', () => { try { win.show(); win.focus(); } catch {} });
+  // Mémorise ta taille/position (écriture différée : on n'écrit pas le fichier à chaque pixel du glisser).
+  let boundsTimer = null;
+  const rememberBounds = () => {
+    if (boundsTimer) clearTimeout(boundsTimer);
+    boundsTimer = setTimeout(() => {
+      try {
+        if (!win || win.isDestroyed()) return;
+        cfg.winMaximized = win.isMaximized();
+        if (!cfg.winMaximized && !win.isMinimized()) cfg.winBounds = win.getBounds(); // en plein écran, on garde la taille « restaurée »
+        saveCfg();
+      } catch {}
+    }, 700);
+    boundsTimer.unref?.();
+  };
+  win.on('resize', rememberBounds);
+  win.on('move', rememberBounds);
+  win.on('maximize', rememberBounds);
+  win.on('unmaximize', rememberBounds);
   win.removeMenu();
   // Refuse toute permission de périphérique (caméra/micro/géoloc/notif…) : le panel n'en a aucun besoin.
   try { win.webContents.session.setPermissionRequestHandler((_wc, _perm, cb) => cb(false)); } catch {}
