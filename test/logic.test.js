@@ -245,3 +245,36 @@ test('pollDelayFor : caché MAIS une bascule auto en dépend → reste réactif 
 test('pollDelayFor : un sondage lent l\'emporte sur la cadence ralentie', () => {
   assert.equal(pollDelayFor(false, CFG({ pollSec: 60, idlePollSec: 30 })), 60000);
 });
+
+// -------------------------------------------------------- makeChimeWav
+const { makeChimeWav } = require('../logic');
+
+test('makeChimeWav : produit un WAV PCM valide', () => {
+  const w = makeChimeWav();
+  assert.equal(w.slice(0, 4).toString(), 'RIFF');
+  assert.equal(w.slice(8, 12).toString(), 'WAVE');
+  assert.equal(w.readUInt16LE(20), 1, 'format PCM');
+  assert.equal(w.readUInt16LE(22), 1, 'mono');
+  assert.equal(w.readUInt16LE(34), 16, '16 bits');
+  assert.equal(w.readUInt32LE(24), 44100);
+  assert.equal(w.readUInt32LE(4), w.length - 8, 'taille RIFF cohérente');
+  assert.equal(w.readUInt32LE(40), w.length - 44, 'taille du bloc data cohérente');
+});
+
+test('makeChimeWav : reste DOUX (le volume est le point de la fonctionnalité)', () => {
+  const peak = (buf) => { let m = 0; for (let i = 44; i < buf.length; i += 2) m = Math.max(m, Math.abs(buf.readInt16LE(i))); return m / 32767; };
+  assert.ok(peak(makeChimeWav()) < 0.15, 'défaut discret (< 15 % du maximum)');
+  // Le volume demandé doit réellement changer l'amplitude, de façon monotone.
+  assert.ok(peak(makeChimeWav({ amplitude: 0.5 })) > peak(makeChimeWav({ amplitude: 0.1 })));
+});
+
+test('makeChimeWav : amplitude bornée, jamais de saturation', () => {
+  const peak = (buf) => { let m = 0; for (let i = 44; i < buf.length; i += 2) m = Math.max(m, Math.abs(buf.readInt16LE(i))); return m / 32767; };
+  assert.ok(peak(makeChimeWav({ amplitude: 5 })) <= 1, 'amplitude > 1 écrêtée, pas de dépassement');
+  assert.ok(peak(makeChimeWav({ amplitude: -1 })) === 0, 'amplitude négative → silence');
+});
+
+test('makeChimeWav : court (une notification ne doit pas s\'éterniser)', () => {
+  const secondes = (makeChimeWav().readUInt32LE(40) / 2) / 44100;
+  assert.ok(secondes > 0.1 && secondes < 1, `durée ${secondes}s hors plage raisonnable`);
+});

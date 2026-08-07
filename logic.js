@@ -187,7 +187,49 @@ const pollDelayFor = (visible, cfg) => {
   return ((cfg.gameMode && cfg.gameMode.enabled) || cfg.lowNet ? Math.min(idle, 15) : idle) * 1000;
 };
 
+// ---------- Petit son de notification (généré, pas de fichier externe) ----------
+// On fabrique nous-mêmes un WAV court et DOUX plutôt que d'utiliser un son système : ça garantit
+// qu'il existe (aucun fichier à embarquer), et surtout ça nous donne la maîtrise du VOLUME — les sons
+// Windows se jouent à fond via SoundPlayer, qui n'a aucun réglage de volume.
+// Deux notes brèves qui descendent, avec une enveloppe douce (attaque + décroissance) pour éviter le
+// « clic » sec des débuts/fins de signal abrupts.
+const makeChimeWav = ({ amplitude = 0.10, sampleRate = 44100, notes = [[880, 0.10], [660, 0.20]] } = {}) => {
+  const amp = Math.max(0, Math.min(1, amplitude));
+  const samples = [];
+  for (const [freq, dur] of notes) {
+    const n = Math.round(sampleRate * dur);
+    for (let i = 0; i < n; i++) {
+      const t = i / sampleRate;
+      const p = i / n;
+      // attaque rapide (5 % du temps) puis décroissance exponentielle : rend le son « rond »
+      const env = Math.min(1, p / 0.05) * Math.exp(-4 * p);
+      samples.push(Math.sin(2 * Math.PI * freq * t) * env * amp);
+    }
+  }
+  const data = Buffer.alloc(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.max(-1, Math.min(1, samples[i]));
+    data.writeInt16LE(Math.round(v * 32767), i * 2);
+  }
+  const head = Buffer.alloc(44);
+  head.write('RIFF', 0);
+  head.writeUInt32LE(36 + data.length, 4);
+  head.write('WAVE', 8);
+  head.write('fmt ', 12);
+  head.writeUInt32LE(16, 16);          // taille du bloc fmt
+  head.writeUInt16LE(1, 20);           // PCM
+  head.writeUInt16LE(1, 22);           // mono
+  head.writeUInt32LE(sampleRate, 24);
+  head.writeUInt32LE(sampleRate * 2, 28); // octets/seconde (mono 16 bits)
+  head.writeUInt16LE(2, 32);           // alignement de bloc
+  head.writeUInt16LE(16, 34);          // bits par échantillon
+  head.write('data', 36);
+  head.writeUInt32LE(data.length, 40);
+  return Buffer.concat([head, data]);
+};
+
 module.exports = {
+  makeChimeWav,
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,

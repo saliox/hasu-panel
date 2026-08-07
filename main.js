@@ -70,7 +70,15 @@ const setupAutoUpdate = () => {
   autoUpdater.on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version }); log('MAJ disponible :', i?.version); });
   autoUpdater.on('update-not-available', () => { pushUpd({ state: 'uptodate' }); });
   autoUpdater.on('download-progress', (p) => { pushUpd({ state: 'downloading', percent: Math.round(p?.percent || 0), bps: p?.bytesPerSecond || 0, transferred: p?.transferred || 0, total: p?.total || 0, version: lastUpdateStatus?.version }); });
-  autoUpdater.on('update-downloaded', (i) => { updateReady = true; updateReadyAt = Date.now(); updateReadyVersion = i?.version || ''; pushUpd({ state: 'downloaded', version: i?.version }); log('MAJ téléchargée :', i?.version, '→ sera appliquée dès que ce sera sans risque'); updateTray(); });
+  autoUpdater.on('update-downloaded', (i) => {
+    updateReady = true; updateReadyAt = Date.now(); updateReadyVersion = i?.version || '';
+    pushUpd({ state: 'downloaded', version: i?.version });
+    log('MAJ téléchargée :', i?.version, '→ sera appliquée dès que ce sera sans risque');
+    // Prévenir discrètement : jusqu'ici une nouvelle version arrivait en SILENCE (visible seulement
+    // en ouvrant les réglages). Une seule notification par version, et jamais pendant une partie.
+    notifyUpdateReady(i?.version);
+    updateTray();
+  });
   autoUpdater.on('error', (e) => { pushUpd({ state: 'error', message: e?.message || String(e) }); log('updater erreur :', e?.message || e); });
   const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
   setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
@@ -87,7 +95,7 @@ const { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp } 
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert, isDeliberateStop,
-  computeDefaultBounds, boundsAreVisible, pollDelayFor,
+  computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav,
 } = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
@@ -155,6 +163,9 @@ const DEFAULTS = {
   discordAppId: '',         // Application ID Discord (Rich Presence) — à coller dans les réglages, ou via l'env HASU_DISCORD_APP_ID
   alerts: true,             // prévenir quand un bot tombe / redémarre en boucle
   alertToast: true,         // notification Windows (utile seulement si tu es devant le PC)
+  alertSound: true,         // petit son doux avec la notification (généré, volume maîtrisé)
+  alertVolume: 10,          // volume du son en % (1-100). 10 % = discret, volontairement bas par défaut
+  alertVolumeAt: 0,         // volume du WAV déjà généré → sert à le régénérer quand tu changes le volume
   alertWebhook: '',         // URL de webhook Discord (te touche même en jeu ou absent) — https://discord.com/api/webhooks/…
   lastSaveAt: 0,            // dernier « pm2 save » réussi (ce qui reviendra au prochain démarrage)
   autoApplyUpdates: true,   // installer la MAJ tout seul dès que c'est sans risque (jamais en pleine partie)
@@ -234,6 +245,7 @@ const loadCfg = () => {
       autoLaunch: raw.autoLaunch !== false, lowNet: raw.lowNet === true, lowNetApplied: raw.lowNetApplied === true,
       scanAuto: raw.scanAuto !== false, discordRpc: raw.discordRpc !== false,
       alerts: raw.alerts !== false, alertToast: raw.alertToast !== false,
+      alertSound: raw.alertSound !== false, alertVolume: clampInt(raw.alertVolume, 1, 100, 10),
       autoApplyUpdates: raw.autoApplyUpdates !== false,
       // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
       // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
@@ -511,6 +523,57 @@ const postWebhook = (url, payload) => new Promise((resolve) => {
   } catch { resolve(false); }
 });
 
+// ---------- Petit son discret ----------
+// Le WAV est GÉNÉRÉ (logic.js) puis écrit une fois dans le dossier de données : aucun fichier à
+// embarquer, et surtout on maîtrise le volume — SoundPlayer joue un son système à plein niveau, sans
+// aucun réglage possible. Amplitude ~8 % du maximum : audible sans faire sursauter.
+let chimePath = null;
+const ensureChime = () => {
+  if (chimePath) return chimePath;
+  try {
+    const p = path.join(app.getPath('userData'), 'notify.wav');
+    const vol = clampInt(cfg.alertVolume, 1, 100, 10) / 100;
+    if (!fs.existsSync(p) || cfg.alertVolumeAt !== vol) {
+      fs.writeFileSync(p, makeChimeWav({ amplitude: vol }));
+      cfg.alertVolumeAt = vol; saveCfg();
+    }
+    chimePath = p;
+  } catch (e) { log('chime', e.message); }
+  return chimePath;
+};
+const playSoftSound = () => {
+  if (cfg.alertSound === false) return;
+  const f = ensureChime();
+  if (!f) return;
+  // PlaySync dans un process jetable : ne bloque pas le panel, et le son va au bout même si le
+  // process parent est occupé. Le chemin vient de nous (dossier de données) — on échappe malgré tout
+  // les apostrophes, par principe.
+  const safe = f.replace(/'/g, "''");
+  execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command',
+    `(New-Object Media.SoundPlayer '${safe}').PlaySync()`], { windowsHide: true, timeout: 8000 }, () => {});
+};
+
+// Notification « nouvelle version prête ». Discrète et NON répétitive : une seule fois par version,
+// jamais pendant une partie (on ne dérange pas en jeu — la MAJ s'installera toute seule après).
+let updateNotifiedFor = '';
+const notifyUpdateReady = (version) => {
+  try {
+    const v = String(version || '');
+    if (!v || v === updateNotifiedFor) return;
+    if (cfg.alerts === false || cfg.alertToast === false) return;
+    if (statusCache.game) return; // en pleine partie : silence total
+    updateNotifiedFor = v;
+    if (Notification.isSupported()) {
+      new Notification({
+        title: 'Hasu Panel — mise à jour prête',
+        body: `Version ${v} téléchargée. Elle s'installera toute seule quand tu ne joueras pas.`,
+        silent: true,
+      }).show();
+    }
+    playSoftSound();
+  } catch (e) { log('notifyUpdateReady', e.message); }
+};
+
 // Renvoie true si l'alerte est réellement partie (le webhook a répondu 2xx, ou il n'y en a pas).
 const sendAlert = async (title, body, colorHex) => {
   const now = Date.now();
@@ -518,7 +581,9 @@ const sendAlert = async (title, body, colorHex) => {
   if (alertTimes.length >= ALERT_MAX_PER_HOUR) return false; // plafond anti-spam
   alertTimes.push(now);
   if (cfg.alertToast !== false) {
-    try { if (Notification.isSupported()) new Notification({ title, body }).show(); } catch {}
+    // silent:true → Windows ne joue PAS son propre son (souvent fort) ; on joue le nôtre à la place.
+    try { if (Notification.isSupported()) new Notification({ title, body, silent: true }).show(); } catch {}
+    playSoftSound();
   }
   const url = (cfg.alertWebhook || '').trim();
   let ok = true;
@@ -1239,7 +1304,8 @@ ipcMain.handle('panel:status', () => ({
   cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '',
     // Réglages d'alertes : SANS eux, l'UI lisait `undefined` → l'interrupteur se recochait tout seul
     // (undefined !== false) et le champ webhook se vidait au premier rafraîchissement.
-    alerts: cfg.alerts !== false, alertToast: cfg.alertToast !== false, alertWebhook: cfg.alertWebhook || '' }
+    alerts: cfg.alerts !== false, alertToast: cfg.alertToast !== false, alertWebhook: cfg.alertWebhook || '',
+    alertSound: cfg.alertSound !== false, alertVolume: cfg.alertVolume || 10 }
 }));
 
 // Scan disque à la demande (bouton « Scanner ») + gestion des suggestions.
@@ -1475,6 +1541,13 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'autoApplyUpdates') { cfg.autoApplyUpdates = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alerts') { cfg.alerts = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertToast') { cfg.alertToast = !!value; saveCfg(); return { ok: true }; }
+  if (key === 'alertSound') { cfg.alertSound = !!value; saveCfg(); if (cfg.alertSound) playSoftSound(); return { ok: true }; } // aperçu immédiat
+  if (key === 'alertVolume') {
+    cfg.alertVolume = clampInt(value, 1, 100, 10);
+    chimePath = null; // force la régénération du WAV au nouveau volume
+    saveCfg(); playSoftSound(); // on entend tout de suite le résultat
+    return { ok: true, volume: cfg.alertVolume };
+  }
   if (key === 'alertWebhook') {
     const v = String(value || '').trim().slice(0, 300);
     // Vide = désactivé ; sinon on n'accepte QUE des webhooks Discord (rien d'autre ne doit recevoir tes données).

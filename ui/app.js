@@ -138,6 +138,9 @@ const render = (st) => {
   $('set-autoupdate').checked = st.autoApplyUpdates !== false;
   $('set-alerts').checked = st.cfg.alerts !== false;
   $('set-alert-toast').checked = st.cfg.alertToast !== false;
+  $('set-alert-sound').checked = st.cfg.alertSound !== false;
+  if (document.activeElement !== $('set-alert-volume')) $('set-alert-volume').value = st.cfg.alertVolume || 10;
+  $('alert-vol-val').textContent = `${st.cfg.alertVolume || 10} %`;
   if (document.activeElement !== $('set-alert-webhook')) $('set-alert-webhook').value = st.cfg.alertWebhook || '';
   // Dernière sauvegarde pm2 = ce qui reviendra vraiment au prochain démarrage du PC.
   const sv = $('save-info');
@@ -438,6 +441,8 @@ document.addEventListener('change', async (e) => {
   if (t.id === 'set-autoupdate') { await window.panel.setSetting('autoApplyUpdates', t.checked); await refresh(); return; }
   if (t.id === 'set-alerts') { await window.panel.setSetting('alerts', t.checked); await refresh(); return; }
   if (t.id === 'set-alert-toast') { await window.panel.setSetting('alertToast', t.checked); await refresh(); return; }
+  if (t.id === 'set-alert-sound') { await window.panel.setSetting('alertSound', t.checked); await refresh(); return; }
+  if (t.id === 'set-alert-volume') { await window.panel.setSetting('alertVolume', Number(t.value)); await refresh(); return; }
   if (t.id === 'set-alert-webhook') {
     const r = await window.panel.setSetting('alertWebhook', t.value.trim());
     const s = $('alert-status'); if (s) s.textContent = r && r.ok ? ' ✅ enregistré' : ` ❌ ${(r && r.error) || 'refusé'}`;
