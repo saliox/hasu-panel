@@ -2,7 +2,9 @@
 // (quand un jeu multijoueur est détecté, coupe tous les bots ou ceux cochés, puis les relance).
 // Electron, aucune dépendance externe. Sécurité : noms pm2/exe validés par regex (anti-injection),
 // contextIsolation activé, aucun contenu distant chargé.
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell } = require('electron');
+// Imports Electron regroupés ici : `Notification`, `screen` et `powerMonitor` étaient re-`require`és
+// en ligne à chaque usage (jusqu'à un require par alerte envoyée) — même module, mais dispersé.
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell, Notification, screen, powerMonitor } = require('electron');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -39,7 +41,7 @@ const updateBlockers = () => {
   if (stopAllInFlight) b.push('arrêt global en cours');
   if (cfg.stoppedByGame.length) b.push('bots coupés par le mode jeu'); // on ne redémarre pas là-dessus
   if (cfg.lowNetApplied) b.push('éco réseau active');
-  if (win && !win.isDestroyed() && win.isVisible()) b.push('fenêtre ouverte'); // tu es en train de t'en servir
+  if (isWindowVisible()) b.push('fenêtre ouverte'); // tu es en train de t'en servir
   if (Date.now() - updateReadyAt < UPDATE_GRACE_MS) b.push('délai de grâce');
   return b;
 };
@@ -55,18 +57,7 @@ const maybeAutoApplyUpdate = () => {
   // isSilent=true (installeur oneClick, aucune fenêtre) + isForceRunAfter=true (le panel revient tout seul).
   setTimeout(() => { try { updaterRef.quitAndInstall(true, true); } catch (e) { log('quitAndInstall', e.message); updateApplying = false; quitting = false; } }, 400);
 };
-// Vrai si a > b en version sémantique X.Y.Z (comparaison numérique champ par champ).
-const semverGt = (a, b) => {
-  // Retire un éventuel préfixe "v"/"V" (ex. "v1.8.0") : sinon parseInt("v1", 10) vaut NaN||0 = 0,
-  // et une version distante réellement plus récente pouvait s'afficher comme plus ancienne/égale.
-  // Retire "v", puis la pré-release/metadata (-rc.1, +build) avant de parser : sinon parseInt("5-rc")=5
-  // faisait passer "1.7.5-rc.1" pour égal à "1.7.5" (mauvais libellé « à jour »). Label d'affichage only.
-  const core = (s) => String(s || '').trim().replace(/^v/i, '').split(/[-+]/)[0];
-  const pa = core(a).split('.').map((n) => parseInt(n, 10) || 0);
-  const pb = core(b).split('.').map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
-  return false;
-};
+// (`semverGt` vit dans logic.js, testé unitairement — pré-release, préfixe « v », champs manquants.)
 const setupAutoUpdate = () => {
   if (!app.isPackaged) return;
   try { ({ autoUpdater: updaterRef } = require('electron-updater')); } catch (e) { log('updater indispo', e.message); return; }
@@ -91,6 +82,13 @@ const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 // un module SANS Electron pour être testables unitairement (`npm test`). Toute modification de ces
 // règles doit faire passer test/validators.test.js — elles gardent une frontière de sécurité.
 const { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp } = require('./validators');
+// Logique PURE (décisions, parsing, calculs) : extraite pour la même raison — c'est ce module qui est
+// couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
+const {
+  semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
+  hasEstablishedPublic, classifyErrorFr, decideAlert, isDeliberateStop,
+  computeDefaultBounds, boundsAreVisible, pollDelayFor,
+} = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
 // avant le PATH → un binaire planté (powershell.exe/taskkill.exe…) dans le CWD pourrait être exécuté.
@@ -165,6 +163,8 @@ const DEFAULTS = {
 };
 
 let win = null, tray = null, quitting = false;
+// La fenêtre est-elle réellement affichée ? (test répété à l'identique à 4 endroits auparavant)
+const isWindowVisible = () => !!(win && !win.isDestroyed() && win.isVisible());
 let cfg = null;
 let lastGameSeen = null, lastGameAt = 0;
 let sessionOnline = false; // le jeu détecté a une vraie connexion Internet (session multijoueur)
@@ -203,7 +203,6 @@ const log = (...a) => {
 const cfgPath = () => path.join(app.getPath('userData'), 'panel-config.json');
 // Entier borné : un scalaire corrompu/édité à la main (ex. pollSec="10x" → NaN) transformerait la
 // boucle de sondage en boucle folle (spawn continu de tasklist/pm2). On coerce + clamp comme les setters.
-const clampInt = (v, lo, hi, def) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def; };
 const loadCfg = () => {
   const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
   let raw;
@@ -300,13 +299,7 @@ const resolvePm2Runner = () => {
   try { NODE_EXE = findNodeExe(); pm2Direct = !!(NODE_EXE && fs.existsSync(PM2_JS)); } catch { pm2Direct = false; }
   log('pm2 runner :', pm2Direct ? `direct (${NODE_EXE})` : 'repli cmd.exe');
 };
-// Repli cmd.exe : Node ne cite RIEN sous shell:true → on cite nous-mêmes les arguments à espaces
-// (un chemin finissant par « \ » casserait le parsing de cmd → on ajoute un point : D:\ → D:\.).
-const quoteForShell = (a) => {
-  const s = String(a);
-  if (!/[ \t]/.test(s)) return s;
-  return `"${s.endsWith('\\') ? s + '.' : s}"`;
-};
+// (Repli cmd.exe : `quoteForShell` vit dans logic.js, testé unitairement.)
 const pm2Raw = (args) => new Promise((resolve) => {
   const done = (err, out, errOut) => resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
   const opts = { windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 };
@@ -329,7 +322,12 @@ const pm2List = async () => {
     const i = out.indexOf('['); // pm2 peut afficher des lignes de log avant le JSON
     if (i < 0) throw new Error(ok ? 'sortie illisible' : 'pm2 injoignable');
     const arr = JSON.parse(out.slice(i));
-    if (!pm2Health.ok && pm2DownAlerted) { pm2DownAlerted = false; sendAlert('✅ pm2 répond de nouveau', 'La surveillance des bots a repris normalement.', 0x57F287).catch(() => {}); }
+    // Retour de pm2 : mis en FILE (et non envoyé ici) — une fonction de lecture ne doit pas bloquer sur
+    // le réseau. On respecte aussi le réglage `alerts`, qui était contourné sur ce chemin.
+    if (!pm2Health.ok && pm2DownAlerted) {
+      pm2DownAlerted = false;
+      if (cfg.alerts !== false) queueAlert('✅ pm2 répond de nouveau', 'La surveillance des bots a repris normalement.', 0x57F287);
+    }
     pm2Health = { ok: true, since: 0, reason: '', lastOkAt: Date.now() };
     return arr.map((p) => ({
       name: p.name,
@@ -366,32 +364,10 @@ const processTree = () => new Promise((resolve) => {
   execFile(PS_EXE, ['-NoProfile', '-NonInteractive', '-Command',
     'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId):$($_.ParentProcessId):$($_.CreationDate.Ticks)" }'],
     { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
-      const children = new Map(); // ppid -> [pid,...]
-      const born = new Map();     // pid -> date de création (Ticks) : signature pour repérer un PID recyclé
-      if (!err && out) for (const line of String(out).split('\n')) {
-        const m = line.trim().match(/^(\d+):(\d+):(\d*)$/); // pid:ppid:ticks (ticks vide pour certains process système)
-        if (!m) continue;
-        const pid = Number(m[1]), ppid = Number(m[2]);
-        if (!children.has(ppid)) children.set(ppid, []);
-        children.get(ppid).push(pid);
-        born.set(pid, m[3]); // '' si indisponible (jamais un enfant de bot)
-      }
-      resolve({ children, born });
+      resolve(parseProcessTree(err ? '' : out)); // parsing dans logic.js (testé)
     });
 });
-// Descendants d'un PID dans un arbre déjà capturé (borné + anti-cycle contre le recyclage de PID).
-const descendantsOf = (children, rootPid) => {
-  const root = Number(rootPid);
-  if (!Number.isInteger(root) || root <= 0) return [];
-  const res = [], seen = new Set([root]), stack = [root];
-  while (stack.length && res.length < 500) { // borne dure
-    for (const c of (children.get(stack.pop()) || [])) {
-      if (seen.has(c) || c <= 0) continue;
-      seen.add(c); res.push(c); stack.push(c);
-    }
-  }
-  return res;
-};
+// (`descendantsOf` vit dans logic.js, testé unitairement : bornes, cycles, PID invalides.)
 
 // Force-kill de PID déjà capturés. Un PID déjà mort → taskkill no-op (pas d'erreur bloquante).
 const killPids = (pids) => new Promise((resolve) => {
@@ -510,21 +486,8 @@ const ALERT_MAX_PER_HOUR = 6;
 const startedAt = Date.now();
 let quietUntil = 0, alertTimes = [], lastAlertAt = new Map(), prevStatus = new Map(), alertsPrimed = false;
 
-// Traduit la vraie cause en français depuis les dernières lignes du log d'erreurs du bot.
-const diagnoseFr = (bot) => {
-  const t = bot && bot.errLog ? tailFile(bot.errLog, 8 * 1024) : '';
-  if (!t) return '';
-  const last = t.split('\n').filter((l) => l.trim()).slice(-40).join('\n');
-  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(last)) return 'Internet/DNS injoignable (discord.com introuvable)';
-  if (/ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENETUNREACH/i.test(last)) return 'Connexion réseau refusée ou coupée';
-  if (/TOKEN_INVALID|Unauthorized|401|Privileged intent/i.test(last)) return 'Token invalide ou intents Discord manquants';
-  if (/Cannot find module|MODULE_NOT_FOUND/i.test(last)) return 'Module manquant (npm install à refaire)';
-  if (/SyntaxError/i.test(last)) return 'Erreur de syntaxe dans le code';
-  if (/EADDRINUSE/i.test(last)) return 'Port déjà utilisé';
-  if (/heap out of memory|ENOMEM/i.test(last)) return 'Mémoire saturée';
-  const line = last.split('\n').pop() || '';
-  return line.slice(0, 120);
-};
+// (Le diagnostic en français vit dans logic.js `classifyErrorFr` — l'ORDRE de ses règles est figé par
+// un test, car un même log peut contenir plusieurs signatures et la première l'emporte.)
 
 const postWebhook = (url, payload) => new Promise((resolve) => {
   try {
@@ -540,79 +503,108 @@ const postWebhook = (url, payload) => new Promise((resolve) => {
   } catch { resolve(false); }
 });
 
+// Renvoie true si l'alerte est réellement partie (le webhook a répondu 2xx, ou il n'y en a pas).
 const sendAlert = async (title, body, colorHex) => {
   const now = Date.now();
   alertTimes = alertTimes.filter((t) => now - t < 3600 * 1000);
-  if (alertTimes.length >= ALERT_MAX_PER_HOUR) return; // plafond anti-spam
+  if (alertTimes.length >= ALERT_MAX_PER_HOUR) return false; // plafond anti-spam
   alertTimes.push(now);
   if (cfg.alertToast !== false) {
-    try { const { Notification } = require('electron'); if (Notification.isSupported()) new Notification({ title, body }).show(); } catch {}
+    try { if (Notification.isSupported()) new Notification({ title, body }).show(); } catch {}
   }
   const url = (cfg.alertWebhook || '').trim();
-  if (url) await postWebhook(url, { embeds: [{ title, description: body, color: colorHex, timestamp: new Date(now).toISOString(), footer: { text: 'Hasu Panel' } }] });
-  log('alerte :', title, '—', body.replace(/\n/g, ' ').slice(0, 160));
+  let ok = true;
+  if (url) ok = await postWebhook(url, { embeds: [{ title, description: body, color: colorHex, timestamp: new Date(now).toISOString(), footer: { text: 'Hasu Panel' } }] });
+  log('alerte :', ok ? '' : '(ÉCHEC envoi)', title, '—', body.replace(/\n/g, ' ').slice(0, 160));
+  return ok;
 };
 
-// Compare l'état courant au précédent et alerte sur les transitions qui comptent.
-const checkAlerts = async (bots) => {
+// File d'attente des alertes : envoyer depuis la boucle de surveillance la BLOQUAIT (chaque webhook
+// peut prendre 10 s, jusqu'à 6 par heure → un tick pouvait geler ~60 s, donc plus de détection de jeu
+// ni de mise à jour pendant une panne… le moment précis où la surveillance compte le plus).
+// On empile et on dépile en arrière-plan, séquentiellement (pas de rafale parallèle vers Discord).
+const alertQueue = [];
+let alertDraining = false;
+const drainAlerts = async () => {
+  if (alertDraining) return;
+  alertDraining = true;
+  try {
+    while (alertQueue.length) {
+      const a = alertQueue.shift();
+      try { await sendAlert(a.title, a.body, a.color); } catch (e) { log('sendAlert', e.message); }
+    }
+  } finally { alertDraining = false; }
+};
+const queueAlert = (title, body, color) => {
+  if (alertQueue.length >= 20) return; // borne dure : on ne laisse pas la file enfler sans fin
+  alertQueue.push({ title, body, color });
+  drainAlerts(); // volontairement pas attendu : la boucle de surveillance continue
+};
+
+// Photo de l'état des bots, base de toute détection de transition.
+const snapshotOf = (bots) => new Map(bots.map((b) => [b.name, { status: b.status, restarts: b.restarts }]));
+
+// Applique les transitions d'état. La DÉCISION (alerter ? marquer un arrêt volontaire ?) vit dans
+// logic.js `decideAlert`, fonction pure et testée ; ici on ne fait qu'exécuter le verdict.
+//
+// Le suivi des arrêts volontaires est une question d'AUTO-DÉMARRAGE, pas de notification : il tourne
+// donc MÊME quand les alertes sont coupées. Avant, ce cycle de vie était enfermé dans checkAlerts
+// derrière trois sorties anticipées — couper les alertes (réglage purement cosmétique) laissait
+// `manualStop` collé à true pour toujours : le bot n'était plus jamais rallumé au démarrage, ni
+// signalé par le bandeau, sans aucun moyen de le débloquer depuis l'interface.
+const applyTransitions = (bots, prev) => {
   const now = Date.now();
-  const snapshot = new Map(bots.map((b) => [b.name, { status: b.status, restarts: b.restarts }]));
-  if (!alertsPrimed) { prevStatus = snapshot; alertsPrimed = true; return; } // 1er tick : on amorce en silence
-  if (now < quietUntil || now - startedAt < ALERT_QUIET_BOOT_MS) { prevStatus = snapshot; return; }
-  if (cfg.alerts === false) { prevStatus = snapshot; return; }
+  const notifyAllowed = cfg.alerts !== false
+    && now >= quietUntil && now - startedAt >= ALERT_QUIET_BOOT_MS;
+  let changed = false;
 
   for (const b of bots) {
-    const prev = prevStatus.get(b.name);
-    if (!prev) continue;
-    const fell = prev.status === 'online' && b.status !== 'online';
-    const looping = b.restarts > prev.restarts + 2; // redémarre en boucle
-    // Un bot qui revient en ligne n'est plus « arrêté volontairement » — quel que soit l'endroit d'où
-    // tu l'as relancé (panel ou terminal) : sinon il resterait exclu de l'auto-démarrage et du bandeau.
-    if (prev.status !== 'online' && b.status === 'online' && cfg.bots[b.name]?.manualStop) {
-      cfg.bots[b.name].manualStop = false; saveCfg();
+    const p = prev.get(b.name);
+    if (!p) continue;
+    const conf = cfg.bots[b.name];
+    const d = decideAlert(p, b, {
+      name: b.name,
+      stoppedByGame: cfg.stoppedByGame,
+      manualStop: !!(conf && conf.manualStop),
+      hadAlert: lastAlertAt.has(b.name),
+    });
+
+    // 1) État persisté (toujours, même alertes coupées)
+    if (d.clearManualStop && conf) { conf.manualStop = false; changed = true; }
+    if (d.setManualStop) {
+      const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false, manualStop: false });
+      if (!c.manualStop) { c.manualStop = true; changed = true; log('arrêt volontaire détecté :', b.name); }
     }
-    // Retour à la normale : on clôt l'alerte précédente (sinon tu ne sais jamais si c'est reparti).
-    if (prev.status !== 'online' && b.status === 'online' && lastAlertAt.has(b.name)) {
+
+    // 2) Notifications (seulement si autorisées)
+    if (!d.alert || !notifyAllowed) continue;
+    if (d.alert === 'recovered') {
       lastAlertAt.delete(b.name);
-      await sendAlert(`✅ ${b.name} est de retour`, 'Le bot est de nouveau en ligne.', 0x57F287);
+      queueAlert(`✅ ${b.name} est de retour`, 'Le bot est de nouveau en ligne.', 0x57F287);
       continue;
     }
-    if (!fell && !looping) continue;
-    // Silencieux si c'est NOUS qui l'avons arrêté (mode jeu, bouton stop du panel).
-    if (cfg.stoppedByGame.includes(b.name) || cfg.bots[b.name]?.manualStop) continue;
-    // …et aussi si l'arrêt vient d'AILLEURS mais qu'il est manifestement VOLONTAIRE (tu coupes souvent
-    // tes bots depuis un terminal : `pm2 stop <bot>`). Signal fiable : un arrêt propre laisse le statut
-    // 'stopped' SANS faire grimper le compteur de redémarrages, alors qu'un plantage passe par des
-    // relances pm2 (compteur +1) ou finit en 'errored'. On le mémorise pour que le bot ne soit ni
-    // ré-alerté, ni ressuscité au prochain démarrage, ni signalé par le bandeau.
-    if (fell && !looping && b.status === 'stopped' && b.restarts <= prev.restarts) {
-      const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false });
-      if (!c.manualStop) { c.manualStop = true; saveCfg(); log('arrêt volontaire détecté (hors panel) :', b.name, '→ pas d\'alerte'); }
-      continue;
-    }
-    const lastAt = lastAlertAt.get(b.name) || 0;
-    if (now - lastAt < ALERT_DEDUP_MS) continue;
+    if (now - (lastAlertAt.get(b.name) || 0) < ALERT_DEDUP_MS) continue; // anti-doublon 30 min
     lastAlertAt.set(b.name, now);
-    const cause = diagnoseFr(b);
-    await sendAlert(
-      looping ? `🔁 ${b.name} redémarre en boucle` : `⚠️ ${b.name} est tombé`,
+    const cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
+    queueAlert(
+      d.alert === 'looping' ? `🔁 ${b.name} redémarre en boucle` : `⚠️ ${b.name} est tombé`,
       (cause ? `**Cause probable :** ${cause}\n` : '') + `État : ${b.status} · redémarrages : ${b.restarts}`,
-      looping ? 0xE67E22 : 0xED4245);
+      d.alert === 'looping' ? 0xE67E22 : 0xED4245);
   }
-  prevStatus = snapshot;
+  if (changed) saveCfg(); // UN seul enregistrement pour tout le lot (avant : un par bot, en pleine boucle)
 };
 
 // pm2 injoignable = TOUS les bots sont potentiellement à terre, et aucune alerte « bot tombé » ne peut
 // partir (on ne lit plus rien). C'était l'angle mort de la surveillance → on alerte sur pm2 lui-même,
 // une seule fois par panne, et on annonce le retour.
 let pm2DownAlerted = false;
-const alertPm2Down = async () => {
+const alertPm2Down = () => {
   if (cfg.alerts === false || pm2DownAlerted) return;
   const now = Date.now();
   if (now < quietUntil || now - startedAt < ALERT_QUIET_BOOT_MS) return;
   if (!pm2Health.since || now - pm2Health.since < 2 * 60 * 1000) return; // muet depuis > 2 min (évite un simple hoquet)
   pm2DownAlerted = true;
-  await sendAlert('🛑 pm2 ne répond plus', `Impossible de lire l'état des bots depuis ~2 min${pm2Health.reason ? ` (${pm2Health.reason})` : ''}. Tes bots ne sont peut-être plus surveillés.`, 0xED4245);
+  queueAlert('🛑 pm2 ne répond plus', `Impossible de lire l'état des bots depuis ~2 min${pm2Health.reason ? ` (${pm2Health.reason})` : ''}. Tes bots ne sont peut-être plus surveillés.`, 0xED4245);
 };
 
 // ---------- « X bots devraient être en ligne » ----------
@@ -731,11 +723,12 @@ const linkSpeedMbps = () => new Promise((resolve) => {
     });
 });
 
-const applyLowNet = async (game) => {
+// `known` : liste pm2 déjà lue par le tick appelant (évite un `pm2 jlist` redondant).
+const applyLowNet = async (game, known) => {
   const speed = await linkSpeedMbps();
   const level = speed && speed < 100 ? 2 : 1; // petit débit → différer + priorité Idle ; sinon BelowNormal
   try { fs.writeFileSync(LOWNET_FLAG, JSON.stringify({ active: true, level, game, since: Date.now() })); } catch (e) { log('lownet flag', e.message); }
-  const bots = await pm2List() || [];
+  const bots = known || await pm2List() || [];
   await setBotPriority(bots.filter((b) => b.status === 'online').map((b) => b.pid), level === 2 ? 'Idle' : 'BelowNormal');
   cfg.lowNetApplied = true; saveCfg();
   log(`faible usage internet ON (lien ~${Math.round(speed)} Mbps → niveau ${level}) — jeu : ${game}`);
@@ -744,7 +737,12 @@ const applyLowNet = async (game) => {
 
 const clearLowNet = async () => {
   try { fs.unlinkSync(LOWNET_FLAG); } catch {}
-  const bots = await pm2List() || [];
+  // Si pm2 est muet, on ne peut PAS restaurer les priorités CPU. Baisser le drapeau quand même
+  // laisserait les bots coincés en priorité « Idle » pour toujours : la condition de nettoyage du tick
+  // exige `lowNetApplied === true`, donc plus personne ne repasserait jamais. On garde le drapeau levé
+  // et on réessaiera au tick suivant.
+  const bots = await pm2List();
+  if (!bots) { log('éco réseau : pm2 muet → priorités NON restaurées, nouvelle tentative au prochain tick'); return; }
   await setBotPriority(bots.map((b) => b.pid), 'Normal');
   cfg.lowNetApplied = false; saveCfg();
   log('faible usage internet OFF — priorités restaurées');
@@ -874,9 +872,13 @@ const scanInstalledGames = async () => {
 const runScan = async () => {
   if (scanning) return { ok: false, error: 'Scan déjà en cours' };
   scanning = true;
+  // Horodaté AVANT le scan : c'est ce qui garantit vraiment le « 1×/jour ». La date n'était posée
+  // qu'en cas de SUCCÈS — un scan qui échoue laissait la condition des 24 h vraie, donc un parcours
+  // disque complet (Steam + Epic, des milliers d'accès) repartait à CHAQUE tick, indéfiniment.
+  cfg.lastScanAt = Date.now();
+  saveCfg();
   try {
     cfg.discovered = (await scanInstalledGames()).slice(0, 40);
-    cfg.lastScanAt = Date.now();
     saveCfg();
     log(`scan jeux : ${cfg.discovered.length} suggestion(s)`);
     return { ok: true, games: cfg.discovered };
@@ -933,9 +935,15 @@ const tick = async () => {
   // zone de notification), on saute complètement ce scan : c'est le plus gros coût du tick au repos.
   // Dès qu'on rouvre la fenêtre, restartPoll(true) relance un tick immédiat qui rescanne.
   const needProcScan = cfg.gameMode.enabled || cfg.lowNet || cfg.lowNetApplied || cfg.stoppedByGame.length > 0
-    || !!(win && !win.isDestroyed() && win.isVisible());
+    || isWindowVisible();
   const procs = needProcScan ? await listProcs() : null;
-  if (!needProcScan && statusCache.game) statusCache.game = null; // rien ne le rafraîchit → ne pas laisser une info périmée
+  if (!needProcScan) {
+    // Rien ne rafraîchit ces états quand on saute le scan : on les remet à zéro au lieu de les laisser
+    // périmés. `sessionOnline` en particulier restait collé à `true` — au prochain jeu lancé, même SOLO,
+    // la sonde « partie en ligne » était sautée (condition `gameRunning && !sessionOnline`) et le mode
+    // jeu coupait les bots malgré l'option « ignorer les jeux solo ».
+    statusCache.game = null; sessionOnline = false; statusCache.online = false;
+  }
   // UNE seule lecture pm2 par tick, faite AVANT le bloc mode jeu : elle sert et à la bascule et à
   // l'affichage. Avant, un lancement de jeu déclenchait deux `pm2 jlist` coup sur coup (tick + enterGameMode).
   const freshBots = await pm2List();
@@ -966,7 +974,7 @@ const tick = async () => {
         }
         // Faible usage internet : indépendant du mode jeu (utile pour les bots qu'on laisse tourner).
         if (cfg.lowNet && gameRunning && sessionOnline && !cfg.lowNetApplied) {
-          await applyLowNet(hit);
+          await applyLowNet(hit, freshBots); // réutilise la lecture pm2 de ce tick
         } else if (cfg.lowNetApplied && (!cfg.lowNet || (!gameRunning && graceOver))) {
           await clearLowNet(); // couvre aussi la reprise après crash/redémarrage du panel
         }
@@ -976,9 +984,16 @@ const tick = async () => {
   // (la lecture pm2 de ce tick a déjà été faite plus haut — une seule par tick)
   // Débit réseau = affichage UI UNIQUEMENT (aucune logique n'en dépend) → on ne le mesure QUE si la
   // fenêtre est visible. En tray ça épargne un spawn PowerShell/CIM par tick = moins de CPU/batterie.
-  if (win && !win.isDestroyed() && win.isVisible()) await measureNet().catch(() => {});
-  if (pm2Health.ok) await checkAlerts(statusCache.bots).catch((e) => log('checkAlerts', e.message));
-  else await alertPm2Down().catch(() => {}); // pm2 lui-même muet = TOUS les bots en danger, il faut le dire
+  if (isWindowVisible()) await measureNet().catch(() => {});
+  if (pm2Health.ok) {
+    // L'ordre compte : le suivi des arrêts volontaires tourne TOUJOURS (c'est de l'auto-démarrage),
+    // les notifications seulement si elles sont activées. `prevStatus` est mis à jour ici, en UN seul
+    // endroit — avant il l'était sur cinq chemins différents à l'intérieur de checkAlerts.
+    const prev = prevStatus;
+    prevStatus = snapshotOf(statusCache.bots);
+    if (!alertsPrimed) alertsPrimed = true; // 1er tick : on amorce en silence, aucune comparaison
+    else try { applyTransitions(statusCache.bots, prev); } catch (e) { log('applyTransitions', e.message); }
+  } else alertPm2Down(); // pm2 lui-même muet = TOUS les bots en danger, il faut le dire
   maybeAutoApplyUpdate(); // s'installe tout seul dès que c'est sans risque (plus besoin de fermer le panel à la main)
   statusCache.updatedAt = Date.now();
   updateTray();
@@ -1131,12 +1146,13 @@ const updateTray = () => {
 };
 
 // ---------- Fenêtre ----------
+const WIN_MIN_W = 900, WIN_MIN_H = 600; // source unique : bornes minimales de la fenêtre
+
 // Taille d'ouverture : 1020x760 en dur, c'était minuscule sur un grand écran (et immense sur un petit
 // portable). On dimensionne donc d'après l'écran RÉEL : ~82 % de la zone de travail (barre des tâches
 // exclue), borné pour rester lisible. Si tu redimensionnes/déplaces la fenêtre, on retient ton choix.
 const defaultBounds = () => {
   try {
-    const { screen } = require('electron');
     const wa = screen.getPrimaryDisplay().workArea; // exclut la barre des tâches
     const w = Math.max(1100, Math.min(1800, Math.round(wa.width * 0.82)));
     const h = Math.max(760, Math.min(1150, Math.round(wa.height * 0.86)));
@@ -1148,9 +1164,10 @@ const defaultBounds = () => {
 // branché (sinon la fenêtre s'ouvrirait hors champ après avoir débranché un second moniteur).
 const savedBounds = () => {
   const b = cfg.winBounds;
-  if (!b || !Number.isFinite(b.width) || !Number.isFinite(b.height) || b.width < 860 || b.height < 560) return null;
+  // Seuils alignés sur minWidth/minHeight de la fenêtre (900x600) : ils divergeaient (860x560),
+  // donc des bornes mémorisées trop petites étaient acceptées puis silencieusement corrigées par Electron.
+  if (!b || !Number.isFinite(b.width) || !Number.isFinite(b.height) || b.width < WIN_MIN_W || b.height < WIN_MIN_H) return null;
   try {
-    const { screen } = require('electron');
     const visible = screen.getAllDisplays().some((d) => {
       const a = d.workArea;
       return Number.isFinite(b.x) && Number.isFinite(b.y)
@@ -1163,7 +1180,7 @@ const showWindow = () => {
   if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); restartPoll(true); return; } // restaure depuis le tray + rafraîchit tout de suite
   const b = savedBounds() || defaultBounds();
   win = new BrowserWindow({
-    ...b, minWidth: 900, minHeight: 600,
+    ...b, minWidth: WIN_MIN_W, minHeight: WIN_MIN_H,
     backgroundColor: '#0f1117',
     title: 'Hasu Panel',
     icon: path.join(__dirname, 'icon.png'),
@@ -1471,11 +1488,16 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
 // Bouton « Tester » des alertes : envoie une alerte de démonstration (toast + webhook) pour vérifier
 // la configuration sans attendre qu'un bot tombe vraiment.
 ipcMain.handle('panel:testAlert', async () => {
-  const had = cfg.alerts; cfg.alerts = true;           // un test doit partir même si les alertes sont coupées
-  alertTimes = [];                                      // et ne doit pas être bloqué par le plafond horaire
-  await sendAlert('✅ Test des alertes — Hasu Panel', 'Si tu lis ceci, les alertes fonctionnent : tu seras prévenu quand un bot tombera.', 0x57F287);
-  cfg.alerts = had;
-  return { ok: true, webhook: !!(cfg.alertWebhook || '').trim(), toast: cfg.alertToast !== false };
+  // On ne touche PLUS à cfg.alerts : sendAlert ne le lit pas (seuls checkAlerts/alertPm2Down le font),
+  // et le basculer autour d'un `await` de 10 s laissait un tick concurrent ENREGISTRER `alerts:true`
+  // sur le disque — les alertes revenaient donc activées au redémarrage, contre le choix de l'utilisateur.
+  const hasWebhook = !!(cfg.alertWebhook || '').trim();
+  alertTimes = []; // un test ne doit pas être refusé par le plafond horaire
+  // On REMONTE le vrai résultat : avant, l'échec du webhook (URL révoquée, 404, hors ligne) était
+  // ignoré et l'interface affichait « ✅ envoyé » sur une configuration morte.
+  const ok = await sendAlert('✅ Test des alertes — Hasu Panel', 'Si tu lis ceci, les alertes fonctionnent : tu seras prévenu quand un bot tombera.', 0x57F287);
+  return { ok, webhook: hasWebhook, toast: cfg.alertToast !== false,
+    error: ok ? '' : (hasWebhook ? 'Discord a refusé le webhook (URL révoquée, salon supprimé, ou pas de connexion).' : 'Envoi impossible.') };
 });
 
 // Vérification MANUELLE des mises à jour (bouton « Vérifier les mises à jour »).
@@ -1523,7 +1545,7 @@ ipcMain.handle('panel:installPm2', async () => {
 let pollTimer = null;
 let pollEpoch = 0;
 function pollDelayMs() {
-  const visible = !!(win && !win.isDestroyed() && win.isVisible());
+  const visible = isWindowVisible();
   if (visible) return Math.max(2, cfg.pollSec) * 1000;
   const idle = Math.max(cfg.pollSec, cfg.idlePollSec || 30);
   const responsive = cfg.gameMode.enabled || cfg.lowNet; // ces features réagissent à la détection → restent vives
@@ -1576,7 +1598,7 @@ else {
     try { app.setAppUserModelId(app.isPackaged ? 'hasu.panel' : 'com.saliox.hasupanel'); } catch {}
     // Au réveil du PC, tout paraît « tombé » quelques instants (réseau pas encore revenu) → on se tait
     // le temps que la machine se remette, sinon rafale d'alertes bidon à chaque sortie de veille.
-    try { require('electron').powerMonitor.on('resume', () => { quietUntil = Date.now() + ALERT_QUIET_RESUME_MS; log('réveil PC → alertes en silence 2 min'); }); } catch {}
+    try { powerMonitor.on('resume', () => { quietUntil = Date.now() + ALERT_QUIET_RESUME_MS; log('réveil PC → alertes en silence 2 min'); }); } catch {}
     // Les bots pm2 connus obtiennent une entrée de config par défaut à la première vue.
     tray = new Tray(trayIcon(false));
     tray.on('double-click', () => showWindow());
@@ -1589,7 +1611,7 @@ else {
       const from = cfg.updatedFrom; cfg.updatedFrom = ''; saveCfg();
       log('retour après MAJ auto :', from, '→', app.getVersion());
       setTimeout(() => {
-        try { const { Notification } = require('electron'); if (Notification.isSupported()) new Notification({ title: 'Hasu Panel mis à jour', body: `Version ${from} → ${app.getVersion()}. Rien à faire, tout a repris tout seul.` }).show(); } catch {}
+        try { if (Notification.isSupported()) new Notification({ title: 'Hasu Panel mis à jour', body: `Version ${from} → ${app.getVersion()}. Rien à faire, tout a repris tout seul.` }).show(); } catch {}
       }, 4000);
     }
     probeToolchain().then((t) => { toolchain = t; }).catch(() => {}); // détecte Node/pm2 (guide si absent)

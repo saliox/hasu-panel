@@ -298,7 +298,7 @@ document.addEventListener('click', async (e) => {
     let r; try { r = await window.panel.testAlert(); } catch { r = null; }
     if (s) s.textContent = r && r.ok
       ? ` ✅ envoyé (${r.webhook ? 'webhook Discord' : 'pas de webhook'}${r.toast ? ' + notification Windows' : ''})`
-      : ' ❌ échec';
+      : ` ❌ ${(r && r.error) || 'échec'}`;
     t.disabled = false;
     return;
   }
