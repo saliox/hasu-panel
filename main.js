@@ -1065,10 +1065,15 @@ const applyAutoLaunch = (fromToggle = false) => {
 };
 
 // ---------- Rich Presence Discord ----------
-// Affiche sur ton profil Discord « 🤖 Gère X bots en ligne » (+ état mode jeu). Nécessite un Client ID
-// d'Application Discord (portail développeur) — collé dans les réglages, ou via l'env HASU_DISCORD_APP_ID.
+// Affiche sur ton profil Discord « 🤖 Gère X bots en ligne » (+ état mode jeu).
+// Application Discord du panel, utilisée PAR DÉFAUT : la Rich Presence marche donc immédiatement,
+// sans rien coller dans les réglages — y compris chez un ami qui installe le panel.
+// Un « Application ID » Discord est un identifiant PUBLIC (il transite dans chaque payload de présence
+// et est visible par tous) : rien de sensible ici, contrairement au secret client ou à un token de bot.
+// Reste surchargeable : réglage du panel, ou variable d'env HASU_DISCORD_APP_ID (pour ta propre appli).
+const DEFAULT_DISCORD_APP_ID = '889167252790857788';
 let rpcStart = Date.now(), lastRpc = '';
-const rpcAppId = () => (process.env.HASU_DISCORD_APP_ID || cfg.discordAppId || '').trim();
+const rpcAppId = () => (process.env.HASU_DISCORD_APP_ID || cfg.discordAppId || DEFAULT_DISCORD_APP_ID).trim();
 const startRpc = () => {
   const id = rpcAppId();
   if (cfg.discordRpc !== false && id) { rpc.start(id); updateRpc(true); } else rpc.stop();

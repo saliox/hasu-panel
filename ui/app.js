@@ -202,7 +202,7 @@ const aboutHTML = () => {
   <h3>🔋 Économe en ressources</h3>
   <p>Le panel tourne 24h/24 sans se faire remarquer : quand il est <b>réduit dans la zone de notification</b>, il <b>ralentit sa surveillance</b> et arrête de calculer l'affichage inutile. Dès que tu rouvres la fenêtre, tout redevient instantané. (Si le mode jeu ou le faible usage internet est actif, il reste réactif pour ne rien rater.)</p>
   <h3>🎮 Ta présence Discord</h3>
-  <p>Option « Rich Presence » : ton profil Discord peut afficher <b>« 🤖 Gère X bots en ligne »</b> (et le jeu en cours). Purement décoratif, désactivable dans ⚙️ Réglages.</p>
+  <p>Option « Rich Presence » : ton profil Discord affiche <b>« 🤖 Gère X bots en ligne »</b> (et le jeu en cours). <b>Rien à configurer</b> — il suffit que Discord soit ouvert. Purement décoratif, désactivable dans ⚙️ Réglages.</p>
   <h3>🧰 Sur un PC neuf (chez un ami)</h3>
   <p>Les bots ont besoin de <b>Node.js</b> et <b>pm2</b>. Si l'un des deux manque, le panel le <b>détecte</b> et propose le bouton qui va bien (« Télécharger Node.js » ou « Installer pm2 ») au lieu d'afficher une liste vide.</p>
   <h3>📁 Bon à savoir</h3>
