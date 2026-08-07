@@ -156,10 +156,12 @@ const decideAlert = (prev, cur, ctx = {}) => {
 
 // ---------- Fenêtre ----------
 // Taille d'ouverture calculée d'après la zone de travail réelle (barre des tâches exclue).
-const computeDefaultBounds = (workArea, min = { w: 900, h: 600 }) => {
+const computeDefaultBounds = (workArea, min = { w: 1000, h: 680 }) => {
   const wa = workArea || { x: 0, y: 0, width: 1280, height: 860 };
-  const w = Math.min(Math.max(1100, Math.min(1800, Math.round(wa.width * 0.82))), wa.width);
-  const h = Math.min(Math.max(760, Math.min(1150, Math.round(wa.height * 0.86))), wa.height);
+  // Planchers relevés (1100x760 → 1250x820) et parts d'écran augmentées (0,82/0,86 → 0,86/0,90) :
+  // sur un 1920 l'ancienne formule donnait 1574x888, encore petit à l'usage. Défaut = GRANDE fenêtre.
+  const w = Math.min(Math.max(1250, Math.min(1800, Math.round(wa.width * 0.86))), wa.width);
+  const h = Math.min(Math.max(820, Math.min(1150, Math.round(wa.height * 0.90))), wa.height);
   return {
     width: Math.max(w, Math.min(min.w, wa.width)), height: Math.max(h, Math.min(min.h, wa.height)),
     x: wa.x + Math.round((wa.width - w) / 2), y: wa.y + Math.round((wa.height - h) / 2),
@@ -185,6 +187,27 @@ const pollDelayFor = (visible, cfg) => {
   if (visible) return pollSec * 1000;
   const idle = Math.max(pollSec, idlePollSec);
   return ((cfg.gameMode && cfg.gameMode.enabled) || cfg.lowNet ? Math.min(idle, 15) : idle) * 1000;
+};
+
+// ---------- Notes de version ----------
+// PIÈGE : electron-updater (provider GitHub) renvoie `releaseNotes` en **HTML** (il le lit du flux
+// releases.atom, où GitHub a déjà converti le markdown) — et parfois un tableau {version, note}.
+// On en fait des lignes de TEXTE : le renderer les insère via textContent, donc aucun HTML ne survit
+// (et aucun risque d'injection depuis le contenu d'une release).
+const cleanNotes = (raw, maxLines = 8) => {
+  if (!raw) return [];
+  const html = Array.isArray(raw)
+    ? raw.map((n) => (n && n.note) || '').join('\n')
+    : String(raw);
+  const text = html
+    .replace(/<\s*(li)[^>]*>/gi, '\n• ')                      // puces
+    .replace(/<\s*\/(p|div|h[1-6]|ul|ol|li|tr)\s*>/gi, '\n')  // fins de bloc
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')                                   // toutes les autres balises
+    .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');                                   // & en DERNIER (sinon double décodage)
+  return text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, maxLines);
 };
 
 // ---------- Petit son de notification (généré, pas de fichier externe) ----------
@@ -229,7 +252,7 @@ const makeChimeWav = ({ amplitude = 0.10, sampleRate = 44100, notes = [[880, 0.1
 };
 
 module.exports = {
-  makeChimeWav,
+  makeChimeWav, cleanNotes,
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,

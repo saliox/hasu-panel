@@ -65,10 +65,36 @@
   @keyframes armpulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
   .upd-bar { height: 8px; background: #12141d; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-top: 6px; max-width: 360px; }
   .upd-bar-fill { height: 100%; background: var(--accent); border-radius: 6px; transition: width .2s ease; }
+
+  /* Carte de mise à jour — EN HAUT de la fenêtre : tout le parcours (dispo → téléchargement → install)
+     se fait ici, plus besoin d'aller le chercher dans ⚙️ Réglages. */
+  .updcard { margin: 14px 0 0; border: 1px solid #3b4270; border-radius: 12px; padding: 13px 15px;
+             background: linear-gradient(135deg, #1c2040 0%, #191c2a 62%); position: relative; overflow: hidden; }
+  .updcard.hidden { display: none; }
+  .updcard::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); }
+  .updcard.ready { border-color: #2f6b45; background: linear-gradient(135deg, #16301f 0%, #191c2a 62%); }
+  .updcard.ready::before { background: var(--ok); }
+  .updcard.err { border-color: #6b3336; background: linear-gradient(135deg, #2c1a1c 0%, #191c2a 62%); }
+  .updcard.err::before { background: var(--err); }
+  .updcard-head { display: flex; align-items: center; gap: 11px; }
+  .updcard-ico { font-size: 21px; line-height: 1; }
+  .updcard-ttl { font-size: 14px; font-weight: 600; }
+  .updcard-ver { color: var(--mut); font-size: 12px; margin-top: 2px; }
+  .updcard-act { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+  .updcard-notes { margin-top: 10px; color: #b9c0d8; font-size: 12.5px; line-height: 1.65; }
+  .updcard-why { margin-top: 8px; color: var(--mut); font-size: 11.5px; }
+  .updcard .upd-bar { max-width: none; margin-top: 10px; height: 9px; }
+  .updcard-prog { display: flex; justify-content: space-between; gap: 10px; color: var(--mut); font-size: 11.5px; margin-top: 5px; }
+  .upd-bar-fill.live { background: linear-gradient(90deg, var(--accent), #8a95ff, var(--accent)); background-size: 200% 100%; animation: updflow 1.5s linear infinite; }
+  @keyframes updflow { to { background-position: -200% 0; } }
+  .btn.big { padding: 7px 14px; font-size: 13px; font-weight: 600; }
+  .updcard.ready .btn.primary { background: var(--ok); border-color: var(--ok); }
+  .updcard.ready .btn.primary:hover { background: #46b96e; }
 </style>
 </head>
 <body>
   <h1>🛡️ Hasu Panel <span class="sub">gestion des bots pm2 · mode jeu</span> <button class="btn about-btn" id="about-btn">ℹ️ À propos</button></h1>
+  <div id="updcard" class="updcard hidden"></div>
   <div id="banner" class="banner">Chargement…</div>
 
   <div class="grid">

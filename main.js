@@ -67,12 +67,12 @@ const setupAutoUpdate = () => {
   // Pousse chaque changement d'état MAJ au renderer EN DIRECT (progression du téléchargement
   // sans attendre le prochain sondage) + garde lastUpdateStatus pour le polling/panel:status.
   const pushUpd = (s) => { lastUpdateStatus = s; try { if (win && !win.isDestroyed()) win.webContents.send('update-status', s); } catch {} };
-  autoUpdater.on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version }); log('MAJ disponible :', i?.version); });
+  autoUpdater.on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version, notes: cleanNotes(i?.releaseNotes) }); log('MAJ disponible :', i?.version); });
   autoUpdater.on('update-not-available', () => { pushUpd({ state: 'uptodate' }); });
   autoUpdater.on('download-progress', (p) => { pushUpd({ state: 'downloading', percent: Math.round(p?.percent || 0), bps: p?.bytesPerSecond || 0, transferred: p?.transferred || 0, total: p?.total || 0, version: lastUpdateStatus?.version }); });
   autoUpdater.on('update-downloaded', (i) => {
     updateReady = true; updateReadyAt = Date.now(); updateReadyVersion = i?.version || '';
-    pushUpd({ state: 'downloaded', version: i?.version });
+    pushUpd({ state: 'downloaded', version: i?.version, notes: cleanNotes(i?.releaseNotes) });
     log('MAJ téléchargée :', i?.version, '→ sera appliquée dès que ce sera sans risque');
     // Prévenir discrètement : jusqu'ici une nouvelle version arrivait en SILENCE (visible seulement
     // en ouvrant les réglages). Une seule notification par version, et jamais pendant une partie.
@@ -249,9 +249,13 @@ const loadCfg = () => {
       autoApplyUpdates: raw.autoApplyUpdates !== false,
       // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
       // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
-      winBounds: (raw.winBounds && ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(raw.winBounds[k])))
+      // MIGRATION `winSizeV2` : les versions ≤ 1.9.2 ouvraient une petite fenêtre, et cette taille a été
+      // MÉMORISÉE — elle repassait donc devant la nouvelle taille calculée à chaque lancement. On oublie
+      // les bornes mémorisées UNE SEULE FOIS ; tout redimensionnement fait ensuite est respecté.
+      winSizeV2: true,
+      winBounds: (raw.winSizeV2 === true && raw.winBounds && ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(raw.winBounds[k])))
         ? { x: raw.winBounds.x, y: raw.winBounds.y, width: raw.winBounds.width, height: raw.winBounds.height } : null,
-      winMaximized: raw.winMaximized === true,
+      winMaximized: raw.winSizeV2 === true && raw.winMaximized === true,
       updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
@@ -1208,7 +1212,7 @@ const updateTray = () => {
 };
 
 // ---------- Fenêtre ----------
-const WIN_MIN_W = 900, WIN_MIN_H = 600; // source unique : bornes minimales de la fenêtre
+const WIN_MIN_W = 1000, WIN_MIN_H = 680; // source unique : bornes minimales de la fenêtre
 
 // Taille d'ouverture : 1020x760 en dur, c'était minuscule sur un grand écran (et immense sur un petit
 // portable). On dimensionne donc d'après l'écran RÉEL : ~82 % de la zone de travail (barre des tâches

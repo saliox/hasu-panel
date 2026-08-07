@@ -29,6 +29,84 @@ let updBusy = false, updMsg = ''; // état du bouton « Vérifier les mises à j
 // Dernier HTML rendu pour chaque zone : on ne réécrit le DOM que si le contenu a réellement changé.
 let lastBotsHtml = null, lastBannerHtml = null, lastGamesHtml = null, lastSuggestHtml = null;
 
+// ---------- Carte de mise à jour (haut de fenêtre) ----------
+// Tout le parcours de MAJ se fait ICI, sans aller le chercher dans ⚙️ Réglages. Deux sources
+// l'alimentent : l'event `update-status` poussé en direct par le main (progression fluide, ~10×/s)
+// et le sondage `panel:status` toutes les 3 s (blockers + réglage auto, qui ne transitent pas par l'event).
+const upd = { s: null, ready: false, blockers: [], auto: true, current: '', dismissed: '', sawDl: false };
+let lastUpdHtml = null, lastUpdCls = null;
+
+const fmtBps = (b) => b >= 1e6 ? (b / 1e6).toFixed(1) + ' Mo/s' : Math.max(0, Math.round(b / 1e3)) + ' Ko/s';
+const fmtMo = (b) => (b / 1e6).toFixed(b < 1e7 ? 1 : 0) + ' Mo';
+
+const paintUpdCard = () => {
+  const box = $('updcard');
+  if (!box) return;
+  const s = upd.s || {};
+  const ver = s.version || '';
+  const head = (ico, ttl, act) =>
+    `<div class="updcard-head"><span class="updcard-ico">${ico}</span><div><div class="updcard-ttl">${ttl}</div>`
+    + (ver ? `<div class="updcard-ver">${esc(upd.current || '?')} → <b>${esc(ver)}</b></div>` : '')
+    + `</div>${act ? `<div class="updcard-act">${act}</div>` : ''}</div>`;
+  const notes = (s.notes || []).length
+    ? `<div class="updcard-notes">${s.notes.map((n) => `<div>${esc(n)}</div>`).join('')}</div>` : '';
+
+  let cls = 'updcard', html = '';
+  if (upd.dismissed && upd.dismissed === ver) {
+    // « Plus tard » : on s'efface, mais l'installation automatique, elle, suit son cours.
+  } else if (s.state === 'downloading') {
+    const pct = Math.max(0, Math.min(100, Math.round(s.percent || 0)));
+    html = head('⬇️', 'Téléchargement de la mise à jour…', `<b style="font-size:15px">${pct}%</b>`)
+      + `<div class="upd-bar"><div class="upd-bar-fill live" style="width:${pct}%"></div></div>`
+      + `<div class="updcard-prog"><span>${s.bps ? esc(fmtBps(s.bps)) : ''}</span>`
+      + `<span>${(s.transferred && s.total) ? `${esc(fmtMo(s.transferred))} / ${esc(fmtMo(s.total))}` : ''}</span></div>`;
+  } else if (upd.ready || s.state === 'downloaded') {
+    cls += ' ready';
+    // « fenêtre ouverte » est TOUJOURS dans les blockers tant que tu regardes l'écran : l'afficher tel quel
+    // ferait croire à un blocage. On l'exprime en clair et on ne liste que les autres raisons.
+    const others = (upd.blockers || []).filter((b) => b !== 'fenêtre ouverte');
+    const why = upd.auto === false
+      ? 'Installation automatique désactivée — applique-la quand tu veux.'
+      : others.length
+        ? `Elle s'installera toute seule dès que possible — en attente : ${esc(others.join(', '))}.`
+        : 'Elle s\'installera toute seule dès que tu fermeras cette fenêtre.';
+    html = head('✅', 'Mise à jour prête à être installée',
+      '<button class="btn primary big" data-upd="apply">Installer et redémarrer</button>'
+      + '<button class="btn" data-upd="later" title="Masquer cette carte">Plus tard</button>')
+      + notes + `<div class="updcard-why">${why}</div>`;
+  } else if (s.state === 'available') {
+    html = head('🎉', `Nouvelle version disponible`, '<span style="color:var(--mut);font-size:12px">préparation…</span>') + notes;
+  } else if (s.state === 'error' && upd.sawDl) {
+    // Une erreur de simple vérification (PC hors ligne) ne mérite pas une bannière rouge plein écran :
+    // on ne l'affiche que si un téléchargement était réellement engagé.
+    cls += ' err';
+    html = head('⚠️', 'Mise à jour interrompue',
+      '<button class="btn" data-upd="retry">Réessayer</button>')
+      + `<div class="updcard-why">${esc(s.message || 'erreur inconnue')}</div>`;
+  }
+
+  if (!html) cls += ' hidden';
+  if (html !== lastUpdHtml) { lastUpdHtml = html; box.innerHTML = html; }
+  if (cls !== lastUpdCls) { lastUpdCls = cls; box.className = cls; }
+};
+
+$('updcard').addEventListener('click', async (e) => {
+  const a = e.target?.dataset?.upd;
+  if (!a) return;
+  if (a === 'apply') {
+    e.target.disabled = true;
+    e.target.textContent = 'Redémarrage…';
+    await window.panel.applyUpdate();
+  } else if (a === 'later') {
+    upd.dismissed = upd.s?.version || '-';
+    paintUpdCard();
+  } else if (a === 'retry') {
+    e.target.disabled = true;
+    upd.s = null; lastUpdHtml = null; paintUpdCard();
+    await window.panel.checkUpdate();
+  }
+});
+
 const render = (st) => {
   cur = st;
   // Bandeau (réécrit seulement s'il change)
@@ -164,6 +242,16 @@ const render = (st) => {
         : '✅ <b>Mise à jour prête</b> — installation automatique imminente…';
   }
   else if (!updBusy && !st.updateReady && !updMsg) $('upd-status').textContent = st.cfg.packaged ? '' : 'ℹ️ L\'auto-update est actif seulement dans la version installée (Setup.exe).';
+
+  // La carte du haut n'apprend les blockers / le réglage auto QUE par ce sondage (l'event n'a que l'état
+  // brut de l'updater). `updateStatus` n'est repris que si on n'a rien : sinon un sondage de 3 s
+  // écraserait une progression plus fraîche et la barre reculerait.
+  upd.ready = !!st.updateReady;
+  upd.blockers = st.updateBlockers || [];
+  upd.auto = st.autoApplyUpdates !== false;
+  upd.current = st.cfg.version || '';
+  if (!upd.s && st.updateStatus) upd.s = st.updateStatus;
+  paintUpdCard();
 };
 
 const refresh = async () => {
@@ -386,9 +474,12 @@ $('upd-apply').addEventListener('click', async () => {
 });
 
 // Progression du téléchargement de la MAJ, poussée EN DIRECT par le main (event update-status).
-const fmtBps = (b) => b >= 1e6 ? (b / 1e6).toFixed(1) + ' Mo/s' : Math.max(0, Math.round(b / 1e3)) + ' Ko/s';
 const renderUpdateStatus = (s) => {
   if (!s) return;
+  upd.s = s;
+  if (s.state === 'downloading' || s.state === 'available') upd.sawDl = true;
+  if (s.state === 'downloaded' && s.version !== upd.dismissed) upd.dismissed = ''; // nouvelle version = on ré-affiche
+  paintUpdCard();
   const st = $('upd-status');
   if (s.state === 'downloading') {
     const pct = Math.max(0, Math.min(100, s.percent || 0));

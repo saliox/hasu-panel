@@ -5,7 +5,39 @@ const assert = require('node:assert/strict');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, computeDefaultBounds, boundsAreVisible, pollDelayFor,
+  cleanNotes,
 } = require('../logic');
+
+// ------------------------------------------------- notes de version (MAJ)
+test('cleanNotes : le HTML de GitHub devient des lignes de texte', () => {
+  const html = '<h2>Nouveautés</h2><ul><li>Son doux sur les alertes</li><li>Carte de MAJ</li></ul><p>Fin</p>';
+  assert.deepEqual(cleanNotes(html), ['Nouveautés', '• Son doux sur les alertes', '• Carte de MAJ', 'Fin']);
+});
+
+test('cleanNotes : entités HTML — & décodé en DERNIER (sinon double décodage)', () => {
+  // Piège : décoder &amp; d'abord transformerait « &amp;lt; » (un < littéral échappé) en vrai « < ».
+  assert.deepEqual(cleanNotes('<p>A &amp;lt;b&amp;gt; B &amp; C</p>'), ['A &lt;b&gt; B & C']);
+  assert.deepEqual(cleanNotes('<p>&quot;x&quot; &#39;y&#39;&nbsp;z</p>'), ['"x" \'y\' z']);
+});
+
+test('cleanNotes : aucune balise ne survit (contenu de release = donnée non fiable)', () => {
+  const out = cleanNotes('<script>alert(1)</script><img src=x onerror=alert(1)><b>gras</b>');
+  assert.equal(out.join('\n').includes('<'), false, 'une balise a survécu');
+  assert.equal(out.join('\n').includes('>'), false);
+});
+
+test('cleanNotes : tableau {version, note} d\'electron-updater', () => {
+  assert.deepEqual(cleanNotes([{ version: '1.9.3', note: '<li>A</li><li>B</li>' }]), ['• A', '• B']);
+});
+
+test('cleanNotes : vide, null, et plafond de lignes', () => {
+  assert.deepEqual(cleanNotes(null), []);
+  assert.deepEqual(cleanNotes(''), []);
+  assert.deepEqual(cleanNotes('<p></p><p>   </p>'), [], 'les lignes vides sont retirées');
+  const long = Array.from({ length: 30 }, (_, i) => `<li>ligne ${i}</li>`).join('');
+  assert.equal(cleanNotes(long).length, 8, 'une release bavarde ne doit pas envahir la carte');
+  assert.equal(cleanNotes(long, 3).length, 3);
+});
 
 // ---------------------------------------------------------------- semverGt
 test('semverGt : comparaison de base', () => {
@@ -174,12 +206,14 @@ test('classifyErrorFr : sans signature connue → dernière ligne tronquée', ()
 // ----------------------------------------------------- fenêtre : dimensions
 test('computeDefaultBounds : grande fenêtre, centrée, qui tient à l\'écran', () => {
   const b = computeDefaultBounds({ x: 0, y: 0, width: 1920, height: 1032 });
-  assert.equal(b.width, 1574); assert.equal(b.height, 888);
+  assert.equal(b.width, 1651); assert.equal(b.height, 929);
   assert.ok(b.x >= 0 && b.y >= 0 && b.x + b.width <= 1920 && b.y + b.height <= 1032);
+  // Le point de la demande : sur un écran courant, l'ouverture doit être GRANDE, pas timide.
+  assert.ok(b.width / 1920 > 0.8 && b.height / 1032 > 0.85, 'fenêtre trop petite à l\'ouverture');
 });
 
 test('computeDefaultBounds : petit écran — la fenêtre ne déborde jamais', () => {
-  // Cas piège : le plancher (760) dépasse la hauteur utile d'un 1280x720.
+  // Cas piège : le plancher (820) dépasse la hauteur utile d'un 1280x720.
   for (const [w, h] of [[1366, 720], [1280, 672], [1024, 600]]) {
     const b = computeDefaultBounds({ x: 0, y: 0, width: w, height: h });
     assert.ok(b.width <= w, `largeur ${b.width} > ${w}`);
