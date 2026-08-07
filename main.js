@@ -39,7 +39,7 @@ const updateBlockers = () => {
   if (busy) b.push('transition mode jeu');                            // une bascule de bots est en cours
   if (actionsInFlight.size) b.push('action bot en cours');
   if (stopAllInFlight) b.push('arrêt global en cours');
-  if (cfg.stoppedByGame.length) b.push('bots coupés par le mode jeu'); // on ne redémarre pas là-dessus
+  if (cfg.stoppedByGame.some((n) => n !== '-')) b.push('bots coupés par le mode jeu'); // '-' = aucune cible // on ne redémarre pas là-dessus
   if (cfg.lowNetApplied) b.push('éco réseau active');
   if (isWindowVisible()) b.push('fenêtre ouverte'); // tu es en train de t'en servir
   if (Date.now() - updateReadyAt < UPDATE_GRACE_MS) b.push('délai de grâce');
@@ -107,8 +107,9 @@ const PS_EXE = (() => {
 // Dossier « data » du bot saliox (drapeaux de coordination panel ↔ bot). Par défaut : <profil>\Desktop\saliox bot\data
 // (résolu via os.homedir → aucun nom d'utilisateur codé en dur). Personnalisable via la variable d'env HASU_SALIOX_DATA.
 const SALIOX_DATA = process.env.HASU_SALIOX_DATA || path.join(require('os').homedir(), 'Desktop', 'saliox bot', 'data');
-// Drapeau lu par le watchdog de saliox : bots coupés VOLONTAIREMENT (mode jeu) → pas d'alerte MP.
-const WATCHDOG_FLAG = path.join(SALIOX_DATA, 'panel_maintenance.json');
+// (L'ancien drapeau `panel_maintenance.json` a été SUPPRIMÉ : le watchdog de saliox qui le lisait est
+// devenu un no-op lors de sa refonte — vérifié, plus aucun consommateur — donc on écrivait un fichier
+// que personne ne lisait, à chaque entrée/sortie de mode jeu.)
 // Drapeau « faible usage internet » lu par saliox (systems/lownet.js) : gros transferts différés pendant le jeu.
 const LOWNET_FLAG = path.join(SALIOX_DATA, 'lownet.json');
 // Crée data\ s'il manque, SINON les écritures de drapeaux ENOENT en silence (mode jeu / faible usage internet
@@ -242,7 +243,7 @@ const loadCfg = () => {
       updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
-      games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : DEFAULT_GAMES,
+      games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : [...DEFAULT_GAMES], // copie : sinon addGame muterait la constante
       stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
       imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
       ignoredExes: Array.isArray(raw.ignoredExes) ? raw.ignoredExes.filter((g) => EXE_RE.test(g)) : [],
@@ -312,6 +313,14 @@ const pm2 = (args) => {
   return pm2Raw(args);
 };
 
+// Relit l'état des bots dans le cache. Le « si pm2 est muet, on garde le dernier état connu » était
+// copié-collé à l'identique en 5 endroits — une seule version ici, pour qu'il ne puisse pas diverger.
+const refreshBots = async () => {
+  const l = await pm2List();
+  if (l) statusCache.bots = l;
+  return l;
+};
+
 // Santé de pm2 : un tableau VIDE peut vouloir dire « aucun bot » OU « pm2 ne répond pas ». Avant, les
 // deux cas se ressemblaient et l'écran affichait « Aucun bot géré » alors que TOUS les bots étaient
 // peut-être morts. On distingue désormais, et le tick garde le dernier état connu quand pm2 est muet.
@@ -337,13 +346,12 @@ const pm2List = async () => {
       memory: p.monit?.memory || 0,
       cpu: p.monit?.cpu || 0,
       pid: Number(p.pid) || 0,
-      // Métadonnées déjà fournies par pm2 et jusqu'ici jetées : chemins de logs (lecture directe,
-      // idée « logs en direct ») et dossier/script du bot (bouton « ouvrir le dossier », fiche bot).
+      // Métadonnées fournies par pm2 et réellement utilisées : chemins de logs (visionneuse) et
+      // dossier du bot (bouton 📂). `script`/`interpreter` étaient sérialisés puis envoyés au renderer
+      // toutes les 3 s sans que rien ne les lise → retirés.
       outLog: p.pm2_env?.pm_out_log_path || '',
       errLog: p.pm2_env?.pm_err_log_path || '',
-      cwd: p.pm2_env?.pm_cwd || '',
-      script: p.pm2_env?.pm_exec_path || '',
-      interpreter: p.pm2_env?.exec_interpreter || ''
+      cwd: p.pm2_env?.pm_cwd || ''
     })).filter((b) => isSafeName(b.name));
   } catch (e) {
     if (pm2Health.ok) pm2Health = { ok: false, since: Date.now(), reason: e.message, lastOkAt: pm2Health.lastOkAt };
@@ -612,29 +620,27 @@ const alertPm2Down = () => {
 // calcule ici l'écart entre l'intention (Auto boot coché, pas arrêté à la main, pas coupé par le jeu)
 // et la réalité — l'UI en fait un bandeau avec un bouton, PAS une réparation automatique (un bot que
 // pm2 a abandonné après ses tentatives ne doit pas être relancé en boucle).
+// Mémorisé sur l'horodatage du cache : le résultat ne peut changer qu'après un nouveau tick, or la
+// fonction était rappelée à CHAQUE panel:status (toutes les 3 s) et à chaque updateTray — soit 3 à 10
+// recalculs identiques par tick, sur le chemin chaud de l'IPC.
+let needFixCache = { at: -1, names: [] };
 const needFix = () => {
   if (!cfg || !cfg.bots || !pm2Health.ok) return [];
-  return statusCache.bots
+  if (needFixCache.at === statusCache.updatedAt) return needFixCache.names;
+  const names = statusCache.bots
     .filter((b) => b.status !== 'online'
       && cfg.bots[b.name] && cfg.bots[b.name].auto !== false && !cfg.bots[b.name].manualStop
       && !cfg.stoppedByGame.includes(b.name))
     .map((b) => b.name);
+  needFixCache = { at: statusCache.updatedAt, names };
+  return names;
 };
 
 // ---------- Détection de jeu (liste de process + PID) ----------
 const listProcs = () => new Promise((resolve) => {
   execFile(SYS('tasklist.exe'), ['/fo', 'csv', '/nh'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
     if (err || !out) return resolve(null);
-    const names = new Set(); const pids = new Map();
-    for (const line of String(out).split('\n')) {
-      const m = line.match(/^"([^"]+)","(\d+)"/);
-      if (!m) continue;
-      const n = m[1].toLowerCase();
-      names.add(n);
-      if (!pids.has(n)) pids.set(n, []);
-      pids.get(n).push(Number(m[2]));
-    }
-    resolve({ names, pids });
+    resolve(parseTasklistCsv(out)); // parsing dans logic.js (testé : casse, PID multiples, lignes invalides)
   });
 });
 
@@ -645,17 +651,9 @@ const listProcs = () => new Promise((resolve) => {
 
 const hasOnlineActivity = (pids) => new Promise((resolve) => {
   if (!Array.isArray(pids) || !pids.length) return resolve(false);
-  execFile('netstat.exe', ['-ano', '-p', 'tcp'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
+  execFile(SYS('netstat.exe'), ['-ano', '-p', 'tcp'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
     if (err || !out) return resolve(false);
-    const set = new Set(pids.map(String));
-    for (const line of String(out).split('\n')) {
-      const t = line.trim().split(/\s+/); // Proto Local Foreign State PID (IPv4 comme IPv6)
-      if (t.length < 5 || t[0].toUpperCase() !== 'TCP' || t[3].toUpperCase() !== 'ESTABLISHED') continue;
-      if (!set.has(t[4])) continue;                          // pas un de nos PID
-      const foreign = t[2].replace(/:[0-9]+$/, '');          // retire le :port final (IPv4 ou [IPv6])
-      if (isPublicIp(foreign)) return resolve(true);
-    }
-    resolve(false);
+    resolve(hasEstablishedPublic(out, pids)); // analyse dans logic.js (testée : LAN, IPv6, autres PID)
   });
 });
 
@@ -777,7 +775,7 @@ const importBot = async (name, script) => {
   cfg.bots[name] = { auto: true, gameStop: false, ...(cfg.bots[name] || {}) };
   saveCfg();
   log('import OK:', name, '←', script);
-  { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
+  await refreshBots();
   return { ok: true };
 };
 
@@ -790,7 +788,7 @@ const removeBot = async (name) => {
   cfg.stoppedByGame = cfg.stoppedByGame.filter((n) => n !== name);
   saveCfg();
   log('retrait:', name);
-  { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
+  await refreshBots();
   return { ok: true };
 };
 
@@ -886,12 +884,6 @@ const runScan = async () => {
   finally { scanning = false; }
 };
 
-// ---------- Drapeau watchdog (saliox) ----------
-const writeFlag = (bots, game) => {
-  try { fs.writeFileSync(WATCHDOG_FLAG, JSON.stringify({ bots, game, since: Date.now() })); } catch (e) { log('writeFlag', e.message); }
-};
-const clearFlag = () => { try { fs.unlinkSync(WATCHDOG_FLAG); } catch {} };
-
 // ---------- Mode jeu ----------
 const enterGameMode = async (game, known) => {
   // `known` = liste déjà lue par le tick juste avant : on évite un 2e `pm2 jlist` (spawn complet) pile
@@ -902,13 +894,14 @@ const enterGameMode = async (game, known) => {
     .filter((b) => b.status === 'online' && (cfg.gameMode.stopAll || cfg.bots[b.name]?.gameStop))
     .map((b) => b.name);
   if (!targets.length) { cfg.stoppedByGame = ['-']; saveCfg(); return; } // marqueur « déjà traité » sans cible
-  // Drapeau AVANT l'arrêt pour que le watchdog de saliox n'alerte pas ; saliox coupé EN DERNIER (il héberge le watchdog).
-  writeFlag(targets, game);
-  targets.sort((a, b) => (a === 'saliox') - (b === 'saliox'));
-  const pidByName = new Map(list.map((b) => [b.name, b.pid]));
-  await stopBotsTree(targets.map((n) => ({ name: n, pid: pidByName.get(n) || 0 }))); // 1 snapshot + 1 grâce pour tous
+  targets.sort((a, b) => (a === 'saliox') - (b === 'saliox')); // saliox coupé EN DERNIER
+  // Mémorisé AVANT de couper : l'arrêt prend plusieurs secondes (grâce + un pm2 stop par bot) et si le
+  // panel meurt dans cet intervalle, rien sur le disque ne dit que ces bots ont été parqués — ils ne
+  // seraient jamais relancés. On écrit d'abord, on coupe ensuite.
   cfg.stoppedByGame = targets;
   saveCfg();
+  const pidByName = new Map(list.map((b) => [b.name, b.pid]));
+  await stopBotsTree(targets.map((n) => ({ name: n, pid: pidByName.get(n) || 0 }))); // 1 snapshot + 1 grâce pour tous
   log('mode jeu ON —', game, '— coupés :', targets.join(', '));
   updateTray();
 };
@@ -917,7 +910,6 @@ const exitGameMode = async () => {
   const names = cfg.stoppedByGame.filter((n) => n !== '-' && isSafeName(n)); // '-' = marqueur « rien à couper »
   names.sort((a, b) => (b === 'saliox') - (a === 'saliox')); // saliox relancé en premier
   for (const n of names) await pm2(['start', n]);
-  clearFlag();
   cfg.stoppedByGame = [];
   saveCfg();
   log('mode jeu OFF — relancés :', names.join(', ') || '(aucun)');
@@ -1103,7 +1095,7 @@ const updateRpc = (force) => {
 };
 
 // ---------- Tray ----------
-let trayBad = false, lastMenuSig = '';
+let trayBad = false, lastMenuSig = '', lastTip = '';
 const trayIcon = (bad) => {
   const p = path.join(__dirname, bad ? 'icon-alert.png' : 'icon.png');
   try {
@@ -1126,7 +1118,7 @@ const updateTray = () => {
   const tip = statusCache.game
     ? `Hasu Panel — 🎮 ${statusCache.game}${statusCache.online ? ' (en ligne)' : ' (solo)'}${stopped.length ? ` · ${stopped.length} bot(s) coupé(s)` : ''}${cfg.lowNetApplied ? ' · 🌐 éco réseau' : ''}`
     : `Hasu Panel — ${statusCache.bots.filter((b) => b.status === 'online').length}/${statusCache.bots.length} bots en ligne`;
-  tray.setToolTip(tip);
+  if (tip !== lastTip) { lastTip = tip; tray.setToolTip(tip); } // même garde que le menu : pas d'appel natif inutile
   // Le menu du tray ne change QUE si son contenu change (mode jeu, MAJ prête). Avant, on reconstruisait
   // un Menu natif à CHAQUE tick (toutes les 10-30 s, 24h/24) pour un résultat identique — travail inutile
   // côté Windows, et ça pouvait refermer le menu sous le curseur pile au moment où tu cliquais.
@@ -1153,11 +1145,8 @@ const WIN_MIN_W = 900, WIN_MIN_H = 600; // source unique : bornes minimales de l
 // exclue), borné pour rester lisible. Si tu redimensionnes/déplaces la fenêtre, on retient ton choix.
 const defaultBounds = () => {
   try {
-    const wa = screen.getPrimaryDisplay().workArea; // exclut la barre des tâches
-    const w = Math.max(1100, Math.min(1800, Math.round(wa.width * 0.82)));
-    const h = Math.max(760, Math.min(1150, Math.round(wa.height * 0.86)));
-    return { width: Math.min(w, wa.width), height: Math.min(h, wa.height),
-      x: wa.x + Math.round((wa.width - Math.min(w, wa.width)) / 2), y: wa.y + Math.round((wa.height - Math.min(h, wa.height)) / 2) };
+    // Calcul dans logic.js (testé : petits écrans, 4K, écran secondaire, débordement).
+    return computeDefaultBounds(screen.getPrimaryDisplay().workArea, { w: WIN_MIN_W, h: WIN_MIN_H });
   } catch { return { width: 1280, height: 860 }; }
 };
 // Des bornes mémorisées ne sont réutilisées que si elles restent VISIBLES sur un écran actuellement
@@ -1167,14 +1156,8 @@ const savedBounds = () => {
   // Seuils alignés sur minWidth/minHeight de la fenêtre (900x600) : ils divergeaient (860x560),
   // donc des bornes mémorisées trop petites étaient acceptées puis silencieusement corrigées par Electron.
   if (!b || !Number.isFinite(b.width) || !Number.isFinite(b.height) || b.width < WIN_MIN_W || b.height < WIN_MIN_H) return null;
-  try {
-    const visible = screen.getAllDisplays().some((d) => {
-      const a = d.workArea;
-      return Number.isFinite(b.x) && Number.isFinite(b.y)
-        && b.x + b.width > a.x + 80 && b.x < a.x + a.width - 80 && b.y + 40 > a.y && b.y < a.y + a.height - 40;
-    });
-    return visible ? b : null;
-  } catch { return null; }
+  // Test de visibilité dans logic.js (testé : moniteur débranché, fenêtre à cheval, écran absent).
+  try { return boundsAreVisible(b, screen.getAllDisplays()) ? b : null; } catch { return null; }
 };
 const showWindow = () => {
   if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); restartPoll(true); return; } // restaure depuis le tray + rafraîchit tout de suite
@@ -1361,7 +1344,7 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
     else if (action === 'restart') { await stopTree(name); r = await pm2(['start', name]); }
     else r = await pm2([action, name]);
     schedulePm2Save(); // ce que tu vois = ce qui reviendra au prochain démarrage du PC
-    { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
+    await refreshBots();
     return { ok: r.ok };
   } finally {
     actionsInFlight.delete(name);
@@ -1380,7 +1363,7 @@ ipcMain.handle('panel:stopAll', async () => {
     for (const b of online) { const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false }); c.manualStop = true; }
     if (online.length) saveCfg();
     await stopBotsTree(online.map((b) => ({ name: b.name, pid: b.pid }))); // 1 snapshot + 1 grâce pour tous
-    { const _l = await pm2List(); if (_l) statusCache.bots = _l; } // pm2 muet -> on garde le dernier etat connu
+    await refreshBots();
     log('stopAll:', online.length, 'bot(s)');
     return { ok: true, stopped: online.length };
   } finally { stopAllInFlight = false; }
@@ -1417,19 +1400,30 @@ ipcMain.handle('panel:logs', async (_e, { name, which } = {}) => {
 ipcMain.handle('panel:openFolder', (_e, { name, what } = {}) => {
   if (!isSafeName(String(name || ''))) return { ok: false };
   const bot = statusCache.bots.find((b) => b.name === name);
-  const target = what === 'logs' ? path.dirname(bot?.outLog || '') : (bot?.cwd || '');
-  if (!target) return { ok: false };
+  // path.dirname('') renvoie '.' — une valeur TRUTHY : la garde ci-dessous ne se déclenchait pas et
+  // l'Explorateur s'ouvrait sur le dossier courant du panel au lieu de signaler l'absence de chemin.
+  const src = what === 'logs' ? (bot && bot.outLog) : (bot && bot.cwd);
+  const target = src ? (what === 'logs' ? path.dirname(src) : src) : '';
+  if (!target || target === '.') return { ok: false, error: 'Dossier inconnu (pm2 ne l\'a pas fourni).' };
   try { shell.openPath(target); return { ok: true }; } catch { return { ok: false }; }
 });
 
 // « Remettre en ordre » : relance les bots qui DEVRAIENT être en ligne (bandeau). Volontaire, borné.
+let fixAllInFlight = false;
 ipcMain.handle('panel:fixAll', async () => {
-  const names = needFix();
-  for (const n of names) { const c = cfg.bots[n]; if (c) c.manualStop = false; await pm2(['start', n]); }
-  if (names.length) { saveCfg(); schedulePm2Save(5000); }
-  { const _l = await pm2List(); if (_l) statusCache.bots = _l; }
-  log('remise en ordre :', names.join(', ') || '(rien)');
-  return { ok: true, started: names.length };
+  // Garde d'exécution comme panel:action et panel:stopAll : le rendu reconstruit le bandeau toutes
+  // les 3 s avec un bouton RÉACTIVÉ, donc un 2e clic lançait une seconde vague de `pm2 start` en
+  // parallèle sur les mêmes bots.
+  if (fixAllInFlight) return { ok: false, error: 'déjà en cours' };
+  fixAllInFlight = true;
+  try {
+    const names = needFix();
+    for (const n of names) { const c = cfg.bots[n]; if (c) c.manualStop = false; await pm2(['start', n]); }
+    if (names.length) { saveCfg(); schedulePm2Save(5000); }
+    await refreshBots();
+    log('remise en ordre :', names.join(', ') || '(rien)');
+    return { ok: true, started: names.length };
+  } finally { fixAllInFlight = false; }
 });
 
 ipcMain.handle('panel:setBot', (_e, { name, key, value } = {}) => {
@@ -1533,7 +1527,14 @@ ipcMain.handle('panel:installPm2', async () => {
     });
   });
   log('install pm2 :', r.ok ? 'OK' : 'échec', r.out.slice(0, 200));
-  if (r.ok) { toolchain = await probeToolchain(); await tick().catch(() => {}); } // re-sonde + rafraîchit la liste
+  if (r.ok) {
+    toolchain = await probeToolchain();
+    // Re-résout AUSSI le lanceur : sans ça, pm2Direct restait false pour toute la session après une
+    // installation depuis l'app, et chaque appel repassait par cmd.exe — le chemin qui laisse un
+    // process fantôme à chaque sondage, 24h/24.
+    resolvePm2Runner();
+    await tick().catch(() => {}); // rafraîchit la liste
+  }
   return { ok: r.ok && toolchain.pm2, out: r.out };
 });
 
@@ -1544,13 +1545,8 @@ ipcMain.handle('panel:installPm2', async () => {
 // (~15 s) même caché, sinon un jeu qui se lance mettrait jusqu'à 30 s à couper les bots.
 let pollTimer = null;
 let pollEpoch = 0;
-function pollDelayMs() {
-  const visible = isWindowVisible();
-  if (visible) return Math.max(2, cfg.pollSec) * 1000;
-  const idle = Math.max(cfg.pollSec, cfg.idlePollSec || 30);
-  const responsive = cfg.gameMode.enabled || cfg.lowNet; // ces features réagissent à la détection → restent vives
-  return (responsive ? Math.min(idle, 15) : idle) * 1000;
-}
+// Cadence dans logic.js (testée : visible, tray, mode jeu/éco réseau actifs, sondage lent).
+const pollDelayMs = () => pollDelayFor(isWindowVisible(), cfg);
 function restartPoll(immediate = false) {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   const epoch = ++pollEpoch; // invalide toute chaîne de timers précédente (évite deux boucles en parallèle)
@@ -1639,13 +1635,21 @@ else {
     // Coupe la boucle de sondage AVANT le nettoyage (bump d'époque + clear du timer) : sinon un tick
     // pourrait piloter les mêmes bots (pm2 start/stop) en même temps que exitGameMode = état final indéterminé.
     pollEpoch++; if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    // Le nettoyage est plafonné : chaque `pm2 start` a un timeout de 60 s, donc 4 bots parqués + un
+    // démon pm2 bloqué = une app sans fenêtre qui refusait de se fermer pendant des MINUTES. Pire,
+    // quand la fermeture vient d'une mise à jour, l'installeur commençait à remplacer les fichiers
+    // pendant que l'app tournait encore. Au-delà du délai, on quitte quoi qu'il arrive.
+    const QUIT_DEADLINE_MS = 12000;
+    const finish = () => { if (!cleanedUp) { cleanedUp = true; app.quit(); } };
+    const deadline = setTimeout(() => { log('fermeture : nettoyage trop long → sortie forcée'); finish(); }, QUIT_DEADLINE_MS);
+    deadline.unref?.();
     (async () => {
       // Laisse une transition de mode jeu déjà en cours se terminer (max ~6 s) avant de nettoyer.
       for (let i = 0; i < 30 && busy; i++) await new Promise((r) => setTimeout(r, 200));
-      try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.length) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
+      try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.some((n) => n !== '-')) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
       try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
-      cleanedUp = true;
-      app.quit();
+      clearTimeout(deadline);
+      finish();
     })();
   });
   app.on('window-all-closed', () => { /* on reste dans le tray */ });

@@ -46,7 +46,8 @@
       "validators.js",
       "logic.js",
       "ui/**",
-      "icon.png"
+      "icon.png",
+      "icon-alert.png"
     ]
   },
   "dependencies": {

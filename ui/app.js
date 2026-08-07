@@ -26,24 +26,26 @@ let cur = null; // dernier statut reçu
 const pendingBots = new Set();
 let pending = false;
 let updBusy = false, updMsg = ''; // état du bouton « Vérifier les mises à jour »
+// Dernier HTML rendu pour chaque zone : on ne réécrit le DOM que si le contenu a réellement changé.
+let lastBotsHtml = null, lastBannerHtml = null, lastGamesHtml = null, lastSuggestHtml = null;
 
 const render = (st) => {
   cur = st;
-  // Bandeau
+  // Bandeau (réécrit seulement s'il change)
   const banner = $('banner');
+  let bannerHtml, bannerCls;
   if (st.game) {
-    banner.className = 'banner game';
+    bannerCls = 'banner game';
     const lownet = st.lowNetActive ? ' · 🌐 faible usage internet actif' : '';
-    if (!st.online && st.cfg.gameMode.soloSkip !== false) {
-      banner.innerHTML = `🎮 <b>${esc(st.game)}</b> détecté — partie <b>solo</b> : les bots restent en ligne${lownet}`;
-    } else {
-      banner.innerHTML = `🎮 <b>Jeu en ligne :</b>&nbsp;${esc(st.game)}${st.stoppedByGame.length ? ` — <b>${st.stoppedByGame.length} bot(s) coupé(s)</b> (relance auto à la fin de la partie)` : st.cfg.gameMode.enabled ? ' — aucun bot à couper' : ' — mode jeu désactivé'}${lownet}`;
-    }
+    bannerHtml = (!st.online && st.cfg.gameMode.soloSkip !== false)
+      ? `🎮 <b>${esc(st.game)}</b> détecté — partie <b>solo</b> : les bots restent en ligne${lownet}`
+      : `🎮 <b>Jeu en ligne :</b>&nbsp;${esc(st.game)}${st.stoppedByGame.length ? ` — <b>${st.stoppedByGame.length} bot(s) coupé(s)</b> (relance auto à la fin de la partie)` : st.cfg.gameMode.enabled ? ' — aucun bot à couper' : ' — mode jeu désactivé'}${lownet}`;
   } else {
     const on = st.bots.filter((b) => b.status === 'online').length;
-    banner.className = 'banner';
-    banner.innerHTML = `🟢 <b>${on}/${st.bots.length}</b>&nbsp;bots en ligne — aucun jeu détecté`;
+    bannerCls = 'banner';
+    bannerHtml = `🟢 <b>${on}/${st.bots.length}</b>&nbsp;bots en ligne — aucun jeu détecté`;
   }
+  if (bannerHtml !== lastBannerHtml) { lastBannerHtml = bannerHtml; banner.className = bannerCls; banner.innerHTML = bannerHtml; }
 
   // Bots — deux catégories : les bots « maison » et les bots importés par l'utilisateur.
   const imported = st.cfg.imported || [];
@@ -99,10 +101,15 @@ const render = (st) => {
       + '<div class="row" style="margin-top:8px"><button class="btn primary" id="fix-all">Remettre en ordre</button>'
       + '<span id="fix-status" style="color:var(--mut);font-size:12px"></span></div></div>'
     : '';
-  $('bots').innerHTML = (!health.ok ? empty : '') + fixBanner + (
+  // La liste n'est RECONSTRUITE que si son contenu a changé. Avant, `innerHTML` était réassigné toutes
+  // les 3 s même à l'identique : ~16 éléments par bot détruits/recréés en boucle (rendu logiciel, GPU
+  // coupé), et surtout les cases à cocher perdaient focus et survol à chaque cycle — d'où le clic qui
+  // « ne prend pas » quand le rafraîchissement tombe au mauvais moment.
+  const botsHtml = (!health.ok ? empty : '') + fixBanner + (
     main.map(botRow).join('') +
     (imps.length ? `<div class="sechead">🧩 Bots importés</div>${imps.map(botRow).join('')}` : '')
   ) || (fixBanner + empty);
+  if (botsHtml !== lastBotsHtml) { lastBotsHtml = botsHtml; $('bots').innerHTML = botsHtml; }
 
   // Mode jeu
   $('gm-enabled').checked = !!st.cfg.gameMode.enabled;
@@ -113,10 +120,12 @@ const render = (st) => {
   if (document.activeElement !== $('gm-grace')) $('gm-grace').value = st.cfg.gameMode.graceSec;
   $('gm-stopped').textContent = st.stoppedByGame.length ? `⏸ Coupés par le mode jeu : ${st.stoppedByGame.join(', ')}` : '';
 
-  // Jeux
-  $('games').innerHTML = st.cfg.games.map((g) => `<span class="chip">${esc(g)} <b data-rm="${esc(g)}" title="Retirer">✕</b></span>`).join('');
+  // Jeux (liste stable : ~16 puces reconstruites toutes les 3 s pour rien avant cette garde)
+  const gamesHtml = st.cfg.games.map((g) => `<span class="chip">${esc(g)} <b data-rm="${esc(g)}" title="Retirer">✕</b></span>`).join('');
+  if (gamesHtml !== lastGamesHtml) { lastGamesHtml = gamesHtml; $('games').innerHTML = gamesHtml; }
   const disc = st.cfg.discovered || [];
-  $('game-suggest').innerHTML = disc.length ? `🔍 ${disc.length} jeu(x) installé(s) non listé(s) — <button class="btn" id="game-suggest-btn" style="font-size:11.5px;padding:2px 8px">Voir les suggestions</button>` : '';
+  const suggestHtml = disc.length ? `🔍 ${disc.length} jeu(x) installé(s) non listé(s) — <button class="btn" id="game-suggest-btn" style="font-size:11.5px;padding:2px 8px">Voir les suggestions</button>` : '';
+  if (suggestHtml !== lastSuggestHtml) { lastSuggestHtml = suggestHtml; $('game-suggest').innerHTML = suggestHtml; }
 
   // Réglages
   $('set-autolaunch').checked = !!st.cfg.autoLaunch;
