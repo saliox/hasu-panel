@@ -89,7 +89,7 @@ const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 // Validateurs de sécurité (anti-injection, anti-pollution de prototype, IP publique) : extraits dans
 // un module SANS Electron pour être testables unitairement (`npm test`). Toute modification de ces
 // règles doit faire passer test/validators.test.js — elles gardent une frontière de sécurité.
-const { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp } = require('./validators');
+const { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp, isSafePm2Arg, isDiscordWebhookUrl } = require('./validators');
 // Logique PURE (décisions, parsing, calculs) : extraite pour la même raison — c'est ce module qui est
 // couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
 const {
@@ -215,29 +215,48 @@ const log = (...a) => {
 const cfgPath = () => path.join(app.getPath('userData'), 'panel-config.json');
 // Entier borné : un scalaire corrompu/édité à la main (ex. pollSec="10x" → NaN) transformerait la
 // boucle de sondage en boucle folle (spawn continu de tasklist/pm2). On coerce + clamp comme les setters.
+// Une étape de normalisation qui échoue ne doit PAS effacer tout le reste de la config (avant : un
+// seul champ inattendu dans le fichier faisait retomber bots/games/webhook/fenêtre... sur les défauts).
+const safeField = (fn, fallback) => { try { return fn(); } catch { return fallback; } };
 const loadCfg = () => {
   const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
   let raw;
   try { raw = read(cfgPath()); }
   catch { try { raw = read(cfgPath() + '.bak'); log('config: fichier principal illisible → repli sur .bak'); } catch { return JSON.parse(JSON.stringify(DEFAULTS)); } }
-  try {
-    // bots : RECONSTRUIT depuis {} — on ne garde que les clés sûres avec une valeur-objet (anti type-confusion :
-    // un tableau ou une chaîne passait le typeof==='object' d'avant et corrompait les lookups par bot).
-    const gm = raw.gameMode && typeof raw.gameMode === 'object' ? raw.gameMode : {};
-    const bots = {};
+  // bots : RECONSTRUIT depuis {} — on ne garde que les clés sûres avec une valeur-objet (anti type-confusion :
+  // un tableau ou une chaîne passait le typeof==='object' d'avant et corrompait les lookups par bot).
+  const bots = safeField(() => {
+    const out = {};
     if (raw.bots && typeof raw.bots === 'object' && !Array.isArray(raw.bots)) {
       for (const k of Object.keys(raw.bots)) {
         const v = raw.bots[k];
-        if (isSafeName(k) && v && typeof v === 'object' && !Array.isArray(v)) bots[k] = { auto: v.auto !== false, gameStop: !!v.gameStop, manualStop: v.manualStop === true };
+        if (isSafeName(k) && v && typeof v === 'object' && !Array.isArray(v)) out[k] = { auto: v.auto !== false, gameStop: !!v.gameStop, manualStop: v.manualStop === true };
       }
     }
+    return out;
+  }, {});
+  const gameMode = safeField(() => {
+    const gm = raw.gameMode && typeof raw.gameMode === 'object' ? raw.gameMode : {};
+    return {
+      enabled: gm.enabled === true, stopAll: gm.stopAll === true, soloSkip: gm.soloSkip !== false,
+      graceSec: clampInt(gm.graceSec, 10, 3600, DEFAULTS.gameMode.graceSec),
+    };
+  }, { ...DEFAULTS.gameMode });
+  // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
+  // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
+  // MIGRATION `winSizeV2` : les versions ≤ 1.9.2 ouvraient une petite fenêtre, et cette taille a été
+  // MÉMORISÉE — elle repassait donc devant la nouvelle taille calculée à chaque lancement. On oublie
+  // les bornes mémorisées UNE SEULE FOIS ; tout redimensionnement fait ensuite est respecté.
+  const winFields = safeField(() => ({
+    winBounds: (raw.winSizeV2 === true && raw.winBounds && ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(raw.winBounds[k])))
+      ? { x: raw.winBounds.x, y: raw.winBounds.y, width: raw.winBounds.width, height: raw.winBounds.height } : null,
+    winMaximized: raw.winSizeV2 === true && raw.winMaximized === true,
+  }), { winBounds: null, winMaximized: false });
+  try {
     return {
       ...DEFAULTS, ...raw,
       bots,
-      gameMode: {
-        enabled: gm.enabled === true, stopAll: gm.stopAll === true, soloSkip: gm.soloSkip !== false,
-        graceSec: clampInt(gm.graceSec, 10, 3600, DEFAULTS.gameMode.graceSec),
-      },
+      gameMode,
       // Scalaires bornés (mêmes bornes que setSetting/setGameMode) — un NaN ne peut plus casser la boucle.
       pollSec: clampInt(raw.pollSec, 5, 120, DEFAULTS.pollSec),
       idlePollSec: clampInt(raw.idlePollSec, 15, 300, DEFAULTS.idlePollSec),
@@ -247,24 +266,17 @@ const loadCfg = () => {
       alerts: raw.alerts !== false, alertToast: raw.alertToast !== false,
       alertSound: raw.alertSound !== false, alertVolume: clampInt(raw.alertVolume, 1, 100, 10),
       autoApplyUpdates: raw.autoApplyUpdates !== false,
-      // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
-      // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
-      // MIGRATION `winSizeV2` : les versions ≤ 1.9.2 ouvraient une petite fenêtre, et cette taille a été
-      // MÉMORISÉE — elle repassait donc devant la nouvelle taille calculée à chaque lancement. On oublie
-      // les bornes mémorisées UNE SEULE FOIS ; tout redimensionnement fait ensuite est respecté.
       winSizeV2: true,
-      winBounds: (raw.winSizeV2 === true && raw.winBounds && ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(raw.winBounds[k])))
-        ? { x: raw.winBounds.x, y: raw.winBounds.y, width: raw.winBounds.width, height: raw.winBounds.height } : null,
-      winMaximized: raw.winSizeV2 === true && raw.winMaximized === true,
+      ...winFields,
       updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
-      games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : [...DEFAULT_GAMES], // copie : sinon addGame muterait la constante
-      stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
-      imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
-      ignoredExes: Array.isArray(raw.ignoredExes) ? raw.ignoredExes.filter((g) => EXE_RE.test(g)) : [],
-      discovered: Array.isArray(raw.discovered) ? raw.discovered.filter((g) => g && EXE_RE.test(g.exe || '')) : [],
-      discordAppId: (typeof raw.discordAppId === 'string' && raw.discordAppId.trim()) ? raw.discordAppId.trim().slice(0, 40) : DEFAULTS.discordAppId
+      games: safeField(() => Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : [...DEFAULT_GAMES], [...DEFAULT_GAMES]), // copie : sinon addGame muterait la constante
+      stoppedByGame: safeField(() => Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [], []),
+      imported: safeField(() => Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [], []),
+      ignoredExes: safeField(() => Array.isArray(raw.ignoredExes) ? raw.ignoredExes.filter((g) => EXE_RE.test(g)) : [], []),
+      discovered: safeField(() => Array.isArray(raw.discovered) ? raw.discovered.filter((g) => g && EXE_RE.test(g.exe || '')) : [], []),
+      discordAppId: safeField(() => (typeof raw.discordAppId === 'string' && raw.discordAppId.trim()) ? raw.discordAppId.trim().slice(0, 40) : DEFAULTS.discordAppId, DEFAULTS.discordAppId)
     };
   } catch { return JSON.parse(JSON.stringify(DEFAULTS)); }
 };
@@ -325,7 +337,7 @@ const pm2Raw = (args) => new Promise((resolve) => {
 });
 // Variante courante : uniquement des mots-clés/noms sûrs (start/stop/restart/jlist/save/… + noms pm2).
 const pm2 = (args) => {
-  if (!args.every((a) => /^[A-Za-z0-9_.-]+$/.test(a))) return Promise.resolve({ ok: false, out: 'arg refusé' });
+  if (!args.every(isSafePm2Arg)) return Promise.resolve({ ok: false, out: 'arg refusé' });
   return pm2Raw(args);
 };
 
@@ -515,8 +527,8 @@ let quietUntil = 0, alertTimes = [], lastAlertAt = new Map(), prevStatus = new M
 
 const postWebhook = (url, payload) => new Promise((resolve) => {
   try {
+    if (!isDiscordWebhookUrl(url)) return resolve(false); // webhook Discord uniquement
     const u = new URL(url);
-    if (u.protocol !== 'https:' || !/(^|\.)discord\.com$/i.test(u.hostname)) return resolve(false); // webhook Discord uniquement
     const body = Buffer.from(JSON.stringify(payload), 'utf8');
     const req = require('https').request({ method: 'POST', hostname: u.hostname, path: u.pathname + u.search,
       headers: { 'Content-Type': 'application/json', 'Content-Length': body.length }, timeout: 10000 },
@@ -1536,8 +1548,8 @@ ipcMain.handle('panel:removeGame', (_e, exe) => {
 
 ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'autoLaunch') { cfg.autoLaunch = !!value; saveCfg(); applyAutoLaunch(true); return { ok: true }; }
-  if (key === 'pollSec') { cfg.pollSec = Math.max(5, Math.min(120, Math.floor(Number(value) || 10))); saveCfg(); restartPoll(); return { ok: true }; }
-  if (key === 'idlePollSec') { cfg.idlePollSec = Math.max(15, Math.min(300, Math.floor(Number(value) || 30))); saveCfg(); restartPoll(); return { ok: true }; }
+  if (key === 'pollSec') { cfg.pollSec = clampInt(value, 5, 120, 10); saveCfg(); restartPoll(); return { ok: true }; }
+  if (key === 'idlePollSec') { cfg.idlePollSec = clampInt(value, 15, 300, 30); saveCfg(); restartPoll(); return { ok: true }; }
   if (key === 'lowNet') { cfg.lowNet = !!value; saveCfg(); return { ok: true }; } // le tick applique/retire tout seul
   if (key === 'scanAuto') { cfg.scanAuto = !!value; saveCfg(); return { ok: true }; }
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }

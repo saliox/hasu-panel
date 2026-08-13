@@ -4,7 +4,7 @@
 // injection cmd) — les tests les figent.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp } = require('../validators');
+const { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp, isSafePm2Arg, isDiscordWebhookUrl } = require('../validators');
 
 test('isSafeName : accepte les noms pm2 légitimes', () => {
   for (const n of ['saliox', 'mon-bot', 'bot_2', 'a', 'bot.prod', 'A1.b-c_d']) {
@@ -63,9 +63,22 @@ test('isPublicIp : IPv6 locales refusées, globales acceptées, crochets tolér�
   for (const ip of ['::1', '::', 'fe80::1', 'fc00::1', 'fd12:3456::1']) {
     assert.equal(isPublicIp(ip), false, ip);
   }
-  for (const ip of ['2001:4860:4860::8888', '2606:4700::1111', '[2001:db8::1]']) {
+  for (const ip of ['2001:4860:4860::8888', '2606:4700::1111', '[2606:4700::1111]']) {
     assert.equal(isPublicIp(ip), true, ip);
   }
+});
+
+test('isPublicIp : plages nouvellement exclues (multicast, réservé, CGNAT, IPv6 documentation)', () => {
+  for (const ip of ['224.0.0.1', '239.255.255.250', '240.0.0.1', '255.0.0.1', '100.64.0.1', '100.127.255.255',
+    '2001:db8::1', '[2001:db8::1]', '2001:0db8::1']) {
+    assert.equal(isPublicIp(ip), false, ip);
+  }
+  // Bornes hors plage CGNAT (100.64.0.0/10 seulement) restent publiques
+  for (const ip of ['100.63.255.255', '100.128.0.0', '223.255.255.255']) {
+    assert.equal(isPublicIp(ip), true, ip);
+  }
+  // 2001:db80::/32 n'est PAS 2001:db8::/32 (piège de préfixe) : reste publique
+  assert.equal(isPublicIp('2001:db80::1'), true);
 });
 
 test('isPublicIp : IPv4 mappée en IPv6 suit les règles IPv4', () => {
@@ -76,5 +89,33 @@ test('isPublicIp : IPv4 mappée en IPv6 suit les règles IPv4', () => {
 test('isPublicIp : entrées invalides refusées', () => {
   for (const ip of ['', null, undefined, 'localhost', 'not-an-ip']) {
     assert.equal(isPublicIp(ip), false, String(ip));
+  }
+});
+
+test('isSafePm2Arg : accepte les arguments pm2 légitimes (alphanumérique/point/tiret/underscore)', () => {
+  for (const a of ['start', 'stop', 'restart', 'jlist', 'save', 'mon-bot', 'bot_2', 'A1.b-c_d', '0']) {
+    assert.equal(isSafePm2Arg(a), true, a);
+  }
+});
+
+test('isSafePm2Arg : rejette espaces, métacaractères shell et non-string', () => {
+  for (const a of ['mon bot', 'a;b', 'a`b`', 'a$(whoami)', 'a|b', 'a&b', 'a<b', 'a>b', 'a"b', "a'b",
+    'C:\\bots\\a.js', '', null, undefined, 42, {}, []]) {
+    assert.equal(isSafePm2Arg(a), false, String(a));
+  }
+});
+
+test('isDiscordWebhookUrl : accepte discord.com et ses sous-domaines en https', () => {
+  for (const u of ['https://discord.com/api/webhooks/123/abc', 'https://x.discord.com/api/webhooks/123/abc',
+    'https://canary.discord.com/api/webhooks/123/abc', 'https://ptb.discord.com/api/webhooks/1/a']) {
+    assert.equal(isDiscordWebhookUrl(u), true, u);
+  }
+});
+
+test('isDiscordWebhookUrl : rejette http, hôtes non-Discord, sosies et entrées invalides', () => {
+  for (const u of ['http://discord.com/api/webhooks/123/abc', 'https://discord.com.evil.com/x',
+    'https://evil.com/discord.com', 'https://discordapp.com/api/webhooks/1/a', 'https://notdiscord.com/x',
+    'ftp://discord.com/x', 'not-a-url', '', null, undefined, 42]) {
+    assert.equal(isDiscordWebhookUrl(u), false, String(u));
   }
 });

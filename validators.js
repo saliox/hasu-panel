@@ -19,6 +19,21 @@ const RESERVED_NAMES = new Set([
 ]);
 const isSafeName = (n) => typeof n === 'string' && NAME_RE.test(n) && !RESERVED_NAMES.has(n.toLowerCase());
 
+// Liste blanche des arguments passés à pm2 (repli cmd.exe compris) : uniquement les caractères
+// qu'on utilise réellement pour un nom/chemin pm2 (id, nom, action) — jamais d'espace/quote/métacaractère.
+const PM2_ARG_RE = /^[A-Za-z0-9_.-]+$/;
+const isSafePm2Arg = (a) => typeof a === 'string' && PM2_ARG_RE.test(a);
+
+// Le webhook d'alerte ne doit JAMAIS pouvoir pointer ailleurs que Discord (SSRF) : https uniquement,
+// et hostname discord.com ou un sous-domaine (ex. canary.discord.com) — pas "discord.com.evil.com".
+const DISCORD_WEBHOOK_HOST_RE = /(^|\.)discord\.com$/i;
+const isDiscordWebhookUrl = (url) => {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' && DISCORD_WEBHOOK_HOST_RE.test(u.hostname);
+  } catch { return false; }
+};
+
 // Métacaractères cmd interdits dans un chemin. Depuis le passage de pm2 en invocation
 // directe (sans shell), ce filtre n'est plus la seule barrière — il reste en défense
 // en profondeur pour le repli shell (layout npm inhabituel) et contre les chemins pièges.
@@ -30,18 +45,23 @@ const isPublicIp = (raw) => {
   const ip = String(raw || '').replace(/^\[|\]$/g, '').toLowerCase(); // retire les crochets IPv6
   if (ip.includes('.') && !ip.includes(':')) { // IPv4
     if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.|255\.)/.test(ip)) return false;
+    const b1 = Number(ip.split('.')[0]);
     const b2 = Number(ip.split('.')[1]);
     if (ip.startsWith('172.') && b2 >= 16 && b2 <= 31) return false;
+    if (ip.startsWith('100.') && b2 >= 64 && b2 <= 127) return false; // CGNAT (100.64.0.0/10)
+    if (b1 >= 224 && b1 <= 239) return false;               // multicast (224.0.0.0/4)
+    if (b1 >= 240) return false;                             // réservé (240.0.0.0/4, dont broadcast 255.x déjà exclu au-dessus)
     return true;
   }
   if (ip.includes(':')) { // IPv6
     if (ip === '::1' || ip === '::') return false;          // loopback / non spécifié
     if (ip.startsWith('fe80')) return false;                // link-local
     if (/^f[cd]/.test(ip)) return false;                    // unique-local (fc00::/7)
+    if (/^2001:0?db8(:|$)/.test(ip)) return false;            // documentation (2001:db8::/32)
     if (ip.startsWith('::ffff:')) return isPublicIp(ip.slice(7)); // IPv4 mappée
     return true;                                            // adresse IPv6 globale
   }
   return false;
 };
 
-module.exports = { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp };
+module.exports = { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp, isSafePm2Arg, isDiscordWebhookUrl };
