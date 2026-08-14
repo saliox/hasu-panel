@@ -270,7 +270,13 @@ const loadCfg = () => {
 };
 // Écriture ATOMIQUE : temp + rename (jamais de fichier tronqué si crash/coupure en plein write), + un .bak
 // restauré par loadCfg si le principal devient illisible. Sinon un write interrompu réinitialisait TOUT aux DEFAULTS.
+// Incrémenté à CHAQUE saveCfg() : sert de « version de config » pour invalider needFixCache (voir plus
+// bas) dès qu'un handler IPC modifie cfg.bots (ex: panel:setBot / Auto boot) en dehors d'un tick — sinon
+// le cache, keyé uniquement sur statusCache.updatedAt, peut renvoyer une liste de bots périmée jusqu'au
+// prochain tick (jusqu'à pollSec/idlePollSec de retard sur le bandeau « N bot(s) devraient être en ligne »).
+let cfgVersion = 0;
 const saveCfg = () => {
+  cfgVersion++;
   try {
     const file = cfgPath(), tmp = file + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
@@ -692,16 +698,18 @@ const alertPm2Down = () => {
 // Mémorisé sur l'horodatage du cache : le résultat ne peut changer qu'après un nouveau tick, or la
 // fonction était rappelée à CHAQUE panel:status (toutes les 3 s) et à chaque updateTray — soit 3 à 10
 // recalculs identiques par tick, sur le chemin chaud de l'IPC.
-let needFixCache = { at: -1, names: [] };
+let needFixCache = { at: -1, cfgVer: -1, names: [] };
 const needFix = () => {
   if (!cfg || !cfg.bots || !pm2Health.ok) return [];
-  if (needFixCache.at === statusCache.updatedAt) return needFixCache.names;
+  // Keyé sur statusCache.updatedAt (nouveau tick) ET cfgVersion (config changée entre deux ticks, ex :
+  // panel:setBot qui coche/décoche « Auto boot ») — sinon le cache reste périmé jusqu'au tick suivant.
+  if (needFixCache.at === statusCache.updatedAt && needFixCache.cfgVer === cfgVersion) return needFixCache.names;
   const names = statusCache.bots
     .filter((b) => b.status !== 'online'
       && cfg.bots[b.name] && cfg.bots[b.name].auto !== false && !cfg.bots[b.name].manualStop
       && !cfg.stoppedByGame.includes(b.name))
     .map((b) => b.name);
-  needFixCache = { at: statusCache.updatedAt, names };
+  needFixCache = { at: statusCache.updatedAt, cfgVer: cfgVersion, names };
   return names;
 };
 
@@ -1203,7 +1211,13 @@ const updateTray = () => {
     { label: 'Ouvrir le panel', click: () => showWindow() },
     {
       label: `Mode jeu : ${cfg.gameMode.enabled ? 'activé ✔' : 'désactivé'}`,
-      click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); updateTray(); }
+      click: async () => {
+        cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg();
+        if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) {
+          try { await withGameLock(exitGameMode); } catch (e) { log('tray exitGameMode', e.message); }
+        }
+        updateTray();
+      }
     },
     ...(updateReady ? [{ label: '🔄 Mise à jour prête — appliquer & redémarrer', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
     { type: 'separator' },
@@ -1514,7 +1528,9 @@ ipcMain.handle('panel:setGameMode', async (_e, patch = {}) => {
   if (typeof patch.soloSkip === 'boolean') cfg.gameMode.soloSkip = patch.soloSkip;
   if (Number.isFinite(patch.graceSec)) cfg.gameMode.graceSec = Math.max(10, Math.min(3600, Math.floor(patch.graceSec)));
   saveCfg();
-  if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); // désactivation = tout relancer
+  if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) {
+    try { await withGameLock(exitGameMode); } catch (e) { log('panel:setGameMode exitGameMode', e.message); } // désactivation = tout relancer
+  }
   updateTray();
   return { ok: true };
 });

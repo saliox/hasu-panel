@@ -25,14 +25,36 @@ const scheduleReconnect = () => {
   reconnectT = setTimeout(() => { reconnectT = null; connect(0); }, 15000); // Discord peut être fermé → on retente
 };
 
+// Délai max pour qu'un `net.connect()` sur le pipe aboutisse (connect OU error). Sans ça, un pipe qui
+// existe mais ne répond jamais (process Discord suspendu, pipe fantôme) laisse la socket "pending" pour
+// toujours : `connecting` reste bloqué à true, et le garde-fou de scheduleReconnect() (`connecting ||
+// ready`) empêche alors TOUTE tentative future — Rich Presence morte jusqu'au redémarrage de l'appli.
+const CONNECT_TIMEOUT_MS = 7000;
+
 const connect = (i) => {
   if (!clientId || connecting || ready) return;
   if (i > 9) { scheduleReconnect(); return; } // aucun pipe 0..9 → Discord absent, on réessaiera
   connecting = true;
   const s = net.connect(`\\\\?\\pipe\\discord-ipc-${i}`);
-  const nextPipe = () => { try { s.destroy(); } catch {} connecting = false; connect(i + 1); };
+  let settled = false; // protège contre un double traitement (timeout après error/connect, etc.)
+  const connectTimer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    try { s.destroy(); } catch {}
+    connecting = false; // ne JAMAIS laisser `connecting` bloqué → scheduleReconnect() doit rester débloquable
+    scheduleReconnect();
+  }, CONNECT_TIMEOUT_MS);
+  const nextPipe = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(connectTimer);
+    try { s.destroy(); } catch {} connecting = false; connect(i + 1);
+  };
   s.once('error', nextPipe);
   s.once('connect', () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(connectTimer);
     s.removeListener('error', nextPipe);
     sock = s; connecting = false;
     s.on('error', () => { cleanup(); scheduleReconnect(); });
@@ -47,7 +69,9 @@ const connect = (i) => {
       ready = true;
       if (wanted) push(wanted);
     });
-    try { s.write(encode(0, { v: 1, client_id: clientId })); } catch { nextPipe(); }
+    // Post-connect : `settled` est déjà à true ici (la course connect/error/timeout est résolue), donc
+    // nextPipe() (qui vérifie `settled`) n'agirait plus — on rejoue son comportement directement.
+    try { s.write(encode(0, { v: 1, client_id: clientId })); } catch { try { s.destroy(); } catch {} connecting = false; connect(i + 1); }
   });
 };
 

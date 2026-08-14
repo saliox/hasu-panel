@@ -518,26 +518,36 @@ document.addEventListener('input', (e) => {
 
 document.addEventListener('change', async (e) => {
   const t = e.target;
-  if (t.dataset?.bot && t.dataset?.key) { await window.panel.setBot(t.dataset.bot, t.dataset.key, t.checked); await refresh(); return; }
-  if (t.id === 'gm-enabled') { await window.panel.setGameMode({ enabled: t.checked }); await refresh(); return; }
-  if (t.id === 'gm-all' || t.id === 'gm-some') { await window.panel.setGameMode({ stopAll: $('gm-all').checked }); await refresh(); return; }
-  if (t.id === 'gm-grace') { await window.panel.setGameMode({ graceSec: Number(t.value) }); await refresh(); return; }
-  if (t.id === 'gm-soloskip') { await window.panel.setGameMode({ soloSkip: t.checked }); await refresh(); return; }
-  if (t.id === 'gm-lownet') { await window.panel.setSetting('lowNet', t.checked); await refresh(); return; }
-  if (t.id === 'set-autolaunch') { await window.panel.setSetting('autoLaunch', t.checked); await refresh(); return; }
-  if (t.id === 'set-poll') { await window.panel.setSetting('pollSec', Number(t.value)); await refresh(); return; }
-  if (t.id === 'set-scanauto') { await window.panel.setSetting('scanAuto', t.checked); await refresh(); return; }
-  if (t.id === 'set-rpc') { await window.panel.setSetting('discordRpc', t.checked); await refresh(); return; }
-  if (t.id === 'set-rpc-id') { await window.panel.setSetting('discordAppId', t.value.trim()); await refresh(); return; }
-  if (t.id === 'set-autoupdate') { await window.panel.setSetting('autoApplyUpdates', t.checked); await refresh(); return; }
-  if (t.id === 'set-alerts') { await window.panel.setSetting('alerts', t.checked); await refresh(); return; }
-  if (t.id === 'set-alert-toast') { await window.panel.setSetting('alertToast', t.checked); await refresh(); return; }
-  if (t.id === 'set-alert-sound') { await window.panel.setSetting('alertSound', t.checked); await refresh(); return; }
-  if (t.id === 'set-alert-volume') { await window.panel.setSetting('alertVolume', Number(t.value)); await refresh(); return; }
-  if (t.id === 'set-alert-webhook') {
-    const r = await window.panel.setSetting('alertWebhook', t.value.trim());
-    const s = $('alert-status'); if (s) s.textContent = r && r.ok ? ' ✅ enregistré' : ` ❌ ${(r && r.error) || 'refusé'}`;
-    await refresh(); return;
+  // Si l'appel IPC (setBot/setGameMode/setSetting) rejette, on ne doit ni planter silencieusement ni
+  // sauter le refresh() qui suit : sans ce filet, la checkbox reste sur son nouvel état visuel (posé
+  // par le navigateur avant même que ce handler ne s'exécute) alors que le backend n'a rien changé —
+  // désynchro silencieuse entre l'UI et l'état réel. Le catch journalise et refait un refresh() : il
+  // redessine les checkboxes depuis l'état serveur réel, ce qui les remet à leur vraie valeur.
+  try {
+    if (t.dataset?.bot && t.dataset?.key) { await window.panel.setBot(t.dataset.bot, t.dataset.key, t.checked); await refresh(); return; }
+    if (t.id === 'gm-enabled') { await window.panel.setGameMode({ enabled: t.checked }); await refresh(); return; }
+    if (t.id === 'gm-all' || t.id === 'gm-some') { await window.panel.setGameMode({ stopAll: $('gm-all').checked }); await refresh(); return; }
+    if (t.id === 'gm-grace') { await window.panel.setGameMode({ graceSec: Number(t.value) }); await refresh(); return; }
+    if (t.id === 'gm-soloskip') { await window.panel.setGameMode({ soloSkip: t.checked }); await refresh(); return; }
+    if (t.id === 'gm-lownet') { await window.panel.setSetting('lowNet', t.checked); await refresh(); return; }
+    if (t.id === 'set-autolaunch') { await window.panel.setSetting('autoLaunch', t.checked); await refresh(); return; }
+    if (t.id === 'set-poll') { await window.panel.setSetting('pollSec', Number(t.value)); await refresh(); return; }
+    if (t.id === 'set-scanauto') { await window.panel.setSetting('scanAuto', t.checked); await refresh(); return; }
+    if (t.id === 'set-rpc') { await window.panel.setSetting('discordRpc', t.checked); await refresh(); return; }
+    if (t.id === 'set-rpc-id') { await window.panel.setSetting('discordAppId', t.value.trim()); await refresh(); return; }
+    if (t.id === 'set-autoupdate') { await window.panel.setSetting('autoApplyUpdates', t.checked); await refresh(); return; }
+    if (t.id === 'set-alerts') { await window.panel.setSetting('alerts', t.checked); await refresh(); return; }
+    if (t.id === 'set-alert-toast') { await window.panel.setSetting('alertToast', t.checked); await refresh(); return; }
+    if (t.id === 'set-alert-sound') { await window.panel.setSetting('alertSound', t.checked); await refresh(); return; }
+    if (t.id === 'set-alert-volume') { await window.panel.setSetting('alertVolume', Number(t.value)); await refresh(); return; }
+    if (t.id === 'set-alert-webhook') {
+      const r = await window.panel.setSetting('alertWebhook', t.value.trim());
+      const s = $('alert-status'); if (s) s.textContent = r && r.ok ? ' ✅ enregistré' : ` ❌ ${(r && r.error) || 'refusé'}`;
+      await refresh(); return;
+    }
+  } catch (err) {
+    console.error('change handler', t.id || t.dataset?.bot, err);
+    try { await refresh(); } catch {} // resynchronise l'UI (checkboxes redessinées depuis l'état réel) même si l'appel a échoué
   }
 });
 $('game-add-btn').addEventListener('click', async () => {
