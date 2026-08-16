@@ -71,10 +71,22 @@ const setupAutoUpdate = () => {
   // Pousse chaque changement d'état MAJ au renderer EN DIRECT (progression du téléchargement
   // sans attendre le prochain sondage) + garde lastUpdateStatus pour le polling/panel:status.
   pushUpd = (s) => { lastUpdateStatus = s; try { if (win && !win.isDestroyed()) win.webContents.send('update-status', s); } catch {} };
-  autoUpdater.on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version, notes: cleanNotes(i?.releaseNotes) }); log('MAJ disponible :', i?.version); });
-  autoUpdater.on('update-not-available', () => { pushUpd({ state: 'uptodate' }); });
-  autoUpdater.on('download-progress', (p) => { pushUpd({ state: 'downloading', percent: Math.round(p?.percent || 0), bps: p?.bytesPerSecond || 0, transferred: p?.transferred || 0, total: p?.total || 0, version: lastUpdateStatus?.version }); });
-  autoUpdater.on('update-downloaded', (i) => {
+  // `emit` est SYNCHRONE : une exception dans un de ces écouteurs remonte dans doCheckForUpdates, qui
+  // rejette AVANT la ligne lançant le téléchargement. C'est exactement ce qui a coupé toute la chaîne
+  // de mise à jour en 1.10.0 (un identifiant non importé) : le panel ne pouvait plus jamais se
+  // corriger lui-même. On isole donc chaque écouteur — mais en JOURNALISANT et en AFFICHANT l'erreur,
+  // jamais en l'avalant : un échec muet ici serait le pire des deux mondes.
+  const on = (evt, fn) => autoUpdater.on(evt, (...a) => {
+    try { fn(...a); }
+    catch (e) {
+      log('écouteur updater', evt, '—', e.message);
+      try { pushUpd({ state: 'error', message: `Erreur interne du panel (${evt}) : ${e.message}` }); } catch {}
+    }
+  });
+  on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version, notes: cleanNotes(i?.releaseNotes) }); log('MAJ disponible :', i?.version); });
+  on('update-not-available', () => { pushUpd({ state: 'uptodate' }); });
+  on('download-progress', (p) => { pushUpd({ state: 'downloading', percent: Math.round(p?.percent || 0), bps: p?.bytesPerSecond || 0, transferred: p?.transferred || 0, total: p?.total || 0, version: lastUpdateStatus?.version }); });
+  on('update-downloaded', (i) => {
     updateReady = true; updateReadyAt = Date.now(); updateReadyVersion = i?.version || '';
     pushUpd({ state: 'downloaded', version: i?.version, notes: cleanNotes(i?.releaseNotes) });
     log('MAJ téléchargée :', i?.version, '→ sera appliquée dès que ce sera sans risque');
@@ -83,7 +95,7 @@ const setupAutoUpdate = () => {
     notifyUpdateReady(i?.version);
     updateTray();
   });
-  autoUpdater.on('error', (e) => { pushUpd({ state: 'error', message: e?.message || String(e) }); log('updater erreur :', e?.message || e); });
+  on('error', (e) => { pushUpd({ state: 'error', message: e?.message || String(e) }); log('updater erreur :', e?.message || e); });
   const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
   setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
   setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)
@@ -190,6 +202,9 @@ let sessionOnline = false; // le jeu détecté a une vraie connexion Internet (s
 // de « aucun jeu » : les décisions coûteuses ou dérangeantes (scan disque, application d'une MAJ)
 // ne doivent pas se déclencher sur une ignorance prise pour une absence.
 let gameUnknown = true, gameUnknownSince = Date.now();
+// Faux tant que le premier tick n'a pas rendu son verdict : l'écran doit dire « recherche en cours »
+// et non « aucun bot géré », qui est un mensonge inquiétant quand les bots tournent très bien.
+let firstTickDone = false;
 // …mais BORNÉ. Si tasklist échoue durablement, bloquer les mises à jour pour toujours serait pire que
 // le mal qu'on évite (c'est exactement le mode de panne « panel figé sur une vieille version »).
 // Au-delà de ce délai, on cesse de s'en servir comme motif de blocage.
@@ -1198,7 +1213,14 @@ const tick = async () => {
     || isWindowVisible()
     || (updateReady && cfg.autoApplyUpdates !== false)
     || scanDu;
-  const procs = needProcScan ? await listProcs() : null;
+  // Les deux lectures les plus chères du tick — tasklist (~437 ms) et pm2 jlist (~457 ms) — étaient
+  // SÉQUENTIELLES : ~900 ms avant que la liste des bots existe, à chaque tick et surtout au démarrage,
+  // où c'est exactement le temps pendant lequel la fenêtre paraît vide. Elles sont indépendantes,
+  // donc menées de front : ~460 ms au lieu de ~900, sans rien changer au comportement.
+  const [procs, freshBots] = await Promise.all([
+    needProcScan ? listProcs() : Promise.resolve(null),
+    pm2List(),
+  ]);
   // « On n'a pas regardé » et « on a regardé, pas de jeu » ne sont pas la même chose : sans ce
   // drapeau, un échec de tasklist passait pour une absence de jeu. Il est dérivé de `procs`, pas de
   // `needProcScan`, précisément pour couvrir ce cas.
@@ -1210,9 +1232,9 @@ const tick = async () => {
     // jeu coupait les bots malgré l'option « ignorer les jeux solo ».
     statusCache.game = null; sessionOnline = false; statusCache.online = false;
   }
-  // UNE seule lecture pm2 par tick, faite AVANT le bloc mode jeu : elle sert et à la bascule et à
-  // l'affichage. Avant, un lancement de jeu déclenchait deux `pm2 jlist` coup sur coup (tick + enterGameMode).
-  const freshBots = await pm2List();
+  // UNE seule lecture pm2 par tick (lancée ci-dessus, en parallèle du scan de process) : elle sert et
+  // à la bascule du mode jeu et à l'affichage. Avant, un lancement de jeu déclenchait deux
+  // `pm2 jlist` coup sur coup (tick + enterGameMode).
   if (freshBots) statusCache.bots = freshBots; // pm2 muet → on garde le dernier état connu
   if (procs) {
     const hit = cfg.games.find((g) => procs.names.has(g.toLowerCase()));
@@ -1270,6 +1292,11 @@ const tick = async () => {
   } else alertPm2Down(); // pm2 lui-même muet = TOUS les bots en danger, il faut le dire
   maybeAutoApplyUpdate(); // s'installe tout seul dès que c'est sans risque (plus besoin de fermer le panel à la main)
   statusCache.updatedAt = Date.now();
+  firstTickDone = true;
+  // La fenêtre s'ouvre AVANT la fin du premier tick et ne se rafraîchissait qu'à son sondage de 3 s :
+  // au démarrage, la liste des bots pouvait donc rester vide plusieurs secondes après qu'elle était
+  // connue. On prévient l'écran dès que l'état change, il n'attend plus son tour.
+  try { if (win && !win.isDestroyed() && isWindowVisible()) win.webContents.send('status-changed'); } catch {}
   updateTray();
   updateRpc(); // met à jour la Rich Presence Discord (« gère X bots en ligne »)
 
@@ -1524,6 +1551,7 @@ ipcMain.handle('panel:status', () => ({
   // Nombre d'alertes différées par le plafond horaire, sur la dernière heure : sans ça, l'écran
   // affichait « alertes activées » alors que certaines n'étaient jamais parties.
   alertsSuppressed: (alertsSuppressed = alertsSuppressed.filter((t) => Date.now() - t < 3600 * 1000)).length,
+  ready: firstTickDone,           // false = première mesure en cours (≠ « aucun bot »)
   cfgWriteFailed,                 // les réglages ne s'écrivent plus sur le disque → bandeau (jamais silencieux)
   cfgPath: cfgWriteFailed ? cfgPath() : '', // le chemin n'est utile que pour dire OÙ regarder
   needFix: needFix(),             // bots « Auto boot » éteints sans que tu l'aies demandé

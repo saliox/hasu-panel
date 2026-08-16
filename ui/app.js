@@ -190,6 +190,10 @@ const render = (st) => {
       + 'Clique pour l\'installer automatiquement (sans droits administrateur).'
       + '<div class="row" style="margin-top:8px"><button class="btn primary" id="tc-pm2">Installer pm2</button>'
       + '<span id="tc-pm2-status" style="color:var(--mut);font-size:12px"></span></div></div>';
+  } else if (!st.ready) {
+    // Au démarrage, la fenêtre s'ouvre avant la fin de la première mesure. Afficher « aucun bot »
+    // à ce moment-là est un mensonge inquiétant : on dit ce qui se passe réellement.
+    empty = '<div class="hint">⏳ Recherche des bots en cours…</div>';
   } else {
     empty = '<div class="hint">Aucun bot géré par pm2 pour l\'instant. Importe un bot avec « ➕ Importer » ci-dessus.</div>';
   }
@@ -273,7 +277,22 @@ const render = (st) => {
         ? `✅ <b>Mise à jour prête</b> — elle s'installera toute seule dès que possible.<br><span style="opacity:.75">En attente : ${esc(bl.join(', '))}.</span> Tu peux aussi l'appliquer maintenant.`
         : '✅ <b>Mise à jour prête</b> — installation automatique imminente…';
   }
-  else if (!updBusy && !st.updateReady && !updMsg) $('upd-status').textContent = st.cfg.packaged ? '' : 'ℹ️ L\'auto-update est actif seulement dans la version installée (Setup.exe).';
+  // …et on n'écrase PAS un état vivant de l'updater. `available`/`downloading` n'arrivent qu'une fois
+  // par événement : ce sondage de 3 s effaçait le message juste après, laissant une zone vide pendant
+  // tout le téléchargement. `st.updateStatus` est consulté en plus de `upd.s`, qui peut ne pas encore
+  // avoir été alimenté au premier rendu après une réouverture de la fenêtre.
+  else if (!updBusy && !st.updateReady && !updMsg) {
+    const vivant = (upd.s || st.updateStatus || {}).state;
+    if (vivant !== 'available' && vivant !== 'downloading') {
+      $('upd-status').textContent = st.cfg.packaged ? '' : 'ℹ️ L\'auto-update est actif seulement dans la version installée (Setup.exe).';
+    }
+  }
+  // Le bouton n'est grisé QUE pendant un travail réellement en cours. Avant, l'état `available`
+  // (poussé une seule fois) le désactivait sans que rien ne le réactive : si le téléchargement
+  // n'aboutissait pas — c'était le cas en 1.10.0, où la chaîne de MAJ était cassée —, « Vérifier les
+  // mises à jour » restait mort jusqu'au redémarrage du panel.
+  const enCours = (upd.s || st.updateStatus || {}).state;
+  $('upd-check').disabled = updBusy || enCours === 'downloading';
 
   // La carte du haut n'apprend les blockers / le réglage auto QUE par ce sondage (l'event n'a que l'état
   // brut de l'updater). `updateStatus` n'est repris que si on n'a rien : sinon un sondage de 3 s
@@ -485,7 +504,10 @@ $('upd-check').addEventListener('click', async () => {
   updBusy = true; updMsg = '';
   $('upd-check').disabled = true;
   $('upd-status').textContent = '⏳ Recherche de mise à jour…';
-  let r; try { r = await window.panel.checkUpdate(); } catch { r = { state: 'error' }; }
+  // Le `finally` plus bas garantit la réactivation du bouton : sans lui, une exception ou un retour
+  // inattendu du main laissait « Vérifier les mises à jour » grisé jusqu'au redémarrage du panel.
+  let r; try { r = await window.panel.checkUpdate(); } catch (e) { r = { state: 'error', message: e && e.message }; }
+  if (!r || typeof r !== 'object') r = { state: 'error', message: 'aucune réponse du panel' };
   // `version`, `current` et `message` viennent du flux de mise à jour DISTANT (electron-updater
   // recopie tel quel le contenu du latest.yml téléchargé dans ses messages d'erreur) : jamais
   // d'interpolation brute dans innerHTML. Le reste du gabarit contient du <b> volontaire, donc on
@@ -498,9 +520,8 @@ $('upd-check').addEventListener('click', async () => {
     error: `⚠️ Impossible de vérifier maintenant${r.message ? ' (' + esc(r.message) + ')' : ''}. Réessaie plus tard.`,
   }[r.state] || '⚠️ Réponse inattendue.';
   updMsg = msg;
-  $('upd-status').innerHTML = msg;
-  $('upd-check').disabled = false;
-  updBusy = false;
+  try { $('upd-status').innerHTML = msg; }
+  finally { $('upd-check').disabled = false; updBusy = false; } // le bouton se réactive quoi qu'il arrive
   refresh();
 });
 $('upd-apply').addEventListener('click', async () => {
@@ -628,3 +649,6 @@ $('game-scan-btn').addEventListener('click', async () => {
 
 refresh();
 setInterval(refresh, 3000);
+// Le main pousse un signal dès que l'état a changé : au démarrage, la liste des bots s'affiche dès
+// qu'elle est connue au lieu d'attendre jusqu'à 3 s le prochain sondage.
+if (window.panel.onStatusChanged) window.panel.onStatusChanged(() => refresh());

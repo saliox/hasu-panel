@@ -25,5 +25,7 @@ contextBridge.exposeInMainWorld('panel', {
   checkUpdate: () => ipcRenderer.invoke('panel:checkUpdate'),
   applyUpdate: () => ipcRenderer.invoke('panel:applyUpdate'),
   onUpdate: (cb) => ipcRenderer.on('update-status', (_e, d) => cb(d)),
+  // Le main previent quand l'etat a change, au lieu de laisser l'ecran attendre son sondage de 3 s.
+  onStatusChanged: (cb) => ipcRenderer.on('status-changed', () => cb()),
   installPm2: () => ipcRenderer.invoke('panel:installPm2')
 });
