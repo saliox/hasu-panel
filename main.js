@@ -89,13 +89,15 @@ const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 // Validateurs de sécurité (anti-injection, anti-pollution de prototype, IP publique) : extraits dans
 // un module SANS Electron pour être testables unitairement (`npm test`). Toute modification de ces
 // règles doit faire passer test/validators.test.js — elles gardent une frontière de sécurité.
-const { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp } = require('./validators');
+// NAME_RE / RESERVED_NAMES / isPublicIp étaient importés sans jamais servir ici : ils sont utilisés
+// À L'INTÉRIEUR de validators.js (par isSafeName) et de logic.js (par hasEstablishedPublic).
+const { EXE_RE, isSafeName, BAD_SHELL_RE } = require('./validators');
 // Logique PURE (décisions, parsing, calculs) : extraite pour la même raison — c'est ce module qui est
 // couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert, isDeliberateStop,
-  computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav,
+  computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, cleanNotes,
 } = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
@@ -216,10 +218,19 @@ const cfgPath = () => path.join(app.getPath('userData'), 'panel-config.json');
 // Entier borné : un scalaire corrompu/édité à la main (ex. pollSec="10x" → NaN) transformerait la
 // boucle de sondage en boucle folle (spawn continu de tasklist/pm2). On coerce + clamp comme les setters.
 const loadCfg = () => {
-  const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
-  let raw;
-  try { raw = read(cfgPath()); }
-  catch { try { raw = read(cfgPath() + '.bak'); log('config: fichier principal illisible → repli sur .bak'); } catch { return JSON.parse(JSON.stringify(DEFAULTS)); } }
+  // Lit les DEUX copies (principale + .bak) avec leur date, puis laisse pickCfgSource trancher.
+  // Avant : « la principale, sauf si elle est illisible » — or elle peut être parfaitement lisible et
+  // PÉRIMÉE. Constaté en production : panel-config.json figé au 5 juillet pendant six semaines pendant
+  // que le .bak suivait, donc chaque démarrage rechargeait de vieux réglages (webhook et alertes perdus)
+  // sans le moindre signe. Voir la vérification d'écriture dans saveCfg.
+  const probe = (file) => {
+    try { return { ok: true, raw: JSON.parse(fs.readFileSync(file, 'utf8')), mtime: fs.statSync(file).mtimeMs }; }
+    catch { return { ok: false }; }
+  };
+  const pick = pickCfgSource(probe(cfgPath()), probe(cfgPath() + '.bak'));
+  if (pick.warn) log('config:', pick.warn, '→ repli sur .bak');
+  if (pick.source === 'defaults') return JSON.parse(JSON.stringify(DEFAULTS));
+  const raw = pick.raw;
   try {
     // bots : RECONSTRUIT depuis {} — on ne garde que les clés sûres avec une valeur-objet (anti type-confusion :
     // un tableau ou une chaîne passait le typeof==='object' d'avant et corrompait les lookups par bot).
@@ -270,13 +281,31 @@ const loadCfg = () => {
 };
 // Écriture ATOMIQUE : temp + rename (jamais de fichier tronqué si crash/coupure en plein write), + un .bak
 // restauré par loadCfg si le principal devient illisible. Sinon un write interrompu réinitialisait TOUT aux DEFAULTS.
+//
+// ET SURTOUT : on RELIT ce qu'on vient d'écrire. Sans cette vérification, une écriture qui n'atterrit pas
+// passe totalement inaperçue — c'est arrivé six semaines durant (panel-config.json figé au 5 juillet alors
+// que le fichier était parfaitement accessible en écriture). Un `catch` vide ne suffit pas : ici, l'appel
+// ne levait AUCUNE erreur. Le .bak est écrit AVANT le fichier principal pour que, si le rename échoue, la
+// copie saine soit la plus récente des deux — c'est ce qui permet à loadCfg de retomber dessus.
+let cfgWriteFailed = false; // remonté dans panel:status → bandeau dans l'interface (échec bruyant)
 const saveCfg = () => {
+  const data = JSON.stringify(cfg, null, 2);
+  const file = cfgPath(), tmp = file + '.tmp';
+  try { fs.writeFileSync(file + '.bak', data); } catch (e) { log('saveCfg .bak', e.message); }
+  let ok = false;
   try {
-    const file = cfgPath(), tmp = file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
-    try { if (fs.existsSync(file)) fs.copyFileSync(file, file + '.bak'); } catch {}
+    fs.writeFileSync(tmp, data);
     fs.renameSync(tmp, file); // atomique sur NTFS
+    ok = fs.readFileSync(file, 'utf8') === data;
   } catch (e) { log('saveCfg', e.message); }
+  if (!ok && !cfgWriteFailed) {
+    log('saveCfg: ÉCHEC SILENCIEUX — le fichier ne reflète pas ce qui a été écrit ; les réglages ne survivent que dans le .bak :', file);
+    // Différé d'un tick : saveCfg peut être appelé pendant l'amorçage, avant que queueAlert soit défini.
+    setTimeout(() => queueAlert('⚠️ Réglages non enregistrés',
+      `Le panel n'arrive pas à écrire \`${file}\`. Tes réglages sont conservés dans la copie de secours, mais vérifie ce dossier (antivirus, synchronisation, disque plein).`, 0xfaa61a), 0);
+  }
+  cfgWriteFailed = !ok;
+  return ok;
 };
 
 // ---------- Détection de la chaîne d'outils (Node + pm2) ----------
@@ -1303,6 +1332,8 @@ ipcMain.handle('panel:status', () => ({
   updateBlockers: updateReady ? updateBlockers() : [], // pourquoi la MAJ prête n'est pas encore appliquée
   autoApplyUpdates: cfg.autoApplyUpdates !== false,
   lastSaveAt: cfg.lastSaveAt || 0, // dernier `pm2 save` (ce qui reviendra au reboot)
+  cfgWriteFailed,                 // les réglages ne s'écrivent plus sur le disque → bandeau (jamais silencieux)
+  cfgPath: cfgWriteFailed ? cfgPath() : '', // le chemin n'est utile que pour dire OÙ regarder
   needFix: needFix(),             // bots « Auto boot » éteints sans que tu l'aies demandé
   stoppedByGame: cfg.stoppedByGame.filter((n) => n !== '-'),
   cfg: { bots: cfg.bots, gameMode: cfg.gameMode, games: cfg.games, pollSec: cfg.pollSec, idlePollSec: cfg.idlePollSec, autoLaunch: cfg.autoLaunch, lowNet: cfg.lowNet, packaged: app.isPackaged, imported: cfg.imported, version: app.getVersion(), scanAuto: cfg.scanAuto !== false, lastScanAt: cfg.lastScanAt || 0, discovered: cfg.discovered || [], discordRpc: cfg.discordRpc !== false, discordAppId: cfg.discordAppId || '',

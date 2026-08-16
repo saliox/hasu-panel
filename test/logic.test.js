@@ -5,8 +5,59 @@ const assert = require('node:assert/strict');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, computeDefaultBounds, boundsAreVisible, pollDelayFor,
-  cleanNotes,
+  cleanNotes, pickCfgSource,
 } = require('../logic');
+
+// ------------------------------------------- config : quelle copie charger ?
+// Régression réelle : panel-config.json est resté figé au 5 juillet pendant six semaines — LISIBLE mais
+// plus écrit — pendant que le .bak suivait. L'ancienne règle (« la principale sauf si illisible »)
+// rechargeait donc à chaque démarrage des réglages vieux de six semaines, webhook d'alerte compris.
+const M = (raw, mtime) => ({ ok: true, raw, mtime });
+const KO = { ok: false };
+
+test('pickCfgSource : le principal PÉRIMÉ perd contre un .bak plus récent', () => {
+  const r = pickCfgSource(M({ v: 'juillet' }, 1000), M({ v: 'aout' }, 2000));
+  assert.equal(r.source, 'bak');
+  assert.deepEqual(r.raw, { v: 'aout' });
+  assert.match(r.warn, /périmé/);
+});
+
+test('pickCfgSource : cas normal — le principal est le plus récent, il gagne sans avertissement', () => {
+  const r = pickCfgSource(M({ v: 'neuf' }, 5000), M({ v: 'vieux' }, 4000));
+  assert.equal(r.source, 'main');
+  assert.equal(r.warn, undefined);
+});
+
+test('pickCfgSource : à ÉGALITÉ de date, le principal gagne', () => {
+  // saveCfg écrit le .bak AVANT le principal : à mtime égal (granularité du système de fichiers),
+  // le principal est au moins aussi frais. Sans cette règle, on basculerait sur le .bak à chaque save.
+  assert.equal(pickCfgSource(M({ v: 'a' }, 3000), M({ v: 'b' }, 3000)).source, 'main');
+});
+
+test('pickCfgSource : principal illisible → repli sur le .bak (comportement historique conservé)', () => {
+  const r = pickCfgSource(KO, M({ v: 'secours' }, 1));
+  assert.equal(r.source, 'bak');
+  assert.match(r.warn, /illisible/);
+});
+
+test('pickCfgSource : .bak absent → on garde le principal, même vieux', () => {
+  const r = pickCfgSource(M({ v: 'seul' }, 1), KO);
+  assert.equal(r.source, 'main');
+  assert.equal(r.warn, undefined);
+});
+
+test('pickCfgSource : les deux illisibles → valeurs par défaut', () => {
+  assert.equal(pickCfgSource(KO, KO).source, 'defaults');
+  assert.equal(pickCfgSource(null, undefined).source, 'defaults');
+});
+
+test('pickCfgSource : mtime absente ou corrompue ne fait pas basculer par erreur', () => {
+  // Un mtime NaN/undefined vaut 0 : sans la coercition, NaN > NaN est faux mais NaN comparé
+  // à un nombre l'était aussi — on veut un comportement défini, pas un hasard.
+  assert.equal(pickCfgSource(M({ v: 'a' }), M({ v: 'b' })).source, 'main');
+  assert.equal(pickCfgSource(M({ v: 'a' }, NaN), M({ v: 'b' }, 9)).source, 'bak');
+  assert.equal(pickCfgSource(M({ v: 'a' }, 9), M({ v: 'b' }, NaN)).source, 'main');
+});
 
 // ------------------------------------------------- notes de version (MAJ)
 test('cleanNotes : le HTML de GitHub devient des lignes de texte', () => {

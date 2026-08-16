@@ -179,6 +179,30 @@ const boundsAreVisible = (b, displays) => {
   });
 };
 
+// ---------- Config : laquelle des deux copies charger ? ----------
+/**
+ * Choisit entre le fichier principal et le .bak. PURE : l'appelant a déjà lu les deux.
+ *
+ * La règle est « la PLUS RÉCENTE gagne », pas « la principale sauf si elle est illisible ». Constaté en
+ * production : panel-config.json est resté figé au 5 juillet pendant six semaines — parfaitement LISIBLE,
+ * juste plus écrit — pendant que le .bak suivait. Chaque démarrage rechargeait donc des réglages vieux de
+ * six semaines (webhook d'alerte et préférences perdus) sans aucun signe. La lisibilité ne dit rien de
+ * la fraîcheur. saveCfg écrit le .bak AVANT le principal, donc à égalité de date le principal gagne.
+ *
+ * @param main {ok, raw, mtime} — fichier principal
+ * @param bak  {ok, raw, mtime} — copie de secours
+ * @returns {source:'main'|'bak'|'defaults', raw?, warn?}
+ */
+const pickCfgSource = (main, bak) => {
+  const okM = !!(main && main.ok), okB = !!(bak && bak.ok);
+  if (!okM && !okB) return { source: 'defaults' };
+  if (!okB) return { source: 'main', raw: main.raw };
+  if (!okM) return { source: 'bak', raw: bak.raw, warn: 'fichier principal illisible' };
+  const tM = Number(main.mtime) || 0, tB = Number(bak.mtime) || 0;
+  if (tB > tM) return { source: 'bak', raw: bak.raw, warn: 'fichier principal périmé' };
+  return { source: 'main', raw: main.raw };
+};
+
 // ---------- Cadence de sondage ----------
 // Fenêtre visible → réactif. Dans la zone de notification → ralenti, SAUF si une bascule automatique
 // dépend du sondage (mode jeu / éco réseau), auquel cas on reste à 15 s max.
@@ -256,5 +280,5 @@ module.exports = {
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,
-  computeDefaultBounds, boundsAreVisible, pollDelayFor,
+  computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
 };

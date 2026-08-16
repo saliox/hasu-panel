@@ -107,8 +107,24 @@ $('updcard').addEventListener('click', async (e) => {
   }
 });
 
+let lastWarnHtml = null;
+
 const render = (st) => {
   cur = st;
+  // Réglages qui ne s'enregistrent plus : ça doit se VOIR. Ce mode de panne a duré six semaines sans
+  // le moindre signe (fichier lisible mais plus écrit), et il fait perdre webhook et préférences.
+  const warnHtml = st.cfgWriteFailed
+    ? `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">Tes réglages ne s'enregistrent plus</div>`
+      + `<div class="updcard-ver">Ils sont conservés dans une copie de secours et restent actifs, mais le fichier principal refuse l'écriture.</div></div></div>`
+      + `<div class="updcard-why">Fichier : ${esc(st.cfgPath || '')} — regarde du côté de l'antivirus, d'une synchronisation de dossier, ou d'un disque plein.</div>`
+    : '';
+  if (warnHtml !== lastWarnHtml) {
+    lastWarnHtml = warnHtml;
+    const w = $('cfgwarn');
+    w.innerHTML = warnHtml;
+    w.className = warnHtml ? 'updcard err' : 'updcard err hidden';
+  }
+
   // Bandeau (réécrit seulement s'il change)
   const banner = $('banner');
   let bannerHtml, bannerCls;
