@@ -108,7 +108,12 @@ const hasEstablishedPublic = (stdout, pids) => {
 // donc les causes les plus spécifiques/actionnables en premier.
 const classifyErrorFr = (logText) => {
   if (!logText) return '';
-  const last = String(logText).split('\n').filter((l) => l.trim()).slice(-40).join('\n');
+  const last = String(logText).split('\n').filter((l) => l.trim()).slice(-40).join('\n')
+    // Neutralise les positions « fichier:ligne:colonne » AVANT toute recherche de code numérique.
+    // Sans ça, `\b401\b` matchait le numéro de ligne d'une pile d'appels : une simple SyntaxError à
+    // la ligne 401 était diagnostiquée « Token invalide ou intents Discord manquants » dans l'alerte,
+    // et la règle passant avant celle de SyntaxError, le vrai motif n'était jamais atteint.
+    .replace(/:\d+(?::\d+)?(?=\)|\s|$)/gm, '');
   if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(last)) return 'Internet/DNS injoignable (discord.com introuvable)';
   if (/TOKEN_INVALID|Unauthorized|\b401\b|Privileged intent/i.test(last)) return 'Token invalide ou intents Discord manquants';
   if (/Cannot find module|MODULE_NOT_FOUND/i.test(last)) return 'Module manquant (npm install à refaire)';
@@ -123,6 +128,10 @@ const classifyErrorFr = (logText) => {
 // Un arrêt PROPRE (`pm2 stop`) laisse le statut 'stopped' SANS faire grimper le compteur de
 // redémarrages ; un plantage passe par des relances pm2 (compteur +1) ou finit en 'errored'.
 // C'est ce qui distingue « l'utilisateur a coupé son bot » (même depuis un terminal) d'une vraie panne.
+// Statuts pm2 de PASSAGE : ni « en ligne », ni un verdict. Voir decideAlert.
+const TRANSIENT_STATUS = new Set(['stopping', 'launching', 'one-launch-status']);
+const TRANSIENT_MAX_TICKS = 3; // au-delà, l'état n'est plus « de passage », il est bloqué → on alerte
+
 const isDeliberateStop = (prev, cur) =>
   !!prev && !!cur && prev.status === 'online' && cur.status === 'stopped' && cur.restarts <= prev.restarts;
 
@@ -135,11 +144,22 @@ const isDeliberateStop = (prev, cur) =>
  * @returns { alert: 'down'|'looping'|'recovered'|null, setManualStop, clearManualStop }
  */
 const decideAlert = (prev, cur, ctx = {}) => {
-  const out = { alert: null, setManualStop: false, clearManualStop: false };
+  const out = { alert: null, setManualStop: false, clearManualStop: false, hold: false };
   if (!prev || !cur) return out;
   const parked = (ctx.stoppedByGame || []).includes(ctx.name);
   const fell = prev.status === 'online' && cur.status !== 'online';
   const looping = cur.restarts > prev.restarts + 2;
+
+  // pm2 publie aussi des statuts de PASSAGE : 'stopping' pendant kill_timeout (~1,6 s), 'launching'
+  // au démarrage. Les compter comme une chute déclenchait « ⚠️ X est tombé » sur un simple
+  // `pm2 stop` tapé au terminal environ une fois sur six (le sondage tombe dans la fenêtre) — et
+  // pire, au tick suivant prev valait 'stopping' au lieu de 'online', donc l'arrêt volontaire
+  // n'était plus reconnu du tout et le bot n'était plus jamais rallumé au démarrage.
+  // `hold` demande à l'appelant de NE PAS avancer l'instantané : on attend que l'état se pose.
+  if (TRANSIENT_STATUS.has(cur.status) && !looping && (ctx.transientTicks || 0) < TRANSIENT_MAX_TICKS) {
+    out.hold = true; // …borné : un bot coincé en 'launching' finit par être signalé comme tombé
+    return out;
+  }
 
   // Revenu en ligne : il n'est plus « arrêté volontairement », quel que soit l'endroit d'où on l'a relancé.
   if (prev.status !== 'online' && cur.status === 'online') {
@@ -281,4 +301,5 @@ module.exports = {
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
+  TRANSIENT_STATUS, TRANSIENT_MAX_TICKS,
 };

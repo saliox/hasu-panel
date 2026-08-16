@@ -78,3 +78,26 @@ test('isPublicIp : entrées invalides refusées', () => {
     assert.equal(isPublicIp(ip), false, String(ip));
   }
 });
+
+// ------------------------------------------------- noms CRÉÉS par l'utilisateur
+// isSafeName sert aussi de filtre de LECTURE sur ce que pm2 renvoie : le durcir ferait disparaître
+// des bots existants de l'affichage sans un mot. isSafeNewName ne s'applique donc qu'à la création.
+test('isSafeNewName : refuse ce qui casse à la création (option pm2, nom de dossier)', () => {
+  const { isSafeNewName } = require('../validators');
+  for (const n of ['-rf', '-f', '--name', '-w', '.', '..', '.next', '-.']) {
+    assert.equal(isSafeNewName(n), false, `« ${n} » ne doit pas être acceptable comme NOUVEAU nom`);
+  }
+});
+
+test('isSafeNewName : accepte les noms normaux', () => {
+  const { isSafeNewName } = require('../validators');
+  for (const n of ['saliox', 'hasu-music', 'bot_2', 'a', 'Bot.v2', '9lives']) {
+    assert.equal(isSafeNewName(n), true, `« ${n} » doit rester acceptable`);
+  }
+});
+
+test('isSafeName reste PERMISSIF (filtre de lecture) : un bot pm2 nommé « .next » doit rester visible', () => {
+  const { isSafeName, isSafeNewName } = require('../validators');
+  assert.equal(isSafeName('.next'), true, 'durcir isSafeName ferait disparaître ce bot de la liste');
+  assert.equal(isSafeNewName('.next'), false);
+});

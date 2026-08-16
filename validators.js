@@ -19,6 +19,16 @@ const RESERVED_NAMES = new Set([
 ]);
 const isSafeName = (n) => typeof n === 'string' && NAME_RE.test(n) && !RESERVED_NAMES.has(n.toLowerCase());
 
+// Nom que l'utilisateur CRÉE (import d'un bot) — plus strict que isSafeName, et il doit le rester.
+// `isSafeName` sert aussi de filtre de LECTURE sur ce que pm2 renvoie déjà : le durcir ferait
+// disparaître de l'affichage, sans un mot, tout process pm2 préexistant nommé « .next » ou « -w ».
+// Ici on refuse en revanche ce qui casse à la CRÉATION :
+//   - un nom commençant par « - » : `pm2 start x --name -rf` fait lire « -rf » comme une OPTION par
+//     l'analyseur d'arguments de pm2, pas comme une valeur ;
+//   - « . » et « .. » : des noms de dossier, dont pm2 dérive ses chemins de fichiers de log.
+const NEW_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
+const isSafeNewName = (n) => isSafeName(n) && NEW_NAME_RE.test(n);
+
 // Métacaractères cmd interdits dans un chemin. Depuis le passage de pm2 en invocation
 // directe (sans shell), ce filtre n'est plus la seule barrière — il reste en défense
 // en profondeur pour le repli shell (layout npm inhabituel) et contre les chemins pièges.
@@ -44,4 +54,4 @@ const isPublicIp = (raw) => {
   return false;
 };
 
-module.exports = { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, BAD_SHELL_RE, isPublicIp };
+module.exports = { NAME_RE, EXE_RE, RESERVED_NAMES, isSafeName, isSafeNewName, BAD_SHELL_RE, isPublicIp };

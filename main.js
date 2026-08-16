@@ -36,6 +36,7 @@ const UPDATE_GRACE_MS = 5 * 60 * 1000; // laisse passer 5 min après le téléch
 const updateBlockers = () => {
   const b = [];
   if (statusCache.game) b.push('jeu en cours');                       // ne jamais couper pendant une partie
+  if (gameUnknown && Date.now() - gameUnknownSince < GAME_UNKNOWN_MAX_MS) b.push('partie en cours inconnue'); // dans le doute on ne redémarre pas sous le nez du joueur — mais pas indéfiniment
   if (busy) b.push('transition mode jeu');                            // une bascule de bots est en cours
   if (actionsInFlight.size) b.push('action bot en cours');
   if (stopAllInFlight) b.push('arrêt global en cours');
@@ -91,7 +92,7 @@ const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 // règles doit faire passer test/validators.test.js — elles gardent une frontière de sécurité.
 // NAME_RE / RESERVED_NAMES / isPublicIp étaient importés sans jamais servir ici : ils sont utilisés
 // À L'INTÉRIEUR de validators.js (par isSafeName) et de logic.js (par hasEstablishedPublic).
-const { EXE_RE, isSafeName, BAD_SHELL_RE } = require('./validators');
+const { EXE_RE, isSafeName, isSafeNewName, BAD_SHELL_RE } = require('./validators');
 // Logique PURE (décisions, parsing, calculs) : extraite pour la même raison — c'est ce module qui est
 // couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
 const {
@@ -182,6 +183,14 @@ const isWindowVisible = () => !!(win && !win.isDestroyed() && win.isVisible());
 let cfg = null;
 let lastGameSeen = null, lastGameAt = 0;
 let sessionOnline = false; // le jeu détecté a une vraie connexion Internet (session multijoueur)
+// Vrai quand on n'a PAS pu savoir si un jeu tourne (scan sauté, ou tasklist en échec). À distinguer
+// de « aucun jeu » : les décisions coûteuses ou dérangeantes (scan disque, application d'une MAJ)
+// ne doivent pas se déclencher sur une ignorance prise pour une absence.
+let gameUnknown = true, gameUnknownSince = Date.now();
+// …mais BORNÉ. Si tasklist échoue durablement, bloquer les mises à jour pour toujours serait pire que
+// le mal qu'on évite (c'est exactement le mode de panne « panel figé sur une vieille version »).
+// Au-delà de ce délai, on cesse de s'en servir comme motif de blocage.
+const GAME_UNKNOWN_MAX_MS = 30 * 60 * 1000;
 let statusCache = { bots: [], game: null, online: false, updatedAt: 0 };
 let busy = false; // évite deux bascules mode jeu simultanées
 // Verrou partagé par TOUS les appelants de enterGameMode/exitGameMode (tick, bascule manuelle
@@ -223,13 +232,37 @@ const loadCfg = () => {
   // PÉRIMÉE. Constaté en production : panel-config.json figé au 5 juillet pendant six semaines pendant
   // que le .bak suivait, donc chaque démarrage rechargeait de vieux réglages (webhook et alertes perdus)
   // sans le moindre signe. Voir la vérification d'écriture dans saveCfg.
+  // Trois essais : au démarrage de session, Defender et les outils de synchronisation verrouillent
+  // %APPDATA% pendant quelques dizaines de millisecondes. Un `catch {}` muet transformait ce verrou
+  // passager en « fichier illisible » → valeurs d'usine.
+  const dodo = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
   const probe = (file) => {
-    try { return { ok: true, raw: JSON.parse(fs.readFileSync(file, 'utf8')), mtime: fs.statSync(file).mtimeMs }; }
-    catch { return { ok: false }; }
+    for (let i = 0; i < 3; i++) {
+      try { return { ok: true, raw: JSON.parse(fs.readFileSync(file, 'utf8')), mtime: fs.statSync(file).mtimeMs }; }
+      catch (e) {
+        if (e.code === 'ENOENT') return { ok: false }; // premier lancement : normal, inutile d'insister
+        log('config: lecture impossible', file, e.code || e.message, `(essai ${i + 1}/3)`);
+        if (i < 2) dodo(150);
+      }
+    }
+    return { ok: false };
   };
   const pick = pickCfgSource(probe(cfgPath()), probe(cfgPath() + '.bak'));
   if (pick.warn) log('config:', pick.warn, '→ repli sur .bak');
-  if (pick.source === 'defaults') return JSON.parse(JSON.stringify(DEFAULTS));
+  if (pick.source === 'defaults') {
+    // Repartir des valeurs d'usine est normal au tout premier lancement. Mais si des fichiers
+    // EXISTENT et sont illisibles, le premier saveCfg venu écraserait les DEUX copies (le .bak est
+    // écrit en premier) : réglages perdus pour de bon, en silence. On les met de côté avant, et on
+    // le fait savoir.
+    const presents = [cfgPath(), cfgPath() + '.bak'].filter((f) => { try { return fs.existsSync(f); } catch { return false; } });
+    if (presents.length) {
+      for (const f of presents) { try { fs.copyFileSync(f, f + '.corrompu'); } catch (e) { log('config: copie de secours impossible', f, e.message); } }
+      log('config: ILLISIBLE alors que les fichiers existent → copie dans *.corrompu, démarrage sur les valeurs d\'usine :', presents.join(', '));
+      setTimeout(() => queueAlert('⚠️ Configuration illisible',
+        'Le panel n\'a pas pu relire ses réglages et repart des valeurs d\'usine. Les anciens fichiers sont conservés à côté, suffixés `.corrompu`.', 0xED4245), 0);
+    }
+    return JSON.parse(JSON.stringify(DEFAULTS));
+  }
   const raw = pick.raw;
   try {
     // bots : RECONSTRUIT depuis {} — on ne garde que les clés sûres avec une valeur-objet (anti type-confusion :
@@ -608,15 +641,20 @@ const notifyUpdateReady = (version) => {
 };
 
 // Renvoie true si l'alerte est réellement partie (le webhook a répondu 2xx, ou il n'y en a pas).
-const sendAlert = async (title, body, colorHex) => {
+// `dejaNotifie` = on est dans un RÉESSAI : le toast, le son et le quota horaire ont déjà été consommés
+// au premier essai. Sans ça, trois réessais empilaient trois toasts identiques et vidaient à eux seuls
+// le plafond de 6 alertes/heure.
+const sendAlert = async (title, body, colorHex, dejaNotifie = false) => {
   const now = Date.now();
-  alertTimes = alertTimes.filter((t) => now - t < 3600 * 1000);
-  if (alertTimes.length >= ALERT_MAX_PER_HOUR) return false; // plafond anti-spam
-  alertTimes.push(now);
-  if (cfg.alertToast !== false) {
-    // silent:true → Windows ne joue PAS son propre son (souvent fort) ; on joue le nôtre à la place.
-    try { if (Notification.isSupported()) new Notification({ title, body, silent: true }).show(); } catch {}
-    playSoftSound();
+  if (!dejaNotifie) {
+    alertTimes = alertTimes.filter((t) => now - t < 3600 * 1000);
+    if (alertTimes.length >= ALERT_MAX_PER_HOUR) return false; // plafond anti-spam → mis en réessai, plus jeté
+    alertTimes.push(now);
+    if (cfg.alertToast !== false) {
+      // silent:true → Windows ne joue PAS son propre son (souvent fort) ; on joue le nôtre à la place.
+      try { if (Notification.isSupported()) new Notification({ title, body, silent: true }).show(); } catch {}
+      playSoftSound();
+    }
   }
   const url = (cfg.alertWebhook || '').trim();
   let ok = true;
@@ -631,19 +669,40 @@ const sendAlert = async (title, body, colorHex) => {
 // On empile et on dépile en arrière-plan, séquentiellement (pas de rafale parallèle vers Discord).
 const alertQueue = [];
 let alertDraining = false;
+// Une alerte n'est « faite » que si elle est réellement PARTIE. Avant, le bot était marqué comme
+// signalé AVANT l'envoi : quand le webhook échouait — typiquement parce que la panne EST la coupure
+// réseau qui a tué les bots — l'alerte était perdue, et comme la transition ne se reproduit plus
+// (les bots restent en 'errored'), plus personne n'était jamais prévenu. Le scénario fondateur de
+// la fonctionnalité, précisément. On réessaie donc, HORS du verrou pour ne pas geler la surveillance.
+const ALERT_RETRY_MS = [30 * 1000, 2 * 60 * 1000, 5 * 60 * 1000];
 const drainAlerts = async () => {
   if (alertDraining) return;
   alertDraining = true;
   try {
     while (alertQueue.length) {
       const a = alertQueue.shift();
-      try { await sendAlert(a.title, a.body, a.color); } catch (e) { log('sendAlert', e.message); }
+      let ok = false;
+      try { ok = await sendAlert(a.title, a.body, a.color, a.notifie); } catch (e) { log('sendAlert', e.message); }
+      a.notifie = true;
+      if (ok) continue;
+      const attente = ALERT_RETRY_MS[a.essais];
+      if (attente === undefined) {
+        // Abandon. On OUBLIE que ce bot a été signalé pour qu'un tick ultérieur puisse réessayer,
+        // au lieu de le laisser silencieux pour toujours.
+        if (a.cle) lastAlertAt.delete(a.cle);
+        log('alerte abandonnée après', a.essais, 'réessai(s) :', a.title);
+        continue;
+      }
+      a.essais++;
+      // Replanifié hors de la boucle : `await sleep()` ici tiendrait le verrou et gèlerait les
+      // alertes « pm2 ne répond plus » et les retours en ligne pendant plusieurs minutes.
+      setTimeout(() => { alertQueue.push(a); drainAlerts(); }, attente).unref?.();
     }
   } finally { alertDraining = false; }
 };
-const queueAlert = (title, body, color) => {
+const queueAlert = (title, body, color, cle = '') => {
   if (alertQueue.length >= 20) return; // borne dure : on ne laisse pas la file enfler sans fin
-  alertQueue.push({ title, body, color });
+  alertQueue.push({ title, body, color, cle, essais: 0, notifie: false });
   drainAlerts(); // volontairement pas attendu : la boucle de surveillance continue
 };
 
@@ -658,11 +717,14 @@ const snapshotOf = (bots) => new Map(bots.map((b) => [b.name, { status: b.status
 // derrière trois sorties anticipées — couper les alertes (réglage purement cosmétique) laissait
 // `manualStop` collé à true pour toujours : le bot n'était plus jamais rallumé au démarrage, ni
 // signalé par le bandeau, sans aucun moyen de le débloquer depuis l'interface.
+// Renvoie l'ensemble des bots dont l'instantané ne doit PAS avancer (statut de passage).
+const transientTicks = new Map(); // nom → nombre de ticks consécutifs passés dans un statut de passage
 const applyTransitions = (bots, prev) => {
   const now = Date.now();
   const notifyAllowed = cfg.alerts !== false
     && now >= quietUntil && now - startedAt >= ALERT_QUIET_BOOT_MS;
   let changed = false;
+  const held = new Set();
 
   for (const b of bots) {
     const p = prev.get(b.name);
@@ -673,7 +735,14 @@ const applyTransitions = (bots, prev) => {
       stoppedByGame: cfg.stoppedByGame,
       manualStop: !!(conf && conf.manualStop),
       hadAlert: lastAlertAt.has(b.name),
+      transientTicks: transientTicks.get(b.name) || 0,
     });
+    if (d.hold) {
+      held.add(b.name);
+      transientTicks.set(b.name, (transientTicks.get(b.name) || 0) + 1);
+      continue; // on ne décide rien tant que l'état n'est pas posé
+    }
+    transientTicks.delete(b.name);
 
     // 1) État persisté (toujours, même alertes coupées)
     if (d.clearManualStop && conf) { conf.manualStop = false; changed = true; }
@@ -682,22 +751,28 @@ const applyTransitions = (bots, prev) => {
       if (!c.manualStop) { c.manualStop = true; changed = true; log('arrêt volontaire détecté :', b.name); }
     }
 
-    // 2) Notifications (seulement si autorisées)
-    if (!d.alert || !notifyAllowed) continue;
+    // 2) Notifications
+    if (!d.alert) continue;
     if (d.alert === 'recovered') {
+      // La purge de l'anti-doublon doit avoir lieu MÊME notifications coupées : sinon un retour en
+      // ligne non notifié laissait l'horodatage en place, et l'anti-doublon de 30 min étouffait la
+      // panne SUIVANTE — la seule qui comptait.
       lastAlertAt.delete(b.name);
-      queueAlert(`✅ ${b.name} est de retour`, 'Le bot est de nouveau en ligne.', 0x57F287);
+      if (notifyAllowed) queueAlert(`✅ ${b.name} est de retour`, 'Le bot est de nouveau en ligne.', 0x57F287, b.name);
       continue;
     }
+    if (!notifyAllowed) continue;
     if (now - (lastAlertAt.get(b.name) || 0) < ALERT_DEDUP_MS) continue; // anti-doublon 30 min
     lastAlertAt.set(b.name, now);
     const cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
     queueAlert(
       d.alert === 'looping' ? `🔁 ${b.name} redémarre en boucle` : `⚠️ ${b.name} est tombé`,
       (cause ? `**Cause probable :** ${cause}\n` : '') + `État : ${b.status} · redémarrages : ${b.restarts}`,
-      d.alert === 'looping' ? 0xE67E22 : 0xED4245);
+      d.alert === 'looping' ? 0xE67E22 : 0xED4245,
+      b.name); // la clé permet d'oublier le « déjà signalé » si l'envoi finit par échouer
   }
   if (changed) saveCfg(); // UN seul enregistrement pour tout le lot (avant : un par bot, en pleine boucle)
+  return held;
 };
 
 // pm2 injoignable = TOUS les bots sont potentiellement à terre, et aucune alerte « bot tombé » ne peut
@@ -831,13 +906,16 @@ const applyLowNet = async (game, known) => {
   updateTray();
 };
 
-const clearLowNet = async () => {
+// `known` : liste pm2 DÉJÀ lue par le tick. undefined = rien de disponible, on lit ici ; null = le
+// tick a déjà constaté que pm2 est muet, donc inutile de relancer un `pm2 jlist` (437 ms mesurés)
+// pour se le faire redire — et il le relançait à CHAQUE tick pendant toute la durée de la panne.
+const clearLowNet = async (known) => {
   try { fs.unlinkSync(LOWNET_FLAG); } catch {}
   // Si pm2 est muet, on ne peut PAS restaurer les priorités CPU. Baisser le drapeau quand même
   // laisserait les bots coincés en priorité « Idle » pour toujours : la condition de nettoyage du tick
   // exige `lowNetApplied === true`, donc plus personne ne repasserait jamais. On garde le drapeau levé
   // et on réessaiera au tick suivant.
-  const bots = await pm2List();
+  const bots = known === undefined ? await pm2List() : known;
   if (!bots) { log('éco réseau : pm2 muet → priorités NON restaurées, nouvelle tentative au prochain tick'); return; }
   await setBotPriority(bots.map((b) => b.pid), 'Normal');
   cfg.lowNetApplied = false; saveCfg();
@@ -855,7 +933,10 @@ const clearLowNet = async () => {
 const approvedScripts = new Set();
 
 const importBot = async (name, script) => {
-  if (!isSafeName(name)) return { ok: false, error: 'Nom invalide (lettres, chiffres, tirets, sans espace)' };
+  // isSafeNewName (et pas isSafeName) : à la CRÉATION, un nom comme « -rf » serait lu par pm2 comme
+  // une option et non comme un nom. isSafeName reste volontairement plus permissif ailleurs, car il
+  // filtre aussi ce que pm2 renvoie déjà (durcir ferait disparaître des bots existants de la liste).
+  if (!isSafeNewName(name)) return { ok: false, error: 'Nom invalide : lettres, chiffres, tirets, sans espace, et il doit commencer par une lettre ou un chiffre' };
   script = path.resolve(String(script || ''));
   if (!approvedScripts.has(script)) return { ok: false, error: 'Sélectionne le fichier via le bouton d\'import (chemin non approuvé)' };
   if (BAD_SHELL_RE.test(script)) return { ok: false, error: 'Chemin non pris en charge (caractères spéciaux)' };
@@ -1024,9 +1105,23 @@ const tick = async () => {
   // mode jeu et l'éco réseau. Si les deux sont coupés ET que personne ne regarde l'écran (panel dans la
   // zone de notification), on saute complètement ce scan : c'est le plus gros coût du tick au repos.
   // Dès qu'on rouvre la fenêtre, restartPoll(true) relance un tick immédiat qui rescanne.
+  //
+  // …MAIS deux autres décisions lisent `statusCache.game` pour NE PAS déranger pendant une partie :
+  // l'application automatique des mises à jour (updateBlockers) et le scan disque quotidien. Avec la
+  // configuration d'usine (mode jeu désactivé), on sautait le scan de process, `statusCache.game`
+  // était forcé à null, et ces deux-là se croyaient donc « hors partie » : un parcours complet des
+  // bibliothèques Steam/Epic — des milliers d'accès disque — pouvait démarrer en plein match, et la
+  // MAJ s'appliquer au même moment. On lit donc aussi quand l'une de ces décisions est imminente.
+  const scanDu = cfg.scanAuto !== false && Date.now() - (cfg.lastScanAt || 0) > SCAN_MS;
   const needProcScan = cfg.gameMode.enabled || cfg.lowNet || cfg.lowNetApplied || cfg.stoppedByGame.length > 0
-    || isWindowVisible();
+    || isWindowVisible()
+    || (updateReady && cfg.autoApplyUpdates !== false)
+    || scanDu;
   const procs = needProcScan ? await listProcs() : null;
+  // « On n'a pas regardé » et « on a regardé, pas de jeu » ne sont pas la même chose : sans ce
+  // drapeau, un échec de tasklist passait pour une absence de jeu. Il est dérivé de `procs`, pas de
+  // `needProcScan`, précisément pour couvrir ce cas.
+  if (!procs !== gameUnknown) { gameUnknown = !procs; gameUnknownSince = Date.now(); }
   if (!needProcScan) {
     // Rien ne rafraîchit ces états quand on saute le scan : on les remet à zéro au lieu de les laisser
     // périmés. `sessionOnline` en particulier restait collé à `true` — au prochain jeu lancé, même SOLO,
@@ -1066,7 +1161,7 @@ const tick = async () => {
         if (cfg.lowNet && gameRunning && sessionOnline && !cfg.lowNetApplied) {
           await applyLowNet(hit, freshBots); // réutilise la lecture pm2 de ce tick
         } else if (cfg.lowNetApplied && (!cfg.lowNet || (!gameRunning && graceOver))) {
-          await clearLowNet(); // couvre aussi la reprise après crash/redémarrage du panel
+          await clearLowNet(freshBots); // réutilise la lecture pm2 de ce tick ; couvre aussi la reprise après crash du panel
         }
       } catch (e) { log('tick', e.message); }
     });
@@ -1080,9 +1175,17 @@ const tick = async () => {
     // les notifications seulement si elles sont activées. `prevStatus` est mis à jour ici, en UN seul
     // endroit — avant il l'était sur cinq chemins différents à l'intérieur de checkAlerts.
     const prev = prevStatus;
-    prevStatus = snapshotOf(statusCache.bots);
-    if (!alertsPrimed) alertsPrimed = true; // 1er tick : on amorce en silence, aucune comparaison
-    else try { applyTransitions(statusCache.bots, prev); } catch (e) { log('applyTransitions', e.message); }
+    const suivant = snapshotOf(statusCache.bots);
+    if (!alertsPrimed) { prevStatus = suivant; alertsPrimed = true; } // 1er tick : amorçage silencieux
+    else {
+      let held = new Set();
+      try { held = applyTransitions(statusCache.bots, prev) || new Set(); }
+      catch (e) { log('applyTransitions', e.message); }
+      // Pour un bot dans un statut de PASSAGE, on garde l'ancien instantané : sinon 'online' est
+      // remplacé par 'stopping' et la transition réelle (l'arrêt volontaire) devient indétectable.
+      for (const n of held) { const p = prev.get(n); if (p) suivant.set(n, p); }
+      prevStatus = suivant;
+    }
   } else alertPm2Down(); // pm2 lui-même muet = TOUS les bots en danger, il faut le dire
   maybeAutoApplyUpdate(); // s'installe tout seul dès que c'est sans risque (plus besoin de fermer le panel à la main)
   statusCache.updatedAt = Date.now();
@@ -1090,7 +1193,9 @@ const tick = async () => {
   updateRpc(); // met à jour la Rich Presence Discord (« gère X bots en ligne »)
 
   // Découverte auto : au plus 1×/jour, jamais pendant une partie (le scan disque attendra).
-  if (cfg.scanAuto !== false && !statusCache.game && Date.now() - (cfg.lastScanAt || 0) > SCAN_MS) {
+  // `!gameUnknown` : un parcours disque complet (des milliers d'accès) ne part que si on SAIT
+  // qu'aucun jeu ne tourne — pas simplement parce qu'on n'a pas regardé.
+  if (cfg.scanAuto !== false && !statusCache.game && !gameUnknown && Date.now() - (cfg.lastScanAt || 0) > SCAN_MS) {
     runScan().catch(() => {});
   }
   } finally { tickRunning = false; }
@@ -1266,7 +1371,10 @@ const showWindow = () => {
   if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); restartPoll(true); return; } // restaure depuis le tray + rafraîchit tout de suite
   const b = savedBounds() || defaultBounds();
   win = new BrowserWindow({
-    ...b, minWidth: WIN_MIN_W, minHeight: WIN_MIN_H,
+    // Bornes minimales PLAFONNÉES par la taille réellement calculée : sur un écran dont la zone de
+    // travail fait moins de 680 px de haut, imposer minHeight=680 forçait la fenêtre à déborder
+    // sous la barre des tâches (les boutons du bas devenaient inatteignables).
+    ...b, minWidth: Math.min(WIN_MIN_W, b.width), minHeight: Math.min(WIN_MIN_H, b.height),
     backgroundColor: '#0f1117',
     title: 'Hasu Panel',
     icon: path.join(__dirname, 'icon.png'),
@@ -1527,8 +1635,15 @@ ipcMain.handle('panel:fixAll', async () => {
     for (const n of names) { const c = cfg.bots[n]; if (c) c.manualStop = false; await pm2(['start', n]); }
     if (names.length) { saveCfg(); schedulePm2Save(5000); }
     await refreshBots();
-    log('remise en ordre :', names.join(', ') || '(rien)');
-    return { ok: true, started: names.length };
+    // On compte ce qui est RÉELLEMENT en ligne après coup, pas le nombre de bots tentés. Avant,
+    // trois bots dont le dossier avait été déplacé donnaient « ✅ 3 relance(s) » alors qu'aucun
+    // n'était reparti — et le bandeau réaffichait aussitôt les mêmes trois noms.
+    const enLigne = new Set(statusCache.bots.filter((b) => b.status === 'online').map((b) => b.name));
+    const repartis = names.filter((n) => enLigne.has(n));
+    const echoues = names.filter((n) => !enLigne.has(n));
+    log('remise en ordre :', names.join(', ') || '(rien)',
+      echoues.length ? `— TOUJOURS hors ligne : ${echoues.join(', ')}` : '');
+    return { ok: true, started: repartis.length, failed: echoues };
   } finally { fixAllInFlight = false; }
 });
 

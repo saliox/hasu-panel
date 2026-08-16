@@ -254,6 +254,21 @@ test('classifyErrorFr : sans signature connue → dernière ligne tronquée', ()
   assert.equal(classifyErrorFr(null), '');
 });
 
+test('classifyErrorFr : un numéro de LIGNE 401 dans la pile ne doit pas passer pour un HTTP 401', () => {
+  // La règle « 401 » passe AVANT celles de SyntaxError et de module manquant : sans neutralisation
+  // des positions fichier:ligne:colonne, une erreur de syntaxe à la ligne 401 était annoncée dans
+  // l'alerte Discord comme « Token invalide » — le diagnostic le plus trompeur possible.
+  assert.equal(classifyErrorFr('SyntaxError: Unexpected token }\n    at Object..js (C:/bots/x/index.js:401:9)'),
+    'Erreur de syntaxe dans le code');
+  assert.equal(classifyErrorFr('Error: connect ECONNREFUSED\n    at TCP (net.js:401)'),
+    'Connexion réseau refusée ou coupée');
+  assert.equal(classifyErrorFr('Cannot find module discord.js\n    at Module._load (node:internal/modules/cjs/loader:401:12)'),
+    'Module manquant (npm install à refaire)');
+  // …tout en gardant les VRAIS 401
+  assert.equal(classifyErrorFr('DiscordAPIError[401]: Unauthorized'), 'Token invalide ou intents Discord manquants');
+  assert.equal(classifyErrorFr('Request failed with status code 401'), 'Token invalide ou intents Discord manquants');
+});
+
 // ----------------------------------------------------- fenêtre : dimensions
 test('computeDefaultBounds : grande fenêtre, centrée, qui tient à l\'écran', () => {
   const b = computeDefaultBounds({ x: 0, y: 0, width: 1920, height: 1032 });
@@ -362,4 +377,36 @@ test('makeChimeWav : amplitude bornée, jamais de saturation', () => {
 test('makeChimeWav : court (une notification ne doit pas s\'éterniser)', () => {
   const secondes = (makeChimeWav().readUInt32LE(40) / 2) / 44100;
   assert.ok(secondes > 0.1 && secondes < 1, `durée ${secondes}s hors plage raisonnable`);
+});
+
+// ------------------------------- statuts pm2 de PASSAGE (stopping / launching)
+const { decideAlert: dA, TRANSIENT_MAX_TICKS } = require('../logic');
+const tr = (p, s, opts = {}) => dA({ status: p, restarts: opts.pr || 0 }, { status: s, restarts: opts.r || 0 },
+  { name: 'x', transientTicks: opts.t || 0, ...opts.ctx });
+
+test('decideAlert : « stopping » n\'est pas une chute — pas de fausse alerte sur un pm2 stop', () => {
+  // Le sondage tombe dans la fenêtre kill_timeout environ une fois sur six : sans ça, un simple
+  // `pm2 stop` tapé au terminal envoyait « ⚠️ x est tombé » sur Discord.
+  for (const s of ['stopping', 'launching', 'one-launch-status']) {
+    const d = tr('online', s);
+    assert.equal(d.alert, null, `« ${s} » ne doit pas alerter`);
+    assert.equal(d.hold, true, `« ${s} » doit demander de figer l'instantané`);
+  }
+});
+
+test('decideAlert : la tolérance est BORNÉE — un bot coincé en « launching » finit par être signalé', () => {
+  // Sans borne, un bot bloqué (wait_ready qui n'arrive jamais) devenait invisible à la surveillance.
+  assert.equal(tr('online', 'launching', { t: TRANSIENT_MAX_TICKS - 1 }).hold, true);
+  assert.equal(tr('online', 'launching', { t: TRANSIENT_MAX_TICKS }).alert, 'down');
+  assert.equal(tr('online', 'launching', { t: TRANSIENT_MAX_TICKS }).hold, false);
+});
+
+test('decideAlert : un redémarrage en boucle passe AVANT la tolérance', () => {
+  // 'launching' est justement l'état d'un bot qui boucle : le suspendre masquerait la panne.
+  assert.equal(tr('online', 'launching', { r: 9, pr: 0 }).alert, 'looping');
+});
+
+test('decideAlert : l\'arrêt volontaire reste détecté après le passage par « stopping »', () => {
+  // C'est tout l'intérêt de figer l'instantané : au tick suivant, prev vaut encore 'online'.
+  assert.equal(tr('online', 'stopped').setManualStop, true);
 });

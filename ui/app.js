@@ -109,6 +109,14 @@ $('updcard').addEventListener('click', async (e) => {
 
 let lastWarnHtml = null;
 
+// Vrai entre `mousedown` et `mouseup` : pendant ce laps, aucune zone cliquable ne doit être remplacée,
+// sinon le `click` n'est jamais émis (il exige un ancêtre commun encore vivant entre les deux
+// événements). En capture, pour ne dépendre d'aucun handler intermédiaire.
+let sourisEnfoncee = false;
+addEventListener('mousedown', () => { sourisEnfoncee = true; }, true);
+addEventListener('mouseup', () => { sourisEnfoncee = false; }, true);
+addEventListener('blur', () => { sourisEnfoncee = false; }); // relâché hors fenêtre : on ne reste pas figé
+
 const render = (st) => {
   cur = st;
   // Réglages qui ne s'enregistrent plus : ça doit se VOIR. Ce mode de panne a duré six semaines sans
@@ -195,15 +203,19 @@ const render = (st) => {
       + '<div class="row" style="margin-top:8px"><button class="btn primary" id="fix-all">Remettre en ordre</button>'
       + '<span id="fix-status" style="color:var(--mut);font-size:12px"></span></div></div>'
     : '';
-  // La liste n'est RECONSTRUITE que si son contenu a changé. Avant, `innerHTML` était réassigné toutes
-  // les 3 s même à l'identique : ~16 éléments par bot détruits/recréés en boucle (rendu logiciel, GPU
-  // coupé), et surtout les cases à cocher perdaient focus et survol à chaque cycle — d'où le clic qui
-  // « ne prend pas » quand le rafraîchissement tombe au mauvais moment.
+  // La liste n'est RECONSTRUITE que si son contenu a changé. Attention : la comparaison porte sur du
+  // HTML qui contient cpu, mémoire, uptime et débits — quatre valeurs qui bougent à CHAQUE tick pour
+  // un bot en ligne. La garde ne tient donc quasiment jamais en usage réel, et ~14 éléments par bot
+  // sont détruits/recréés en boucle : les cases à cocher perdent focus et survol, et un clic dont le
+  // `mouseup` tombe après un rafraîchissement n'émet aucun `click` (le nœud pressé n'existe plus).
+  // D'où le clic qui « ne prend pas ». Tant que le bouton de la souris est ENFONCÉ, on ne remplace
+  // donc rien — et surtout on ne met pas `lastBotsHtml` à jour, sinon le changement sauté serait
+  // perdu définitivement.
   const botsHtml = (!health.ok ? empty : '') + fixBanner + (
     main.map(botRow).join('') +
     (imps.length ? `<div class="sechead">🧩 Bots importés</div>${imps.map(botRow).join('')}` : '')
   ) || (fixBanner + empty);
-  if (botsHtml !== lastBotsHtml) { lastBotsHtml = botsHtml; $('bots').innerHTML = botsHtml; }
+  if (botsHtml !== lastBotsHtml && !sourisEnfoncee) { lastBotsHtml = botsHtml; $('bots').innerHTML = botsHtml; }
 
   // Mode jeu
   $('gm-enabled').checked = !!st.cfg.gameMode.enabled;
@@ -470,12 +482,16 @@ $('upd-check').addEventListener('click', async () => {
   $('upd-check').disabled = true;
   $('upd-status').textContent = '⏳ Recherche de mise à jour…';
   let r; try { r = await window.panel.checkUpdate(); } catch { r = { state: 'error' }; }
+  // `version`, `current` et `message` viennent du flux de mise à jour DISTANT (electron-updater
+  // recopie tel quel le contenu du latest.yml téléchargé dans ses messages d'erreur) : jamais
+  // d'interpolation brute dans innerHTML. Le reste du gabarit contient du <b> volontaire, donc on
+  // échappe les valeurs une par une plutôt que la chaîne entière.
   const msg = {
     dev: 'ℹ️ L\'auto-update ne fonctionne que dans la version installée (Setup.exe), pas en développement.',
-    uptodate: `✅ Tu as déjà la dernière version (${r.current || ''}).`,
-    available: `⬇️ Nouvelle version <b>${r.version || ''}</b> trouvée — téléchargement en cours, elle sera prête dans un instant.`,
+    uptodate: `✅ Tu as déjà la dernière version (${esc(r.current || '')}).`,
+    available: `⬇️ Nouvelle version <b>${esc(r.version || '')}</b> trouvée — téléchargement en cours, elle sera prête dans un instant.`,
     downloaded: '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».',
-    error: `⚠️ Impossible de vérifier maintenant${r.message ? ' (' + r.message + ')' : ''}. Réessaie plus tard.`,
+    error: `⚠️ Impossible de vérifier maintenant${r.message ? ' (' + esc(r.message) + ')' : ''}. Réessaie plus tard.`,
   }[r.state] || '⚠️ Réponse inattendue.';
   updMsg = msg;
   $('upd-status').innerHTML = msg;
@@ -510,10 +526,10 @@ const renderUpdateStatus = (s) => {
     $('upd-check').disabled = false;
     $('upd-apply').style.display = '';
   } else if (s.state === 'available') {
-    st.innerHTML = `⬇️ Nouvelle version <b>${s.version || ''}</b> trouvée — téléchargement…`;
+    st.innerHTML = `⬇️ Nouvelle version <b>${esc(s.version || '')}</b> trouvée — téléchargement…`;
     $('upd-check').disabled = true;
   } else if (s.state === 'error') {
-    st.innerHTML = `⚠️ MàJ : ${s.message || 'erreur'}`;
+    st.innerHTML = `⚠️ MàJ : ${esc(s.message || 'erreur')}`;
     $('upd-check').disabled = false;
   }
 };
