@@ -144,6 +144,7 @@ const redactSensitive = (s) => String(s || '')
 // problème (dossier déplacé, dépendance manquante, token révoqué). S'acharner ne le réparerait pas et
 // noierait l'alerte — qui est justement ce qui doit rester visible dans ce cas.
 const AUTO_HEAL_DELAYS_MS = [5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000];
+const AUTO_HEAL_MAX = AUTO_HEAL_DELAYS_MS.length; // source unique du plafond (main.js le lit aussi)
 
 /**
  * Faut-il tenter une relance maintenant ? PURE : l'appelant a déjà écarté les arrêts volontaires,
@@ -152,12 +153,66 @@ const AUTO_HEAL_DELAYS_MS = [5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000];
  * @param downSince quand le bot est passé hors ligne (0/absent = inconnu → on ne tente rien)
  * @param tries     relances déjà tentées dans cet épisode
  */
-const shouldAutoHeal = (now, downSince, tries) => {
+const shouldAutoHeal = (now, downSince, tries, lastTryAt) => {
   const debut = Number(downSince);
   if (!Number.isFinite(debut) || debut <= 0) return false;
   const t = Number(tries) || 0;
   if (t >= AUTO_HEAL_DELAYS_MS.length) return false; // plafond atteint : on laisse l'alerte parler
-  return now - debut >= AUTO_HEAL_DELAYS_MS[t];
+  // Le délai court depuis le DERNIER essai — depuis la chute seulement pour le premier. Compté
+  // depuis la chute, un bot tombé depuis longtemps (panel redémarré et état repris du disque, ou
+  // longue coupure) voyait 5, 15 et 60 min déjà tous écoulés : ses trois tentatives partaient en
+  // trente secondes, l'espacement croissant ne servait plus à rien et l'abandon tombait aussitôt.
+  const depuis = t === 0 ? debut : (Number(lastTryAt) || debut);
+  return now - depuis >= AUTO_HEAL_DELAYS_MS[t];
+};
+
+// Une relance est-elle DUE pour au moins un bot suivi ? Sert au tick à décider s'il doit lire la
+// liste des process (voir needProcScan) : sans ce terme, la relance automatique ne s'exécutait
+// jamais quand le panel vit dans la zone de notification — son seul mode d'usage réel.
+// On teste « due », pas « présent dans la table » : un bot mort pour de bon y reste indéfiniment,
+// et forcer un `tasklist` à chaque tick pour lui réintroduirait le coût qu'on cherche à éviter.
+const healPending = (now, entries) => {
+  for (const [, v] of (entries || [])) {
+    if (v && shouldAutoHeal(now, v.downSince, v.tries, v.lastTryAt)) return true;
+  }
+  return false;
+};
+
+// ---------- Nettoyage de l'historique et de l'état de surveillance ----------
+// Extrait de loadCfg (qui approchait 120 lignes) pour être TESTABLE : ces deux structures sont
+// indexées par nom de bot et alimentent des relances `pm2 start`. Une clé « __proto__ » ou un
+// horodatage corrompu venant d'un fichier édité à la main ne doit jamais atteindre ce code.
+// Elles sont RECONSTRUITES depuis un objet vide, jamais recopiées telles quelles.
+const { isSafeName: _sain } = require('./validators');
+
+const sanitizeIncidents = (raw, max = 40) =>
+  (Array.isArray(raw) ? raw : [])
+    .filter((i) => i && _sain(i.name) && Number.isFinite(i.at))
+    .map((i) => ({
+      at: i.at,
+      name: i.name,
+      kind: String(i.kind || '').slice(0, 16),
+      cause: String(i.cause || '').slice(0, 160),
+    }))
+    .slice(-max);
+
+const sanitizeRuntime = (raw) => {
+  const r = (raw && typeof raw === 'object') ? raw : {};
+  const lastAlertAt = {}, heal = {};
+  const a = (r.lastAlertAt && typeof r.lastAlertAt === 'object') ? r.lastAlertAt : {};
+  for (const k of Object.keys(a)) if (_sain(k) && Number.isFinite(a[k])) lastAlertAt[k] = a[k];
+  const h = (r.heal && typeof r.heal === 'object') ? r.heal : {};
+  for (const k of Object.keys(h)) {
+    const v = h[k];
+    if (_sain(k) && v && typeof v === 'object' && Number.isFinite(v.downSince)) {
+      heal[k] = {
+        downSince: v.downSince,
+        tries: clampInt(v.tries, 0, 9, 0),
+        lastTryAt: Number.isFinite(v.lastTryAt) ? v.lastTryAt : 0,
+      };
+    }
+  }
+  return { lastAlertAt, heal };
 };
 
 // ---------- Alertes : arrêt volontaire vs panne ----------
@@ -168,8 +223,14 @@ const shouldAutoHeal = (now, downSince, tries) => {
 const TRANSIENT_STATUS = new Set(['stopping', 'launching', 'one-launch-status']);
 const TRANSIENT_MAX_TICKS = 3; // au-delà, l'état n'est plus « de passage », il est bloqué → on alerte
 
+// N'exige PAS que le bot ait été « en ligne » avant. Un `pm2 stop` tapé au terminal sur un bot DÉJÀ
+// tombé (errored) le fait passer errored → stopped sans transition depuis 'online' : l'arrêt n'était
+// donc pas reconnu comme volontaire, et la relance automatique rallumait cinq minutes plus tard un
+// bot que l'utilisateur venait délibérément d'éteindre. pm2 ne fait jamais errored → stopped de
+// lui-même : cette transition ne peut venir que d'une commande.
 const isDeliberateStop = (prev, cur) =>
-  !!prev && !!cur && prev.status === 'online' && cur.status === 'stopped' && cur.restarts <= prev.restarts;
+  !!prev && !!cur && cur.status === 'stopped' && prev.status !== 'stopped'
+  && cur.restarts <= prev.restarts;
 
 /**
  * Décide quoi faire d'une transition d'état de bot. Fonction PURE : aucune notification, aucune
@@ -337,5 +398,6 @@ module.exports = {
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
-  TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS,
+  TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
+  sanitizeIncidents, sanitizeRuntime, healPending,
 };

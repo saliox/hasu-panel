@@ -142,7 +142,13 @@ const render = (st) => {
   let bannerHtml, bannerCls;
   if (st.game) {
     bannerCls = 'banner game';
-    const lownet = st.lowNetActive ? ' · 🌐 faible usage internet actif' : '';
+    // « actif » seulement si le drapeau que LISENT les bots a bien pu être écrit : sinon le bandeau
+    // annonçait une fonctionnalité dont la moitié ne s'appliquait pas (les bots ne différaient rien).
+    const lownet = st.lowNetActive
+      ? (st.lowNetFlagOk === false
+        ? ' · ⚠️ éco réseau : priorités appliquées, mais le signal envoyé aux bots n’est pas passé'
+        : ' · 🌐 faible usage internet actif')
+      : '';
     bannerHtml = (!st.online && st.cfg.gameMode.soloSkip !== false)
       ? `🎮 <b>${esc(st.game)}</b> détecté — partie <b>solo</b> : les bots restent en ligne${lownet}`
       : `🎮 <b>Jeu en ligne :</b>&nbsp;${esc(st.game)}${st.stoppedByGame.length ? ` — <b>${st.stoppedByGame.length} bot(s) coupé(s)</b> (relance auto à la fin de la partie)` : st.cfg.gameMode.enabled ? ' — aucun bot à couper' : ' — mode jeu désactivé'}${lownet}`;
@@ -438,10 +444,10 @@ document.addEventListener('click', async (e) => {
   if (t.id === 'tc-node') { window.open?.('https://nodejs.org/fr/download'); return; }
   if (t.id === 'tc-pm2') {
     t.disabled = true;
-    const st = document.getElementById('tc-pm2-status'); if (st) st.textContent = ' ⏳ installation de pm2… (jusqu\'à 1 min)';
+    const zone = document.getElementById('tc-pm2-status'); if (zone) zone.textContent = ' ⏳ installation de pm2… (jusqu\'à 1 min)';
     let r; try { r = await window.panel.installPm2(); } catch { r = { ok: false }; }
-    if (r.ok) { if (st) st.textContent = ' ✅ pm2 installé !'; setTimeout(refresh, 800); }
-    else { t.disabled = false; if (st) st.textContent = r.reason === 'no-node' ? ' ❌ Node.js requis d\'abord.' : ' ❌ Échec — réessaie ou installe pm2 à la main.'; }
+    if (r.ok) { if (zone) zone.textContent = ' ✅ pm2 installé !'; setTimeout(refresh, 800); }
+    else { t.disabled = false; if (zone) zone.textContent = r.reason === 'no-node' ? ' ❌ Node.js requis d\'abord.' : ' ❌ Échec — réessaie ou installe pm2 à la main.'; }
     return;
   }
   const addExe = t.closest?.('[data-addexe]');
@@ -567,24 +573,24 @@ const renderUpdateStatus = (s) => {
   if (s.state === 'downloading' || s.state === 'available') upd.sawDl = true;
   if (s.state === 'downloaded' && s.version !== upd.dismissed) upd.dismissed = ''; // nouvelle version = on ré-affiche
   paintUpdCard();
-  const st = $('upd-status');
+  const zone = $('upd-status'); // (renommé : `st` désigne l'objet de statut partout ailleurs)
   if (s.state === 'downloading') {
     const pct = Math.max(0, Math.min(100, s.percent || 0));
     const speed = s.bps ? ` · ${fmtBps(s.bps)}` : '';
     const size = (s.transferred && s.total) ? ` · ${(s.transferred / 1e6).toFixed(0)}/${(s.total / 1e6).toFixed(0)} Mo` : '';
-    st.innerHTML = `⬇️ Téléchargement de la mise à jour… <b>${pct}%</b>${speed}${size}`
+    zone.innerHTML = `⬇️ Téléchargement de la mise à jour… <b>${pct}%</b>${speed}${size}`
       + `<div class="upd-bar"><div class="upd-bar-fill" style="width:${pct}%"></div></div>`;
     $('upd-check').disabled = true;
     $('upd-apply').style.display = 'none';
   } else if (s.state === 'downloaded') {
-    st.innerHTML = '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».';
+    zone.innerHTML = '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».';
     $('upd-check').disabled = false;
     $('upd-apply').style.display = '';
   } else if (s.state === 'available') {
-    st.innerHTML = `⬇️ Nouvelle version <b>${esc(s.version || '')}</b> trouvée — téléchargement…`;
+    zone.innerHTML = `⬇️ Nouvelle version <b>${esc(s.version || '')}</b> trouvée — téléchargement…`;
     $('upd-check').disabled = true;
   } else if (s.state === 'error') {
-    st.innerHTML = `⚠️ MàJ : ${esc(s.message || 'erreur')}`;
+    zone.innerHTML = `⚠️ MàJ : ${esc(s.message || 'erreur')}`;
     $('upd-check').disabled = false;
   }
 };

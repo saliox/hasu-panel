@@ -40,19 +40,22 @@ const champsEnvoyes = new Set(
   [...corpsStatus.matchAll(/^\s{2}([A-Za-z_$][\w$]*)\s*[:,]/gm)].map((m) => m[1])
 );
 
-// Corps de `render(st)` UNIQUEMENT : ailleurs dans ui/app.js, `st` désigne un élément du DOM
-// (`const st = $('upd-status')`), et relever ses propriétés donnait de faux manquants (textContent…).
-const corpsRender = (() => {
-  const i = UI.indexOf('const render = (st) => {');
-  assert.ok(i > 0, 'fonction render(st) introuvable dans ui/app.js');
-  let d = 0, fin = -1;
-  for (let k = UI.indexOf('{', i); k < UI.length; k++) {
-    if (UI[k] === '{') d++;
-    else if (UI[k] === '}') { d--; if (d === 0) { fin = k; break; } }
-  }
-  assert.ok(fin > 0, 'fin de render(st) introuvable');
-  return UI.slice(i, fin);
-})();
+// On fouille TOUT ui/app.js, pas seulement le corps de render().
+//
+// La première version se limitait à render() parce qu'un `const st = $('upd-status')` masquait
+// l'objet de statut et produisait de faux manquants (textContent, innerHTML). Mais restreindre la
+// fouille créait un FAUX NÉGATIF bien pire : un champ lu depuis un helper appelé par render() —
+// c'est-à-dire le sens dans lequel ce fichier évolue — n'était plus vérifié du tout. Le masquage a
+// donc été levé à la source (la variable locale s'appelle `zone`), et on peut fouiller partout.
+const corpsRender = UI;
+
+test('garde-fou : aucune variable locale ne masque plus l\'objet de statut', () => {
+  // Si quelqu'un réintroduit un `const st = …` local, la fouille globale ci-dessus redevient
+  // bruyante et ce test le dit tout de suite, au lieu de laisser le contrat se dégrader en silence.
+  const masques = [...UI.matchAll(/\b(?:const|let|var)\s+st\s*=/g)];
+  assert.equal(masques.length, 0,
+    'une variable locale nommée `st` masque l\'objet de statut : renomme-la (voir `zone`)');
+});
 
 test('panel:status envoie bien les champs que l\'écran lit', () => {
   const lus = new Set([...corpsRender.matchAll(/\bst\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]));

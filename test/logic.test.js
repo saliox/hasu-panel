@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, computeDefaultBounds, boundsAreVisible, pollDelayFor,
-  cleanNotes, pickCfgSource,
+  cleanNotes, pickCfgSource, decideAlert,
 } = require('../logic');
 
 // ------------------------------------------- config : quelle copie charger ?
@@ -479,4 +479,149 @@ test('shouldAutoHeal : date de chute inconnue ou corrompue → on ne tente rien'
     assert.equal(shouldAutoHeal(T, bad, 0), false, String(bad));
   }
   assert.equal(shouldAutoHeal(T, T - 60 * MIN, NaN), true, 'un compteur d\'essais corrompu vaut 0');
+});
+
+// ------------------------------------- branches défensives (entrées dégradées)
+// Chaque cas ci-dessous correspond à une branche que la couverture signalait comme jamais prise, et
+// à une entrée RÉALISTE : champ de config vide, commande système muette, API écran en échec.
+test('clampInt : une chaîne VIDE retombe sur le défaut (champ de formulaire effacé)', () => {
+  // Number('') vaut 0 : sans la garde, un pollSec effacé devenait 5 s et doublait la cadence.
+  assert.equal(clampInt('', 5, 120, 10), 10);
+  assert.equal(clampInt('   ', 5, 120, 10), 10);
+});
+
+test('parseTasklistCsv / hasEstablishedPublic : sortie muette ou PID absents', () => {
+  // tasklist peut renvoyer une chaîne vide (charge disque, blocage antivirus) : pas de plantage.
+  const r = parseTasklistCsv(undefined);
+  assert.equal(r.names.size, 0);
+  assert.equal(parseTasklistCsv('').names.size, 0);
+  assert.equal(hasEstablishedPublic('TCP 1.2.3.4:1 5.6.7.8:2 ESTABLISHED 42', undefined), false);
+  assert.equal(hasEstablishedPublic(undefined, [42]), false);
+});
+
+test('decideAlert : instantané précédent absent (premier tick) → aucune décision', () => {
+  assert.equal(decideAlert(null, { status: 'stopped', restarts: 0 }, { name: 'x' }).alert, null);
+  assert.equal(decideAlert({ status: 'online', restarts: 0 }, null, { name: 'x' }).alert, null);
+});
+
+test('computeDefaultBounds / boundsAreVisible : API écran en échec', () => {
+  // screen.getPrimaryDisplay() peut lever (session verrouillée, écran débranché) : on veut une
+  // fenêtre utilisable plutôt qu'un plantage au démarrage.
+  const b = computeDefaultBounds(undefined);
+  assert.ok(b.width > 0 && b.height > 0);
+  assert.equal(boundsAreVisible({ x: 0, y: 0, width: 800, height: 600 }, undefined), false);
+  // Un écran renvoyé SANS workArea (formes dégradées d'Electron) : on retombe sur l'objet lui-même.
+  assert.equal(boundsAreVisible({ x: 100, y: 100, width: 800, height: 600 },
+    [{ x: 0, y: 0, width: 1920, height: 1080 }]), true);
+});
+
+test('pollDelayFor : idlePollSec absent → 30 s par défaut', () => {
+  assert.equal(pollDelayFor(false, { pollSec: 10 }), 30000);
+});
+
+test('cleanNotes : entrées de tableau sans champ « note »', () => {
+  // electron-updater renvoie parfois [{version, note: null}] : ne doit produire aucune ligne fantôme.
+  assert.deepEqual(cleanNotes([{ version: '1.0.0' }]), []);
+  assert.deepEqual(cleanNotes([{ version: '1.0.0', note: null }, { note: '<li>vrai</li>' }]), ['• vrai']);
+});
+
+// ------------------- nettoyage de l'historique et de l'état de surveillance
+// Extraits de loadCfg pour être testables : ces structures viennent d'un fichier JSON sur le disque
+// (éditable à la main, corruptible) et alimentent des relances `pm2 start`.
+const { sanitizeIncidents, sanitizeRuntime } = require('../logic');
+
+test('sanitizeIncidents : garde les entrées valides, borne la taille, tronque les champs', () => {
+  const brut = [{ at: 1, name: 'saliox', kind: 'chute', cause: 'x'.repeat(500) }];
+  const out = sanitizeIncidents(brut);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].cause.length, 160, 'la cause est tronquée');
+  // kind absent : un incident écrit par une version future/plus ancienne ne doit pas produire
+  // "undefined" à l'écran (la liste affiche cette valeur telle quelle).
+  assert.equal(sanitizeIncidents([{ at: 1, name: 'saliox' }])[0].kind, '');
+  const cinquante = Array.from({ length: 50 }, (_, i) => ({ at: i, name: 'bot', kind: 'chute', cause: '' }));
+  assert.equal(sanitizeIncidents(cinquante).length, 40, 'plafond à 40');
+  assert.equal(sanitizeIncidents(cinquante, 5).length, 5);
+  assert.equal(sanitizeIncidents(cinquante, 5)[0].at, 45, 'ce sont les PLUS RÉCENTS qui restent');
+});
+
+test('sanitizeIncidents : rejette tout ce qui n\'est pas exploitable', () => {
+  const out = sanitizeIncidents([
+    { at: 1, name: '__proto__', kind: 'chute' },      // pollution de prototype
+    { at: 1, name: '-rf', kind: 'chute' },            // nom refusé par isSafeName ? (accepté en lecture)
+    { at: 'hier', name: 'saliox' },                   // horodatage non numérique
+    { name: 'saliox' },                               // pas d'horodatage
+    null, undefined, 'chaine', 42,
+  ]);
+  assert.equal(out.some((i) => i.name === '__proto__'), false, '__proto__ ne doit jamais passer');
+  assert.equal(out.every((i) => Number.isFinite(i.at)), true);
+});
+
+test('sanitizeIncidents : entrée non tabulaire → tableau vide', () => {
+  for (const bad of [null, undefined, {}, 'x', 42]) assert.deepEqual(sanitizeIncidents(bad), []);
+});
+
+test('sanitizeRuntime : reconstruit depuis zéro, jamais de recopie', () => {
+  const out = sanitizeRuntime({
+    lastAlertAt: { saliox: 1000, __proto__: 5, 'hasu-music': 'bientot' },
+    heal: { saliox: { downSince: 2000, tries: 2 }, mauvais: { downSince: 'x' }, __proto__: { downSince: 1 } },
+  });
+  assert.deepEqual(Object.keys(out.lastAlertAt), ['saliox'], 'seul un nom sûr avec un nombre survit');
+  assert.deepEqual(out.heal, { saliox: { downSince: 2000, tries: 2, lastTryAt: 0 } });
+  assert.equal(Object.getPrototypeOf(out.heal), Object.prototype, 'le prototype n\'a pas été touché');
+});
+
+test('sanitizeRuntime : compteur d\'essais borné, structures inattendues absorbées', () => {
+  assert.equal(sanitizeRuntime({ heal: { a: { downSince: 1, tries: 999 } } }).heal.a.tries, 9);
+  assert.equal(sanitizeRuntime({ heal: { a: { downSince: 1, tries: 'x' } } }).heal.a.tries, 0);
+  assert.equal(sanitizeRuntime({ heal: { a: { downSince: 1 } } }).heal.a.tries, 0);
+  assert.equal(sanitizeRuntime({ heal: { a: 'pas un objet' } }).heal.a, undefined);
+  for (const bad of [null, undefined, 'x', 42, []]) assert.deepEqual(sanitizeRuntime(bad), { lastAlertAt: {}, heal: {} });
+});
+
+test('sanitizeRuntime : aller-retour sans perte pour des données saines', () => {
+  const sain = { lastAlertAt: { saliox: 1700000000000 }, heal: { 'hasu-music': { downSince: 1700000000001, tries: 1, lastTryAt: 1700000000002 } } };
+  assert.deepEqual(sanitizeRuntime(sain), sain);
+});
+
+// ---- non-régression : les défauts trouvés par l'audit du lot de relance automatique ----
+const { healPending, isDeliberateStop } = require('../logic');
+
+test('shouldAutoHeal : les délais courent depuis le DERNIER essai, pas depuis la chute', () => {
+  // Défaut trouvé : un bot tombé depuis longtemps (panel redémarré, état repris du disque) avait
+  // 5, 15 et 60 min tous déjà écoulés — ses trois tentatives partaient en trente secondes et
+  // l'abandon tombait aussitôt, l'espacement croissant ne servant plus à rien.
+  const tombe = T - 3 * 60 * MIN; // à terre depuis 3 h
+  assert.equal(shouldAutoHeal(T, tombe, 0, 0), true, '1er essai : dû');
+  assert.equal(shouldAutoHeal(T, tombe, 1, T), false, '2e essai juste après le 1er : NON');
+  assert.equal(shouldAutoHeal(T, tombe, 1, T - 14 * MIN), false);
+  assert.equal(shouldAutoHeal(T, tombe, 1, T - 15 * MIN), true, '15 min après le 1er : dû');
+  assert.equal(shouldAutoHeal(T, tombe, 2, T - 59 * MIN), false);
+  assert.equal(shouldAutoHeal(T, tombe, 2, T - 60 * MIN), true);
+});
+
+test('healPending : vrai seulement si une relance est réellement DUE', () => {
+  // Sert au tick à décider de lire la liste des process. Un bot présent dans la table mais dont
+  // les 3 essais sont épuisés ne doit RIEN forcer : sinon un `tasklist` par tick, pour toujours.
+  const due = new Map([['a', { downSince: T - 10 * MIN, tries: 0, lastTryAt: 0 }]]);
+  const pasEncore = new Map([['a', { downSince: T - 1 * MIN, tries: 0, lastTryAt: 0 }]]);
+  const epuise = new Map([['a', { downSince: T - 10 * 60 * MIN, tries: 3, lastTryAt: T - 5 * 60 * MIN }]]);
+  assert.equal(healPending(T, due), true);
+  assert.equal(healPending(T, pasEncore), false);
+  assert.equal(healPending(T, epuise), false, 'un bot mort pour de bon ne doit rien déclencher');
+  assert.equal(healPending(T, new Map()), false);
+  assert.equal(healPending(T, null), false);
+  // un seul bot dû parmi plusieurs suffit
+  assert.equal(healPending(T, new Map([...epuise, ...due])), true);
+});
+
+test('isDeliberateStop : un « pm2 stop » sur un bot DÉJÀ tombé compte comme volontaire', () => {
+  // Défaut trouvé : la règle exigeait un état précédent « online ». Couper au terminal un bot déjà
+  // en erreur ne produisait donc aucune transition depuis 'online' → l'arrêt n'était pas reconnu,
+  // et la relance automatique rallumait cinq minutes plus tard un bot délibérément éteint.
+  assert.equal(isDeliberateStop({ status: 'errored', restarts: 5 }, { status: 'stopped', restarts: 5 }), true);
+  assert.equal(isDeliberateStop({ status: 'online', restarts: 0 }, { status: 'stopped', restarts: 0 }), true);
+  // …mais un plantage (compteur de redémarrages qui grimpe) reste une panne, pas un arrêt voulu
+  assert.equal(isDeliberateStop({ status: 'online', restarts: 3 }, { status: 'stopped', restarts: 7 }), false);
+  // …et rester arrêté n'est pas un nouvel arrêt
+  assert.equal(isDeliberateStop({ status: 'stopped', restarts: 2 }, { status: 'stopped', restarts: 2 }), false);
 });

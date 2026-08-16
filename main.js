@@ -114,7 +114,7 @@ const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, cleanNotes,
-  shouldAutoHeal,
+  shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
 } = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
@@ -319,26 +319,11 @@ const loadCfg = () => {
       alertSound: raw.alertSound !== false, alertVolume: clampInt(raw.alertVolume, 1, 100, 10),
       autoApplyUpdates: raw.autoApplyUpdates !== false,
       autoHeal: raw.autoHeal !== false,
-      // Historique et état de surveillance : RECONSTRUITS depuis zéro, jamais recopiés tels quels.
-      // Ces structures sont indexées par nom de bot et alimentent des relances pm2 : une clé
-      // « __proto__ » ou un horodatage corrompu venant d'un fichier édité à la main ne doit pas
-      // atteindre le code qui décide de démarrer un process.
-      incidents: (Array.isArray(raw.incidents) ? raw.incidents : [])
-        .filter((i) => i && isSafeName(i.name) && Number.isFinite(i.at))
-        .map((i) => ({ at: i.at, name: i.name, kind: String(i.kind || '').slice(0, 16), cause: String(i.cause || '').slice(0, 160) }))
-        .slice(-40),
-      runtime: (() => {
-        const r = (raw.runtime && typeof raw.runtime === 'object') ? raw.runtime : {};
-        const alertes = {}, heal = {};
-        const a = (r.lastAlertAt && typeof r.lastAlertAt === 'object') ? r.lastAlertAt : {};
-        for (const k of Object.keys(a)) if (isSafeName(k) && Number.isFinite(a[k])) alertes[k] = a[k];
-        const h = (r.heal && typeof r.heal === 'object') ? r.heal : {};
-        for (const k of Object.keys(h)) {
-          const v = h[k];
-          if (isSafeName(k) && v && Number.isFinite(v.downSince)) heal[k] = { downSince: v.downSince, tries: clampInt(v.tries, 0, 9, 0) };
-        }
-        return { lastAlertAt: alertes, heal };
-      })(),
+      // Historique et état de surveillance : nettoyage dans logic.js, donc TESTÉ (pollution de
+      // prototype, horodatages corrompus, structures inattendues). Ces données alimentent des
+      // relances `pm2 start` : rien de douteux ne doit franchir cette ligne.
+      incidents: sanitizeIncidents(raw.incidents, INCIDENTS_MAX),
+      runtime: sanitizeRuntime(raw.runtime),
       // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
       // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
       // MIGRATION `winSizeV2` : les versions ≤ 1.9.2 ouvraient une petite fenêtre, et cette taille a été
@@ -823,13 +808,22 @@ const persistRuntime = () => {
 const hydrateRuntime = () => {
   const r = (cfg.runtime && typeof cfg.runtime === 'object') ? cfg.runtime : { lastAlertAt: {}, heal: {} };
   const now = Date.now(), PEREMPTION = 24 * 3600 * 1000;
-  for (const [k, v] of Object.entries(r.lastAlertAt || {})) if (now - v < PEREMPTION) lastAlertAt.set(k, v);
-  for (const [k, v] of Object.entries(r.heal || {})) if (now - v.downSince < PEREMPTION) healState.set(k, { downSince: v.downSince, tries: v.tries || 0 });
+  // Un horodatage dans le FUTUR (horloge reculée, fichier bricolé) rend `now - t` négatif : il passe
+  // la péremption, puis bloque l'anti-doublon et la relance POUR TOUJOURS, sans rien dire. On le
+  // ramène à maintenant plutôt que de le jeter — l'état reste utile, il redevient simplement sain.
+  const borne = (t) => (Number.isFinite(t) && t <= now ? t : now);
+  for (const [k, v] of Object.entries(r.lastAlertAt || {})) if (now - v < PEREMPTION) lastAlertAt.set(k, borne(v));
+  for (const [k, v] of Object.entries(r.heal || {})) {
+    if (now - v.downSince < PEREMPTION) {
+      healState.set(k, { downSince: borne(v.downSince), tries: v.tries || 0, lastTryAt: borne(v.lastTryAt || 0) });
+    }
+  }
   if (lastAlertAt.size || healState.size) log('surveillance reprise :', lastAlertAt.size, 'alerte(s) suivie(s),', healState.size, 'bot(s) en attente de relance');
 };
 
 // Renvoie l'ensemble des bots dont l'instantané ne doit PAS avancer (statut de passage).
 const transientTicks = new Map(); // nom → nombre de ticks consécutifs passés dans un statut de passage
+const lastIncidentAt = new Map(); // nom → dernier incident journalisé (anti-noyade sur un bot qui boucle)
 const applyTransitions = (bots, prev) => {
   const now = Date.now();
   const notifyAllowed = cfg.alerts !== false
@@ -857,10 +851,20 @@ const applyTransitions = (bots, prev) => {
 
     // 1bis) Suivi de la chute, pour la relance automatique. Indépendant des notifications : c'est de
     // la remise en service, pas de l'information. Un bot revenu en ligne clôt son épisode.
+    //
+    // Le suivi ne peut PAS dépendre d'une transition observée (`d.alert`) : un bot déjà à terre quand
+    // le panel démarre n'en produit aucune — c'est pourtant le scénario fondateur, le panel qu'on
+    // rallume et qui trouve des bots morts. On suit donc tout bot durablement hors ligne que la
+    // configuration veut en ligne. `manualStop` reste le seul juge de « c'est moi qui l'ai coupé ».
     if (b.status === 'online') {
       if (healState.delete(b.name)) changed = true;
-    } else if (!healState.has(b.name) && (d.alert === 'down' || d.alert === 'looping')) {
-      healState.set(b.name, { downSince: now, tries: 0 });
+    } else if (!healState.has(b.name)
+        && conf && conf.auto !== false && !conf.manualStop
+        && !cfg.stoppedByGame.includes(b.name)) {
+      // `uptime` est la dernière date de démarrage connue de pm2 : bien meilleure que « maintenant »
+      // pour un bot tombé pendant que le panel était éteint (sinon le compte à rebours repart à zéro
+      // à chaque lancement, et un bot mort depuis des heures attend encore 5 min).
+      healState.set(b.name, { downSince: Number(b.uptime) > 0 ? Number(b.uptime) : now, tries: 0, lastTryAt: 0 });
       changed = true;
     }
 
@@ -884,11 +888,23 @@ const applyTransitions = (bots, prev) => {
     }
     // L'incident est journalisé AVANT la garde des notifications : l'historique doit rester complet
     // même alertes coupées, sinon il ne répond plus à « que s'est-il passé cette nuit ? ».
-    const cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
-    addIncident(b.name, d.alert === 'looping' ? 'boucle' : 'chute', cause); changed = true;
+    // Un bot en boucle de plantage rejoue « looping » à CHAQUE tick : sans ce garde-fou, c'était un
+    // incident + une lecture disque de 8 Ko + une réécriture COMPLÈTE de la config toutes les 10 s,
+    // et les 40 entrées d'historique étaient noyées par un seul bot en dix minutes. On n'enregistre
+    // qu'un incident par bot et par fenêtre d'anti-doublon.
+    let cause = null; // null = pas encore lue (la lecture du log coûte 8 Ko sur le thread principal)
+    const dernier = lastIncidentAt.get(b.name) || 0;
+    if (now - dernier >= ALERT_DEDUP_MS) {
+      lastIncidentAt.set(b.name, now);
+      cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
+      addIncident(b.name, d.alert === 'looping' ? 'boucle' : 'chute', cause); changed = true;
+    }
     if (!notifyAllowed) continue;
     if (now - (lastAlertAt.get(b.name) || 0) < ALERT_DEDUP_MS) continue; // anti-doublon 30 min
     lastAlertAt.set(b.name, now);
+    // La cause a pu ne pas être lue ci-dessus (incident dédoublonné) : on la lit alors ici, car
+    // l'alerte, elle, part — les deux dédoublonnages ont la même durée mais pas le même compteur.
+    if (cause === null) cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
     queueAlert(
       d.alert === 'looping' ? `🔁 ${b.name} redémarre en boucle` : `⚠️ ${b.name} est tombé`,
       (cause ? `**Cause probable :** ${cause}\n` : '') + `État : ${b.status} · redémarrages : ${b.restarts}`,
@@ -904,33 +920,62 @@ const applyTransitions = (bots, prev) => {
 // le verdict, et on écarte tout ce qui rendrait une relance inopportune.
 const runAutoHeal = async () => {
   if (cfg.autoHeal === false || !pm2Health.ok || !healState.size) return;
-  if (statusCache.game || gameUnknown) return; // jamais de travail sous le nez du joueur, ni dans le doute
-  if (busy || actionsInFlight.size || stopAllInFlight) return; // une manœuvre est déjà en cours
+  // `gameUnknown` est BORNÉ comme dans updateBlockers : une panne durable de tasklist (antivirus)
+  // ne doit pas condamner la relance à vie. Sans cette borne, le doute valait interdiction éternelle.
+  const doute = gameUnknown && Date.now() - gameUnknownSince < GAME_UNKNOWN_MAX_MS;
+  const empeche = statusCache.game ? 'jeu en cours'
+    : doute ? 'partie en cours inconnue'
+      : (busy || actionsInFlight.size || stopAllInFlight) ? 'manœuvre en cours' : '';
+  if (empeche) {
+    // Non-silence : si une relance est due et qu'on ne la fait pas, ça doit se lire quelque part.
+    // C'est l'absence exacte de cette ligne qui a laissé le bug ci-dessus invisible.
+    if (healPending(Date.now(), healState) && Date.now() % 600000 < 20000) log('relance en attente —', empeche);
+    return;
+  }
   const now = Date.now();
   let changed = false;
+  // UNE SEULE relance par tick. Le scénario fondateur — coupure Internet, tous les bots tombent
+  // ensemble — les rend tous éligibles à la même minute : la boucle enchaînait alors 2 spawns par bot
+  // (~900 ms chacun) en tenant `tickRunning`, gelant détection de jeu, mode jeu et mises à jour
+  // plusieurs secondes. Les autres passent au tick suivant, 10 s plus tard : sans importance quand
+  // les délais de relance se comptent en minutes.
   for (const b of statusCache.bots) {
     const st = healState.get(b.name);
     if (!st || b.status === 'online') continue;
     const conf = cfg.bots[b.name];
     if (!conf || conf.auto === false || conf.manualStop) continue;   // tu ne veux pas ce bot en ligne
     if (cfg.stoppedByGame.includes(b.name)) continue;                // c'est le mode jeu qui l'a coupé
-    if (!shouldAutoHeal(now, st.downSince, st.tries)) continue;
-    st.tries++; changed = true;                                      // compté AVANT l'await : sinon deux
+    if (!shouldAutoHeal(now, st.downSince, st.tries, st.lastTryAt)) continue;
+    st.tries++; st.lastTryAt = now; changed = true;                  // comptés AVANT l'await : sinon deux
     healState.set(b.name, st);                                       // ticks lents relanceraient en double
     const r = await pm2(['start', b.name]);
-    const apres = await pm2List();
-    const enLigne = !!(apres || []).find((x) => x.name === b.name && x.status === 'online');
-    log('relance automatique :', b.name, `essai ${st.tries}/3 →`, enLigne ? 'OK' : 'échec',
+    // Re-vérifié APRÈS l'attente : tu peux avoir cliqué « arrêter » entre-temps, et la garde d'entrée
+    // de cette fonction date d'avant le spawn. On n'insiste pas contre une action en cours — mais on
+    // ne SUPPRIME PAS l'épisode : le sortir de la surveillance à cause d'une action sur un AUTRE bot
+    // le condamnerait à ne plus jamais être relancé. On repasse simplement au tick suivant.
+    if (actionsInFlight.size || stopAllInFlight || cfg.bots[b.name]?.manualStop) {
+      log('relance automatique interrompue (action en cours) :', b.name, '— reprise au prochain tick');
+      break;
+    }
+    // Un process qui démarre n'est pas « en ligne » à la seconde où pm2 rend la main : il lui faut
+    // le temps de se connecter. Juger tout de suite faisait passer une relance RÉUSSIE pour un échec,
+    // ce qui brûlait les trois essais et envoyait « ne repart pas » sur un bot qui tournait très bien.
+    await new Promise((res) => setTimeout(res, 4000));
+    const apres = await refreshBots();
+    const etat = (apres || []).find((x) => x.name === b.name);
+    const enLigne = !!etat && etat.status === 'online';
+    log('relance automatique :', b.name, `essai ${st.tries}/${AUTO_HEAL_MAX} →`, enLigne ? 'OK' : 'échec',
       enLigne ? '' : String(r.out || '').slice(0, 200));
     addIncident(b.name, enLigne ? 'relance' : 'relance-ko', enLigne ? `essai ${st.tries}` : classifyErrorFr(String(r.out || '')));
     if (enLigne) {
       healState.delete(b.name);
       queueAlert(`🔧 ${b.name} relancé automatiquement`,
         `Il était tombé, le panel l'a redémarré (essai ${st.tries}). Aucune action de ta part.`, 0x57F287, b.name);
-    } else if (st.tries >= 3) {
+    } else if (st.tries >= AUTO_HEAL_MAX) {
       queueAlert(`⛔ ${b.name} ne repart pas`,
-        `Trois relances automatiques ont échoué. Il faut regarder : dossier déplacé, dépendance manquante ou token révoqué.`, 0xED4245, b.name);
+        `${AUTO_HEAL_MAX} relances automatiques ont échoué. Il faut regarder : dossier déplacé, dépendance manquante ou token révoqué.`, 0xED4245, b.name);
     }
+    break; // une seule par tick — voir le commentaire en tête de boucle
   }
   if (changed) { persistRuntime(); saveCfg(); }
 };
@@ -1331,7 +1376,13 @@ const tick = async () => {
   const needProcScan = cfg.gameMode.enabled || cfg.lowNet || cfg.lowNetApplied || cfg.stoppedByGame.length > 0
     || isWindowVisible()
     || (updateReady && cfg.autoApplyUpdates !== false)
-    || scanDu;
+    || scanDu
+    // …et quand une RELANCE est due. Sans ce terme, le scan était sauté en configuration d'usine
+    // (mode jeu désactivé, panel dans la zone de notification), `gameUnknown` restait collé à vrai,
+    // et runAutoHeal sortait sur sa garde à chaque tick : la relance automatique ne s'exécutait
+    // JAMAIS dans son seul mode d'usage réel, tout en s'affichant « activée ». Elle ne marchait que
+    // fenêtre ouverte, c'est-à-dire précisément quand elle ne sert à rien.
+    || (cfg.autoHeal !== false && healPending(Date.now(), healState));
   // Les deux lectures les plus chères du tick — tasklist (~437 ms) et pm2 jlist (~457 ms) — étaient
   // SÉQUENTIELLES : ~900 ms avant que la liste des bots existe, à chaque tick et surtout au démarrage,
   // où c'est exactement le temps pendant lequel la fenêtre paraît vide. Elles sont indépendantes,
@@ -1354,7 +1405,18 @@ const tick = async () => {
   // UNE seule lecture pm2 par tick (lancée ci-dessus, en parallèle du scan de process) : elle sert et
   // à la bascule du mode jeu et à l'affichage. Avant, un lancement de jeu déclenchait deux
   // `pm2 jlist` coup sur coup (tick + enterGameMode).
-  if (freshBots) statusCache.bots = freshBots; // pm2 muet → on garde le dernier état connu
+  if (freshBots) {
+    // Les débits mesurés vivent sur ces objets, et measureNet ne les repose plus qu'un tick sur
+    // trois : remplacer le tableau les effaçait donc deux ticks sur trois, et l'écran affichait
+    // « ↓ 0 o/s » en clignotant. On les reporte, à PID identique et non nul (après un stop, pm2
+    // renvoie pid:0 et tous les bots arrêtés partageraient la même clé).
+    const avant = new Map(statusCache.bots.filter((b) => b.pid > 0).map((b) => [b.name, b]));
+    for (const b of freshBots) {
+      const p = avant.get(b.name);
+      if (p && p.pid === b.pid) { b.netDown = p.netDown; b.netUp = p.netUp; }
+    }
+    statusCache.bots = freshBots; // pm2 muet → on garde le dernier état connu
+  }
   if (procs) {
     const hit = cfg.games.find((g) => procs.names.has(g.toLowerCase()));
     const now = Date.now();
@@ -1846,10 +1908,12 @@ ipcMain.handle('panel:logs', async (_e, { name, which } = {}) => {
   const bot = statusCache.bots.find((b) => b.name === name);
   const file = which === 'err' ? bot?.errLog : bot?.outLog;
   if (!file) return { ok: false, out: '', error: 'Chemin de log inconnu (pm2 ne l\'a pas fourni).' };
-  // tailFile renvoie '' sur TOUTE erreur (fichier tourné par pm2-logrotate, accès refusé) : l'écran
-  // affichait alors « aucun log » alors que le fichier existe mais n'a pas pu être lu. On distingue.
+  // tailFile renvoie '' sur TOUTE erreur (fichier tourné par pm2-logrotate, accès refusé, verrou
+  // exclusif) : l'écran affichait « aucun log » alors que le fichier existe mais n'a pas pu être lu.
+  // On teste par une OUVERTURE réelle et non par accessSync : ce dernier ne consulte que les
+  // permissions et réussit sur un fichier verrouillé — il ne détectait donc pas le cas qu'il nommait.
   let lisible = true;
-  try { fs.accessSync(file, fs.constants.R_OK); } catch { lisible = false; }
+  try { fs.closeSync(fs.openSync(file, 'r')); } catch { lisible = false; }
   const out = tailFile(file);
   return { ok: true, out, file, empty: !out.trim(), unreadable: !out.trim() && !lisible };
 });
