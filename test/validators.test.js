@@ -24,7 +24,6 @@ test('isSafeName : bloque la pollution de prototype et les périphériques Windo
   }
   // Régression concrète : la clé « __proto__ » sur un objet simple réassigne le
   // prototype au lieu de créer une propriété (pollution silencieuse en mémoire).
-  const bots = {};
   const evil = '__proto__';
   assert.equal(isSafeName(evil), false, 'le garde doit refuser AVANT toute écriture cfg.bots[name]');
   assert.equal(RESERVED_NAMES.has(evil), true);

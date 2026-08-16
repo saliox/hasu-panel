@@ -444,3 +444,39 @@ test('classifyErrorFr : le repli est expurgé avant de partir en alerte', () => 
   // …mais le repli reste informatif : c'est le cas où l'alerte sert le plus.
   assert.match(out, /Boom inattendu/);
 });
+
+// --------------------------------------- relance automatique d'un bot tombé
+// Le panel constatait les pannes sans jamais les réparer : quatre bots morts cinq jours durant sur
+// cette machine. La décision « est-ce le moment de retenter ? » est ici ; l'exécution est dans main.js.
+const { shouldAutoHeal, AUTO_HEAL_DELAYS_MS } = require('../logic');
+const MIN = 60 * 1000;
+const T = 1_700_000_000_000;
+
+test('shouldAutoHeal : rien avant le premier délai', () => {
+  assert.equal(shouldAutoHeal(T, T - 2 * MIN, 0), false);
+  assert.equal(shouldAutoHeal(T, T - 4 * MIN, 0), false);
+  assert.equal(shouldAutoHeal(T, T - 5 * MIN, 0), true, 'exactement 5 min = on tente');
+});
+
+test('shouldAutoHeal : espacement CROISSANT entre les essais', () => {
+  // Les délais se comptent depuis la chute, pas depuis l'essai précédent.
+  assert.equal(shouldAutoHeal(T, T - 6 * MIN, 1), false, '6 min : trop tôt pour le 2e essai');
+  assert.equal(shouldAutoHeal(T, T - 15 * MIN, 1), true);
+  assert.equal(shouldAutoHeal(T, T - 30 * MIN, 2), false, '30 min : trop tôt pour le 3e');
+  assert.equal(shouldAutoHeal(T, T - 60 * MIN, 2), true);
+});
+
+test('shouldAutoHeal : PLAFOND à 3 essais — on cesse et on laisse l\'alerte parler', () => {
+  // S'acharner ne répare pas un dossier déplacé ou un token révoqué, et noierait l'alerte.
+  assert.equal(shouldAutoHeal(T, T - 24 * 60 * MIN, 3), false);
+  assert.equal(shouldAutoHeal(T, T - 24 * 60 * MIN, 9), false);
+  assert.equal(AUTO_HEAL_DELAYS_MS.length, 3);
+});
+
+test('shouldAutoHeal : date de chute inconnue ou corrompue → on ne tente rien', () => {
+  // Ce retour déclenche un `pm2 start` : dans le doute, il ne se passe rien.
+  for (const bad of [0, -1, NaN, undefined, null, 'hier', {}]) {
+    assert.equal(shouldAutoHeal(T, bad, 0), false, String(bad));
+  }
+  assert.equal(shouldAutoHeal(T, T - 60 * MIN, NaN), true, 'un compteur d\'essais corrompu vaut 0');
+});

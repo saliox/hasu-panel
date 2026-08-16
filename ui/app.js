@@ -111,7 +111,7 @@ $('updcard').addEventListener('click', async (e) => {
   }
 });
 
-let lastWarnHtml = null;
+let lastWarnHtml = null, lastIncHtml = null;
 
 // Vrai entre `mousedown` et `mouseup` : pendant ce laps, aucune zone cliquable ne doit être remplacée,
 // sinon le `click` n'est jamais émis (il exige un ancêtre commun encore vivant entre les deux
@@ -263,6 +263,21 @@ const render = (st) => {
     : 'Aucune sauvegarde pm2 depuis ce panel.';
   $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.' : (st.cfg.discordAppId ? ' — ✅ activée.' : ' — ⚠️ colle ton Application ID pour l\'activer.');
 
+  $('set-autoheal').checked = st.autoHeal !== false;
+
+  // Derniers incidents — le panel voyait chaque chute et l'oubliait aussitôt. Écrit seulement quand
+  // la liste change : c'est du DOM reconstruit, et le sondage passe toutes les 3 s.
+  const ICONES = { chute: '⚠️', boucle: '🔁', retour: '✅', relance: '🔧', 'relance-ko': '⛔' };
+  const incHtml = (st.incidents || []).length
+    ? (st.incidents || []).map((i) => {
+      const h = new Date(i.at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+      return `<div style="padding:3px 0;border-bottom:1px solid var(--line)">`
+        + `<span style="opacity:.7">${esc(h)}</span> ${ICONES[i.kind] || '•'} <b>${esc(i.name)}</b>`
+        + (i.cause ? ` — ${esc(i.cause)}` : '') + `</div>`;
+    }).join('')
+    : 'Aucun incident enregistré. C\'est bon signe.';
+  if (incHtml !== lastIncHtml) { lastIncHtml = incHtml; $('incidents').innerHTML = incHtml; }
+
   // Mises à jour
   $('upd-version').textContent = st.cfg.version || '—';
   const applyBtn = $('upd-apply');
@@ -371,13 +386,20 @@ const importFormHTML = (script, suggested) => `
 // Modale des logs : lecture DIRECTE des fichiers (instantané, marche même si pm2 est malade),
 // deux onglets Sortie/Erreurs, filtre par mot-clé, copier, ouvrir le dossier des logs.
 let logsFilter = '';
+// « Illisible » et « vide » ne veulent pas dire la même chose : un fichier tourné par pm2-logrotate
+// ou dont l'accès est refusé affichait « Aucun log pour l'instant », ce qui envoie chercher le
+// problème au mauvais endroit.
+let logsUnreadable = false;
 const renderLogsBody = (text) => {
   const pre = $('logs-pre');
   if (!pre) return;
   const f = logsFilter.trim().toLowerCase();
   const lines = String(text || '').split('\n');
   const shown = f ? lines.filter((l) => l.toLowerCase().includes(f)) : lines;
-  pre.textContent = shown.join('\n').trim() || (f ? `Aucune ligne ne contient « ${logsFilter} ».` : 'Aucun log pour l\'instant.');
+  pre.textContent = shown.join('\n').trim()
+    || (f ? `Aucune ligne ne contient « ${logsFilter} ».`
+      : logsUnreadable ? 'Le fichier de log existe, mais il n\'a pas pu être lu (verrouillé, ou accès refusé).'
+        : 'Aucun log pour l\'instant.');
   pre.scrollTop = pre.scrollHeight; // le plus récent est en bas
 };
 let logsRaw = '';
@@ -399,6 +421,7 @@ const openLogs = async (name, which) => {
     const r = await window.panel.logs(name, which);
     if (!$('logs-pre')) return; // modale refermée entre-temps
     logsRaw = (r && r.ok) ? r.out : '';
+    logsUnreadable = !!(r && r.unreadable);
     if (r && !r.ok) { $('logs-pre').textContent = r.error || 'Impossible de lire les logs.'; return; }
     renderLogsBody(logsRaw);
   } catch { if ($('logs-pre')) $('logs-pre').textContent = 'Échec de lecture des logs.'; }
@@ -594,6 +617,7 @@ document.addEventListener('change', async (e) => {
   if (t.id === 'set-rpc') { await window.panel.setSetting('discordRpc', t.checked); await refresh(); return; }
   if (t.id === 'set-rpc-id') { await window.panel.setSetting('discordAppId', t.value.trim()); await refresh(); return; }
   if (t.id === 'set-autoupdate') { await window.panel.setSetting('autoApplyUpdates', t.checked); await refresh(); return; }
+  if (t.id === 'set-autoheal') { await window.panel.setSetting('autoHeal', t.checked); await refresh(); return; }
   if (t.id === 'set-alerts') { await window.panel.setSetting('alerts', t.checked); await refresh(); return; }
   if (t.id === 'set-alert-toast') { await window.panel.setSetting('alertToast', t.checked); await refresh(); return; }
   if (t.id === 'set-alert-sound') { await window.panel.setSetting('alertSound', t.checked); await refresh(); return; }

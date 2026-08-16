@@ -216,6 +216,16 @@
           <label class="switch"><input type="checkbox" id="set-autoupdate"><span></span></label>
           <div>Installer les mises à jour <b>toutes seules</b> <span style="color:var(--mut);font-size:11px">(jamais pendant une partie ni une manip sur les bots)</span></div>
         </div>
+
+        <h2 style="margin-top:16px">🔧 Relance automatique</h2>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="set-autoheal"><span></span></label>
+          <div>Redémarrer tout seul un bot <b>tombé</b> <span style="color:var(--mut);font-size:11px">(après 5 min, puis 15 min, puis 1 h)</span></div>
+        </div>
+        <div class="hint">Quand pm2 a épuisé ses propres relances, le bot reste mort jusqu'à ce que tu t'en aperçoives. Le panel réessaie à ta place, puis <b>arrête au bout de 3 essais</b> : un bot qui refuse de repartir trois fois a un vrai problème, et l'alerte doit rester visible. Ne touche jamais un bot que <b>tu</b> as arrêté, ni un bot coupé par le mode jeu.</div>
+
+        <h2 style="margin-top:16px">📓 Derniers incidents</h2>
+        <div id="incidents" class="hint"></div>
         <div id="upd-status" class="hint"></div>
       </div>
     </div>

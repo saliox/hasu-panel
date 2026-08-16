@@ -112,8 +112,9 @@ const { EXE_RE, isSafeName, isSafeNewName, BAD_SHELL_RE } = require('./validator
 // couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
-  hasEstablishedPublic, classifyErrorFr, decideAlert, isDeliberateStop,
+  hasEstablishedPublic, classifyErrorFr, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, cleanNotes,
+  shouldAutoHeal,
 } = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
@@ -187,6 +188,12 @@ const DEFAULTS = {
   alertWebhook: '',         // URL de webhook Discord (te touche même en jeu ou absent) — https://discord.com/api/webhooks/…
   lastSaveAt: 0,            // dernier « pm2 save » réussi (ce qui reviendra au prochain démarrage)
   autoApplyUpdates: true,   // installer la MAJ tout seul dès que c'est sans risque (jamais en pleine partie)
+  autoHeal: true,           // retenter de relancer un bot tombé (5 min, 15 min, 1 h, puis on laisse l'alerte parler)
+  incidents: [],            // 40 derniers événements {at, name, kind, cause} → onglet « incidents »
+  // État de surveillance PERSISTÉ : il ne vivait qu'en mémoire, donc un redémarrage du panel — que la
+  // mise à jour automatique provoque elle-même — perdait les alertes en attente de réessai et les
+  // compteurs de relance. Une panne pouvait ainsi repartir de zéro à chaque MAJ.
+  runtime: { lastAlertAt: {}, heal: {} },
   updatedFrom: '',          // version quittée lors d'une MAJ auto → sert à annoncer « mis à jour » au retour
   winBounds: null,          // taille/position mémorisées de la fenêtre (null = calculées d'après l'écran)
   winMaximized: false       // la fenêtre était-elle en plein écran à la dernière fermeture ?
@@ -205,6 +212,8 @@ let gameUnknown = true, gameUnknownSince = Date.now();
 // Faux tant que le premier tick n'a pas rendu son verdict : l'écran doit dire « recherche en cours »
 // et non « aucun bot géré », qui est un mensonge inquiétant quand les bots tournent très bien.
 let firstTickDone = false;
+let netTick = 0; // le relevé de débit ne se fait qu'un tick sur trois (247 ms de PowerShell pour de l'affichage)
+let lowNetFlagOk = true; // le drapeau lu par les bots a-t-il pu être écrit ? (sinon l'écran mentirait)
 // …mais BORNÉ. Si tasklist échoue durablement, bloquer les mises à jour pour toujours serait pire que
 // le mal qu'on évite (c'est exactement le mode de panne « panel figé sur une vieille version »).
 // Au-delà de ce délai, on cesse de s'en servir comme motif de blocage.
@@ -309,6 +318,27 @@ const loadCfg = () => {
       alerts: raw.alerts !== false, alertToast: raw.alertToast !== false,
       alertSound: raw.alertSound !== false, alertVolume: clampInt(raw.alertVolume, 1, 100, 10),
       autoApplyUpdates: raw.autoApplyUpdates !== false,
+      autoHeal: raw.autoHeal !== false,
+      // Historique et état de surveillance : RECONSTRUITS depuis zéro, jamais recopiés tels quels.
+      // Ces structures sont indexées par nom de bot et alimentent des relances pm2 : une clé
+      // « __proto__ » ou un horodatage corrompu venant d'un fichier édité à la main ne doit pas
+      // atteindre le code qui décide de démarrer un process.
+      incidents: (Array.isArray(raw.incidents) ? raw.incidents : [])
+        .filter((i) => i && isSafeName(i.name) && Number.isFinite(i.at))
+        .map((i) => ({ at: i.at, name: i.name, kind: String(i.kind || '').slice(0, 16), cause: String(i.cause || '').slice(0, 160) }))
+        .slice(-40),
+      runtime: (() => {
+        const r = (raw.runtime && typeof raw.runtime === 'object') ? raw.runtime : {};
+        const alertes = {}, heal = {};
+        const a = (r.lastAlertAt && typeof r.lastAlertAt === 'object') ? r.lastAlertAt : {};
+        for (const k of Object.keys(a)) if (isSafeName(k) && Number.isFinite(a[k])) alertes[k] = a[k];
+        const h = (r.heal && typeof r.heal === 'object') ? r.heal : {};
+        for (const k of Object.keys(h)) {
+          const v = h[k];
+          if (isSafeName(k) && v && Number.isFinite(v.downSince)) heal[k] = { downSince: v.downSince, tries: clampInt(v.tries, 0, 9, 0) };
+        }
+        return { lastAlertAt: alertes, heal };
+      })(),
       // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
       // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
       // MIGRATION `winSizeV2` : les versions ≤ 1.9.2 ouvraient une petite fenêtre, et cette taille a été
@@ -764,6 +794,40 @@ const snapshotOf = (bots) => new Map(bots.map((b) => [b.name, { status: b.status
 // derrière trois sorties anticipées — couper les alertes (réglage purement cosmétique) laissait
 // `manualStop` collé à true pour toujours : le bot n'était plus jamais rallumé au démarrage, ni
 // signalé par le bandeau, sans aucun moyen de le débloquer depuis l'interface.
+// Suivi des chutes, pour la relance automatique : nom → { downSince, tries }.
+// Hydraté depuis la config au démarrage (voir hydrateRuntime) et réécrit dedans à chaque changement :
+// sans persistance, un redémarrage du panel — que la mise à jour automatique provoque elle-même —
+// remettait tous les compteurs à zéro et relançait indéfiniment un bot qui ne repart pas.
+const healState = new Map();
+
+// Journal des incidents, borné. Le panel voyait chaque chute et l'oubliait aussitôt : impossible de
+// répondre à « pourquoi saliox a redémarré 8 fois ? » sans ouvrir les logs bruts.
+const INCIDENTS_MAX = 40;
+const addIncident = (name, kind, cause) => {
+  if (!Array.isArray(cfg.incidents)) cfg.incidents = [];
+  cfg.incidents.push({ at: Date.now(), name, kind, cause: String(cause || '').slice(0, 160) });
+  if (cfg.incidents.length > INCIDENTS_MAX) cfg.incidents = cfg.incidents.slice(-INCIDENTS_MAX);
+};
+
+// Recopie l'état vivant dans la config, pour qu'il survive à un redémarrage.
+const persistRuntime = () => {
+  const lastAlert = {};
+  for (const [k, v] of lastAlertAt) if (isSafeName(k) && Number.isFinite(v)) lastAlert[k] = v;
+  const heal = {};
+  for (const [k, v] of healState) if (isSafeName(k) && v && Number.isFinite(v.downSince)) heal[k] = { downSince: v.downSince, tries: v.tries || 0 };
+  cfg.runtime = { lastAlertAt: lastAlert, heal };
+};
+
+// …et l'inverse au démarrage. Les entrées trop vieilles sont balayées : une chute d'il y a trois
+// jours ne doit pas déclencher une relance « en retard » ni étouffer une alerte via l'anti-doublon.
+const hydrateRuntime = () => {
+  const r = (cfg.runtime && typeof cfg.runtime === 'object') ? cfg.runtime : { lastAlertAt: {}, heal: {} };
+  const now = Date.now(), PEREMPTION = 24 * 3600 * 1000;
+  for (const [k, v] of Object.entries(r.lastAlertAt || {})) if (now - v < PEREMPTION) lastAlertAt.set(k, v);
+  for (const [k, v] of Object.entries(r.heal || {})) if (now - v.downSince < PEREMPTION) healState.set(k, { downSince: v.downSince, tries: v.tries || 0 });
+  if (lastAlertAt.size || healState.size) log('surveillance reprise :', lastAlertAt.size, 'alerte(s) suivie(s),', healState.size, 'bot(s) en attente de relance');
+};
+
 // Renvoie l'ensemble des bots dont l'instantané ne doit PAS avancer (statut de passage).
 const transientTicks = new Map(); // nom → nombre de ticks consécutifs passés dans un statut de passage
 const applyTransitions = (bots, prev) => {
@@ -791,6 +855,15 @@ const applyTransitions = (bots, prev) => {
     }
     transientTicks.delete(b.name);
 
+    // 1bis) Suivi de la chute, pour la relance automatique. Indépendant des notifications : c'est de
+    // la remise en service, pas de l'information. Un bot revenu en ligne clôt son épisode.
+    if (b.status === 'online') {
+      if (healState.delete(b.name)) changed = true;
+    } else if (!healState.has(b.name) && (d.alert === 'down' || d.alert === 'looping')) {
+      healState.set(b.name, { downSince: now, tries: 0 });
+      changed = true;
+    }
+
     // 1) État persisté (toujours, même alertes coupées)
     if (d.clearManualStop && conf) { conf.manualStop = false; changed = true; }
     if (d.setManualStop) {
@@ -805,21 +878,61 @@ const applyTransitions = (bots, prev) => {
       // ligne non notifié laissait l'horodatage en place, et l'anti-doublon de 30 min étouffait la
       // panne SUIVANTE — la seule qui comptait.
       lastAlertAt.delete(b.name);
+      addIncident(b.name, 'retour', ''); changed = true;
       if (notifyAllowed) queueAlert(`✅ ${b.name} est de retour`, 'Le bot est de nouveau en ligne.', 0x57F287, b.name);
       continue;
     }
+    // L'incident est journalisé AVANT la garde des notifications : l'historique doit rester complet
+    // même alertes coupées, sinon il ne répond plus à « que s'est-il passé cette nuit ? ».
+    const cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
+    addIncident(b.name, d.alert === 'looping' ? 'boucle' : 'chute', cause); changed = true;
     if (!notifyAllowed) continue;
     if (now - (lastAlertAt.get(b.name) || 0) < ALERT_DEDUP_MS) continue; // anti-doublon 30 min
     lastAlertAt.set(b.name, now);
-    const cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
     queueAlert(
       d.alert === 'looping' ? `🔁 ${b.name} redémarre en boucle` : `⚠️ ${b.name} est tombé`,
       (cause ? `**Cause probable :** ${cause}\n` : '') + `État : ${b.status} · redémarrages : ${b.restarts}`,
       d.alert === 'looping' ? 0xE67E22 : 0xED4245,
       b.name); // la clé permet d'oublier le « déjà signalé » si l'envoi finit par échouer
   }
-  if (changed) saveCfg(); // UN seul enregistrement pour tout le lot (avant : un par bot, en pleine boucle)
+  if (changed) { persistRuntime(); saveCfg(); } // UN seul enregistrement pour tout le lot
   return held;
+};
+
+// Relance automatique des bots tombés. Appelée par le tick, APRÈS applyTransitions (qui a posé les
+// `downSince`). La décision « est-ce le moment ? » vit dans logic.js, testée ; ici on n'exécute que
+// le verdict, et on écarte tout ce qui rendrait une relance inopportune.
+const runAutoHeal = async () => {
+  if (cfg.autoHeal === false || !pm2Health.ok || !healState.size) return;
+  if (statusCache.game || gameUnknown) return; // jamais de travail sous le nez du joueur, ni dans le doute
+  if (busy || actionsInFlight.size || stopAllInFlight) return; // une manœuvre est déjà en cours
+  const now = Date.now();
+  let changed = false;
+  for (const b of statusCache.bots) {
+    const st = healState.get(b.name);
+    if (!st || b.status === 'online') continue;
+    const conf = cfg.bots[b.name];
+    if (!conf || conf.auto === false || conf.manualStop) continue;   // tu ne veux pas ce bot en ligne
+    if (cfg.stoppedByGame.includes(b.name)) continue;                // c'est le mode jeu qui l'a coupé
+    if (!shouldAutoHeal(now, st.downSince, st.tries)) continue;
+    st.tries++; changed = true;                                      // compté AVANT l'await : sinon deux
+    healState.set(b.name, st);                                       // ticks lents relanceraient en double
+    const r = await pm2(['start', b.name]);
+    const apres = await pm2List();
+    const enLigne = !!(apres || []).find((x) => x.name === b.name && x.status === 'online');
+    log('relance automatique :', b.name, `essai ${st.tries}/3 →`, enLigne ? 'OK' : 'échec',
+      enLigne ? '' : String(r.out || '').slice(0, 200));
+    addIncident(b.name, enLigne ? 'relance' : 'relance-ko', enLigne ? `essai ${st.tries}` : classifyErrorFr(String(r.out || '')));
+    if (enLigne) {
+      healState.delete(b.name);
+      queueAlert(`🔧 ${b.name} relancé automatiquement`,
+        `Il était tombé, le panel l'a redémarré (essai ${st.tries}). Aucune action de ta part.`, 0x57F287, b.name);
+    } else if (st.tries >= 3) {
+      queueAlert(`⛔ ${b.name} ne repart pas`,
+        `Trois relances automatiques ont échoué. Il faut regarder : dossier déplacé, dépendance manquante ou token révoqué.`, 0xED4245, b.name);
+    }
+  }
+  if (changed) { persistRuntime(); saveCfg(); }
 };
 
 // pm2 injoignable = TOUS les bots sont potentiellement à terre, et aucune alerte « bot tombé » ne peut
@@ -974,7 +1087,13 @@ const linkSpeedMbps = () => new Promise((resolve) => {
 const applyLowNet = async (game, known) => {
   const speed = await linkSpeedMbps();
   const level = speed && speed < 100 ? 2 : 1; // petit débit → différer + priorité Idle ; sinon BelowNormal
-  try { fs.writeFileSync(LOWNET_FLAG, JSON.stringify({ active: true, level, game, since: Date.now() })); } catch (e) { log('lownet flag', e.message); }
+  // L'écriture de ce drapeau peut échouer durablement (dossier de données absent chez un ami, dossier
+  // redirigé) pendant que l'écran et le tray annoncent « éco réseau active ». Les bots le lisent pour
+  // différer leurs gros téléchargements : sans lui, la moitié de la fonctionnalité ne s'applique pas.
+  let flagOk = true;
+  try { fs.writeFileSync(LOWNET_FLAG, JSON.stringify({ active: true, level, game, since: Date.now() })); }
+  catch (e) { flagOk = false; log('éco réseau : drapeau NON écrit —', e.message, '(les bots ne différeront pas leurs téléchargements)'); }
+  lowNetFlagOk = flagOk;
   const bots = known || await pm2List() || [];
   await setBotPriority(bots.filter((b) => b.status === 'online').map((b) => b.pid), level === 2 ? 'Idle' : 'BelowNormal');
   cfg.lowNetApplied = true; saveCfg();
@@ -1272,7 +1391,10 @@ const tick = async () => {
   // (la lecture pm2 de ce tick a déjà été faite plus haut — une seule par tick)
   // Débit réseau = affichage UI UNIQUEMENT (aucune logique n'en dépend) → on ne le mesure QUE si la
   // fenêtre est visible. En tray ça épargne un spawn PowerShell/CIM par tick = moins de CPU/batterie.
-  if (isWindowVisible()) await measureNet().catch(() => {});
+  // …et même fenêtre ouverte, seulement UN TICK SUR TROIS : ce relevé coûte 247 ms de PowerShell
+  // (mesuré) pour deux chiffres purement décoratifs. Rafraîchis toutes les ~30 s au lieu de 10 s ils
+  // restent parfaitement lisibles, et on économise deux spawns sur trois.
+  if (isWindowVisible() && (netTick++ % 3) === 0) await measureNet().catch(() => {});
   if (pm2Health.ok) {
     // L'ordre compte : le suivi des arrêts volontaires tourne TOUJOURS (c'est de l'auto-démarrage),
     // les notifications seulement si elles sont activées. `prevStatus` est mis à jour ici, en UN seul
@@ -1290,6 +1412,9 @@ const tick = async () => {
       prevStatus = suivant;
     }
   } else alertPm2Down(); // pm2 lui-même muet = TOUS les bots en danger, il faut le dire
+  // Réparer avant d'informer n'aurait pas de sens (l'alerte doit partir même si la relance marche),
+  // mais réparer AVANT de publier l'état, si : le tray et l'écran montrent alors le résultat réel.
+  await runAutoHeal().catch((e) => log('runAutoHeal', e.message));
   maybeAutoApplyUpdate(); // s'installe tout seul dès que c'est sans risque (plus besoin de fermer le panel à la main)
   statusCache.updatedAt = Date.now();
   firstTickDone = true;
@@ -1540,6 +1665,7 @@ ipcMain.handle('panel:status', () => ({
   game: statusCache.game,
   online: statusCache.online,
   lowNetActive: !!cfg.lowNetApplied,
+  lowNetFlagOk,                   // false = « éco réseau active » à l'écran mais les bots ne l'ont pas reçu
   updatedAt: statusCache.updatedAt,
   updateReady,
   updateStatus: lastUpdateStatus,
@@ -1552,6 +1678,8 @@ ipcMain.handle('panel:status', () => ({
   // affichait « alertes activées » alors que certaines n'étaient jamais parties.
   alertsSuppressed: (alertsSuppressed = alertsSuppressed.filter((t) => Date.now() - t < 3600 * 1000)).length,
   ready: firstTickDone,           // false = première mesure en cours (≠ « aucun bot »)
+  autoHeal: cfg.autoHeal !== false,
+  incidents: (cfg.incidents || []).slice(-20).reverse(), // le plus récent en premier
   cfgWriteFailed,                 // les réglages ne s'écrivent plus sur le disque → bandeau (jamais silencieux)
   cfgPath: cfgWriteFailed ? cfgPath() : '', // le chemin n'est utile que pour dire OÙ regarder
   needFix: needFix(),             // bots « Auto boot » éteints sans que tu l'aies demandé
@@ -1718,8 +1846,12 @@ ipcMain.handle('panel:logs', async (_e, { name, which } = {}) => {
   const bot = statusCache.bots.find((b) => b.name === name);
   const file = which === 'err' ? bot?.errLog : bot?.outLog;
   if (!file) return { ok: false, out: '', error: 'Chemin de log inconnu (pm2 ne l\'a pas fourni).' };
+  // tailFile renvoie '' sur TOUTE erreur (fichier tourné par pm2-logrotate, accès refusé) : l'écran
+  // affichait alors « aucun log » alors que le fichier existe mais n'a pas pu être lu. On distingue.
+  let lisible = true;
+  try { fs.accessSync(file, fs.constants.R_OK); } catch { lisible = false; }
   const out = tailFile(file);
-  return { ok: true, out, file, empty: !out.trim() };
+  return { ok: true, out, file, empty: !out.trim(), unreadable: !out.trim() && !lisible };
 });
 
 // Ouvre le dossier du bot dans l'Explorateur. Le chemin vient de pm2 (pm_cwd), jamais du renderer.
@@ -1801,6 +1933,7 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'discordRpc') { cfg.discordRpc = !!value; saveCfg(); startRpc(); return { ok: true }; }
   if (key === 'discordAppId') { cfg.discordAppId = String(value || '').trim().slice(0, 40); saveCfg(); startRpc(); return { ok: true }; }
   if (key === 'autoApplyUpdates') { cfg.autoApplyUpdates = !!value; saveCfg(); return { ok: true }; }
+  if (key === 'autoHeal') { cfg.autoHeal = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alerts') { cfg.alerts = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertToast') { cfg.alertToast = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertSound') { cfg.alertSound = !!value; saveCfg(); if (cfg.alertSound) playSoftSound(); return { ok: true }; } // aperçu immédiat
@@ -1934,6 +2067,7 @@ else {
   app.on('second-instance', (_e, argv) => { if (!Array.isArray(argv) || !argv.includes('--hidden')) showWindow(); });
   app.whenReady().then(async () => {
     cfg = loadCfg();
+    hydrateRuntime(); // reprend les alertes suivies et les relances en cours d'avant le redémarrage
     resolvePm2Runner(); // node.exe + pm2/bin/pm2 → appels pm2 sans cmd.exe (zéro process fantôme)
     // Sans AppUserModelId, Windows 10/11 n'affiche AUCUNE notification d'une app Electron.
     // DOIT être identique au `build.appId` du package.json ('hasu.panel') : c'est cet identifiant que

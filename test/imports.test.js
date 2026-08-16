@@ -43,12 +43,25 @@ test('garde-fou : le nettoyage des commentaires ne détruit pas main.js', () => 
 });
 
 // Bloc d'import destructuré : const { a, b, c } = require('./mod');
+// Cherché dans `stripped`, PAS dans `src` : le fichier est en CRLF et `stripped` a été normalisé en
+// LF, donc un bloc extrait de `src` ne se retrouvait plus dans `stripped`. Le `replace` ci-dessous ne
+// retirait alors rien, le bloc d'import restait dans le texte fouillé, et TOUS les imports
+// paraissaient utilisés : la détection d'imports morts était morte elle-même, sans un mot. C'est
+// ESLint (`no-unused-vars`) qui a fini par trouver `isDeliberateStop`, resté importé pour rien.
 const importedFrom = (mod) => {
   const re = new RegExp(`const\\s*\\{([^}]*)\\}\\s*=\\s*require\\(['"]\\./${mod}['"]\\)`, 'm');
-  const m = src.match(re);
+  const m = stripped.match(re);
   assert.ok(m, `aucun import destructuré de ./${mod} trouvé dans main.js`);
   return { noms: m[1].split(',').map((s) => s.trim()).filter(Boolean), bloc: m[0] };
 };
+
+// …et on vérifie que le retrait fonctionne vraiment, sinon ce fichier ment de nouveau en silence.
+test('garde-fou : le bloc d\'import est bien retiré du texte fouillé', () => {
+  const re = /const\s*\{([^}]*)\}\s*=\s*require\(['"]\.\/logic['"]\)/m;
+  const m = stripped.match(re);
+  assert.ok(m, 'bloc d\'import de logic.js introuvable dans le texte nettoyé');
+  assert.equal(stripped.replace(m[0], ' ').includes(m[0]), false, 'le bloc d\'import n\'a pas été retiré');
+});
 
 // Utilisé ailleurs que dans son propre bloc d'import ?
 const utiliseAilleurs = (nom, bloc) => {

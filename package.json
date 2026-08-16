@@ -1,6 +1,6 @@
 {
   "name": "hasu-panel",
-  "version": "1.12.2",
+  "version": "1.13.0",
   "description": "Panel de gestion des bots pm2 (Hasu) — auto-démarrage + mode jeu + auto-update",
   "main": "main.js",
   "author": "saliox",
@@ -10,8 +10,9 @@
     "dist": "electron-builder --win dir",
     "installer": "electron-builder --win nsis",
     "publish": "electron-builder --win nsis --publish always",
-    "test": "node --test",
-    "test:cov": "node --test --experimental-test-coverage"
+    "test": "eslint . && node --test",
+    "test:cov": "node --test --experimental-test-coverage",
+    "lint": "eslint ."
   },
   "build": {
     "appId": "hasu.panel",
@@ -55,6 +56,7 @@
   },
   "devDependencies": {
     "electron": "^37.2.0",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "^26.0.12",
+    "eslint": "^9.39.5"
   }
 }

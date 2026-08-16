@@ -135,6 +135,31 @@ const redactSensitive = (s) => String(s || '')
   .replace(/[A-Za-z]:\\Users\\[^\\/\s"']+/gi, 'C:\\Users\\[…]')
   .replace(/\/(?:home|Users)\/[^/\s"']+/g, '/home/[…]');
 
+// ---------- Relance automatique d'un bot tombé ----------
+// Le panel CONSTATAIT les pannes sans jamais les réparer. Quand pm2 a épuisé ses propres relances et
+// marqué le process 'errored', plus personne ne reprenait le relais : constaté sur cette machine,
+// quatre bots morts cinq jours durant, découverts par hasard. On retente donc nous-mêmes.
+//
+// Espacement CROISSANT et plafond à trois essais : un bot qui refuse de repartir trois fois a un vrai
+// problème (dossier déplacé, dépendance manquante, token révoqué). S'acharner ne le réparerait pas et
+// noierait l'alerte — qui est justement ce qui doit rester visible dans ce cas.
+const AUTO_HEAL_DELAYS_MS = [5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000];
+
+/**
+ * Faut-il tenter une relance maintenant ? PURE : l'appelant a déjà écarté les arrêts volontaires,
+ * les bots parqués par le mode jeu et ceux dont l'auto-démarrage est décoché.
+ * @param now       horodatage courant
+ * @param downSince quand le bot est passé hors ligne (0/absent = inconnu → on ne tente rien)
+ * @param tries     relances déjà tentées dans cet épisode
+ */
+const shouldAutoHeal = (now, downSince, tries) => {
+  const debut = Number(downSince);
+  if (!Number.isFinite(debut) || debut <= 0) return false;
+  const t = Number(tries) || 0;
+  if (t >= AUTO_HEAL_DELAYS_MS.length) return false; // plafond atteint : on laisse l'alerte parler
+  return now - debut >= AUTO_HEAL_DELAYS_MS[t];
+};
+
 // ---------- Alertes : arrêt volontaire vs panne ----------
 // Un arrêt PROPRE (`pm2 stop`) laisse le statut 'stopped' SANS faire grimper le compteur de
 // redémarrages ; un plantage passe par des relances pm2 (compteur +1) ou finit en 'errored'.
@@ -312,5 +337,5 @@ module.exports = {
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
-  TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive,
+  TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS,
 };
