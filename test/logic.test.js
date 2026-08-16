@@ -410,3 +410,37 @@ test('decideAlert : l\'arrêt volontaire reste détecté après le passage par �
   // C'est tout l'intérêt de figer l'instantané : au tick suivant, prev vaut encore 'online'.
   assert.equal(tr('online', 'stopped').setManualStop, true);
 });
+
+// ------------------------------------------ fuite de données dans les alertes
+// Le corps de l'alerte part vers un webhook Discord. Quand aucune règle ne reconnaît l'erreur, on
+// renvoie la dernière ligne BRUTE du log : elle contient couramment le chemin personnel complet et
+// parfois une adresse IP. Contrainte du projet : aucune IP ne sort de la machine.
+const { redactSensitive } = require('../logic');
+
+test('redactSensitive : les adresses IP ne sortent jamais', () => {
+  assert.equal(redactSensitive('connect ETIMEDOUT 104.16.59.5:443'), 'connect ETIMEDOUT [ip]:443');
+  assert.equal(redactSensitive('bind 192.168.1.42'), 'bind [ip]');
+  assert.match(redactSensitive('listen fe80::1c2d:3e4f:5a6b:7c8d'), /\[ipv6\]/);
+});
+
+test('redactSensitive : le prénom dans le chemin Windows disparaît', () => {
+  const s = redactSensitive('at Object.<anonymous> (C:\\Users\\teamf\\Desktop\\bot\\index.js)');
+  assert.equal(s.includes('teamf'), false, 'le nom d\'utilisateur ne doit pas partir sur Discord');
+  assert.ok(s.includes('C:\\Users\\[…]'), s);
+  assert.match(s, /Desktop/, 'le reste du chemin reste utile au diagnostic');
+});
+
+test('redactSensitive : chemins POSIX, et texte sans rien à masquer inchangé', () => {
+  assert.match(redactSensitive('at /home/salomon/bot/index.js'), /\/home\/\[…\]/);
+  assert.equal(redactSensitive('Une erreur bizarre sans motif connu'), 'Une erreur bizarre sans motif connu');
+  assert.equal(redactSensitive(''), '');
+  assert.equal(redactSensitive(null), '');
+});
+
+test('classifyErrorFr : le repli est expurgé avant de partir en alerte', () => {
+  const out = classifyErrorFr('Boom inattendu chez C:\\Users\\teamf\\bot depuis 10.0.0.7');
+  assert.equal(out.includes('teamf'), false);
+  assert.equal(out.includes('10.0.0.7'), false);
+  // …mais le repli reste informatif : c'est le cas où l'alerte sert le plus.
+  assert.match(out, /Boom inattendu/);
+});

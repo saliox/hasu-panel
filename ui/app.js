@@ -70,10 +70,14 @@ const paintUpdCard = () => {
       : others.length
         ? `Elle s'installera toute seule dès que possible — en attente : ${esc(others.join(', '))}.`
         : 'Elle s\'installera toute seule dès que tu fermeras cette fenêtre.';
+    // Un redémarrage raté (installeur en quarantaine antivirus, fichier verrouillé) arrive alors que
+    // `updateReady` est TOUJOURS vrai : sans ce cas, l'erreur ne s'affichait nulle part et le bouton
+    // restait bloqué sur « Redémarrage… » pour toujours.
+    const rate = s.state === 'error' ? `<div class="updcard-why" style="color:var(--err)">${esc(s.message || 'échec')}</div>` : '';
     html = head('✅', 'Mise à jour prête à être installée',
       '<button class="btn primary big" data-upd="apply">Installer et redémarrer</button>'
       + '<button class="btn" data-upd="later" title="Masquer cette carte">Plus tard</button>')
-      + notes + `<div class="updcard-why">${why}</div>`;
+      + notes + rate + `<div class="updcard-why">${why}</div>`;
   } else if (s.state === 'available') {
     html = head('🎉', `Nouvelle version disponible`, '<span style="color:var(--mut);font-size:12px">préparation…</span>') + notes;
   } else if (s.state === 'error' && upd.sawDl) {

@@ -25,6 +25,9 @@ try { app.disableHardwareAcceleration(); } catch {}
 // prochain démarrage du PC, puisqu'il se lance au logon). Pensé pour « installer chez un ami et
 // oublier ». Ne s'active QUE dans la version installée (NSIS) ; ignoré en dev / build « dir ».
 let updateReady = false, updaterRef = null, lastUpdateStatus = null;
+// Défini par setupAutoUpdate, mais déclaré ICI : panel:applyUpdate en a besoin pour signaler un
+// redémarrage raté, et il vit en dehors de cette fonction.
+let pushUpd = () => {};
 let updateReadyAt = 0, updateReadyVersion = '', updateApplying = false;
 
 // ---------- Application AUTOMATIQUE de la mise à jour (fenêtre sûre) ----------
@@ -67,7 +70,7 @@ const setupAutoUpdate = () => {
   autoUpdater.autoInstallOnAppQuit = true;      // la MAJ s'installe à la fermeture (donc au reboot)
   // Pousse chaque changement d'état MAJ au renderer EN DIRECT (progression du téléchargement
   // sans attendre le prochain sondage) + garde lastUpdateStatus pour le polling/panel:status.
-  const pushUpd = (s) => { lastUpdateStatus = s; try { if (win && !win.isDestroyed()) win.webContents.send('update-status', s); } catch {} };
+  pushUpd = (s) => { lastUpdateStatus = s; try { if (win && !win.isDestroyed()) win.webContents.send('update-status', s); } catch {} };
   autoUpdater.on('update-available', (i) => { pushUpd({ state: 'available', version: i?.version, notes: cleanNotes(i?.releaseNotes) }); log('MAJ disponible :', i?.version); });
   autoUpdater.on('update-not-available', () => { pushUpd({ state: 'uptodate' }); });
   autoUpdater.on('download-progress', (p) => { pushUpd({ state: 'downloading', percent: Math.round(p?.percent || 0), bps: p?.bytesPerSecond || 0, transferred: p?.transferred || 0, total: p?.total || 0, version: lastUpdateStatus?.version }); });
@@ -395,7 +398,18 @@ const pm2 = (args) => {
 // copié-collé à l'identique en 5 endroits — une seule version ici, pour qu'il ne puisse pas diverger.
 const refreshBots = async () => {
   const l = await pm2List();
-  if (l) statusCache.bots = l;
+  if (l) {
+    // Les débits réseau sont posés sur les objets par measureNet, que SEUL le tick appelle. Remplacer
+    // le tableau par celui de pm2List les effaçait : « ↓ 0 o/s · ↑ 0 o/s » s'affichait après chaque
+    // action sur un bot, jusqu'au tick suivant. On les reporte, à PID identique et non nul (après un
+    // stop, pm2 renvoie pid:0 et tous les bots arrêtés partageraient la même clé).
+    const avant = new Map(statusCache.bots.filter((b) => b.pid > 0).map((b) => [b.name, b]));
+    for (const b of l) {
+      const p = avant.get(b.name);
+      if (p && p.pid === b.pid) { b.netDown = p.netDown; b.netUp = p.netUp; }
+    }
+    statusCache.bots = l;
+  }
   return l;
 };
 
@@ -539,7 +553,11 @@ const deleteTree = async (name) => { await stopTree(name); return pm2(['delete',
 // « bots coupés » comme état de démarrage voulu.
 let saveTimer = null;
 let saveRetries = 0;
+// Vrai tant qu'un `pm2 save` demandé n'a pas RÉUSSI. Le chemin qui compte vraiment est l'arrêt du
+// PC : sans ce drapeau, une sauvegarde reportée par le mode jeu disparaissait à la fermeture.
+let pm2SavePending = false;
 const schedulePm2Save = (delayMs = 15000) => {
+  pm2SavePending = true;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     saveTimer = null;
@@ -549,13 +567,18 @@ const schedulePm2Save = (delayMs = 15000) => {
     // filtré comme partout ailleurs, sinon il bloquait la sauvegarde toute la partie pour rien.
     const parked = cfg.stoppedByGame.filter((n) => n !== '-');
     if (parked.length || cfg.lowNetApplied) {
-      if (saveRetries < 20) { saveRetries++; log('pm2 save reporté (mode jeu / éco réseau) — nouvelle tentative dans 2 min'); schedulePm2Save(120000); }
-      else log('pm2 save abandonné après 20 tentatives');
+      // Plus de plafond de 20 tentatives : au bout de 42 min de partie, la sauvegarde était ABANDONNÉE
+      // et tout démarrage/arrêt fait pendant la session ne survivait pas au reboot — précisément le
+      // bug que ce report existe pour éviter. Le report ne coûte qu'un minuteur, pas un spawn ; on
+      // réessaie donc tant qu'il le faut, en ne journalisant qu'une fois sur dix.
+      saveRetries++;
+      if (saveRetries % 10 === 1) log('pm2 save reporté (mode jeu / éco réseau) — tentative', saveRetries);
+      schedulePm2Save(120000);
       return;
     }
     saveRetries = 0;
     const r = await pm2(['save']);
-    if (r.ok) { cfg.lastSaveAt = Date.now(); saveCfg(); log('pm2 save auto OK'); } else log('pm2 save auto échec');
+    if (r.ok) { pm2SavePending = false; cfg.lastSaveAt = Date.now(); saveCfg(); log('pm2 save auto OK'); } else log('pm2 save auto échec');
   }, delayMs);
   saveTimer.unref?.();
 };
@@ -571,6 +594,7 @@ const ALERT_DEDUP_MS = 30 * 60 * 1000;
 const ALERT_MAX_PER_HOUR = 6;
 const startedAt = Date.now();
 let quietUntil = 0, alertTimes = [], lastAlertAt = new Map(), prevStatus = new Map(), alertsPrimed = false;
+let alertsSuppressed = []; // horodatages des alertes différées par le plafond horaire (fenêtre 1 h) — remonté à l'écran
 
 // (Le diagnostic en français vit dans logic.js `classifyErrorFr` — l'ORDRE de ses règles est figé par
 // un test, car un même log peut contenir plusieurs signatures et la première l'emporte.)
@@ -648,7 +672,15 @@ const sendAlert = async (title, body, colorHex, dejaNotifie = false) => {
   const now = Date.now();
   if (!dejaNotifie) {
     alertTimes = alertTimes.filter((t) => now - t < 3600 * 1000);
-    if (alertTimes.length >= ALERT_MAX_PER_HOUR) return false; // plafond anti-spam → mis en réessai, plus jeté
+    if (alertTimes.length >= ALERT_MAX_PER_HOUR) {
+      // Jamais de rejet MUET : le plafond est global (tous bots confondus), donc un seul bot qui
+      // oscille pouvait rendre invisible la panne d'un autre. L'alerte part maintenant en réessai
+      // (voir drainAlerts) et le compteur ci-dessous est affiché dans les réglages, pour que
+      // « alertes activées » cesse d'être un demi-mensonge.
+      alertsSuppressed.push(now);
+      log('alerte DIFFÉRÉE (plafond horaire atteint) :', title);
+      return false;
+    }
     alertTimes.push(now);
     if (cfg.alertToast !== false) {
       // silent:true → Windows ne joue PAS son propre son (souvent fort) ; on joue le nôtre à la place.
@@ -799,20 +831,49 @@ const alertPm2Down = () => {
 let needFixCache = { at: -1, names: [] };
 const needFix = () => {
   if (!cfg || !cfg.bots || !pm2Health.ok) return [];
-  if (needFixCache.at === statusCache.updatedAt) return needFixCache.names;
+  // La clé du mémo est faite des VRAIES entrées du calcul. Avant, elle ne contenait que
+  // `statusCache.updatedAt`, que seul le tick fait avancer : décocher « Auto boot », relancer un bot
+  // via « Remettre en ordre » ou sortir du mode jeu laissait le bandeau et la pastille rouge de la
+  // zone de notification sur une liste PÉRIMÉE jusqu'au tick suivant — et « Remettre en ordre »
+  // agissait alors sur cette liste périmée, annulant le choix que l'utilisateur venait de faire.
+  const cle = statusCache.bots.map((b) => `${b.name}:${b.status}`).join('|')
+    + '#' + Object.keys(cfg.bots).map((n) => `${n}:${cfg.bots[n].auto !== false ? 1 : 0}${cfg.bots[n].manualStop ? 1 : 0}`).join('|')
+    + '#' + cfg.stoppedByGame.join('|');
+  if (needFixCache.at === cle) return needFixCache.names;
   const names = statusCache.bots
     .filter((b) => b.status !== 'online'
       && cfg.bots[b.name] && cfg.bots[b.name].auto !== false && !cfg.bots[b.name].manualStop
       && !cfg.stoppedByGame.includes(b.name))
     .map((b) => b.name);
-  needFixCache = { at: statusCache.updatedAt, names };
+  needFixCache = { at: cle, names };
   return names;
 };
 
 // ---------- Détection de jeu (liste de process + PID) ----------
+// `null` = on n'a PAS pu lire la liste des process. Cet échec était totalement muet : sous forte
+// charge disque (timeout) ou blocage par un antivirus, la machine à états du mode jeu gelait avec les
+// bots coupés, et rien nulle part ne le disait. On le journalise, on le compte, et on prévient une
+// seule fois par épisode — sans forcer la sortie du mode jeu, qui rallumerait les bots en pleine
+// partie normale.
+let procScanFails = 0, procScanAlerted = false;
 const listProcs = () => new Promise((resolve) => {
   execFile(SYS('tasklist.exe'), ['/fo', 'csv', '/nh'], { windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
-    if (err || !out) return resolve(null);
+    if (err || !out) {
+      procScanFails++;
+      log('tasklist en échec (', procScanFails, ') :', err ? (err.code || err.message) : 'sortie vide');
+      // ~5 ticks de suite : ce n'est plus un hoquet. Les mêmes garde-fous que les autres alertes
+      // système (alertes coupées, démarrage silencieux) sont appliqués ici, queueAlert ne les
+      // vérifie pas lui-même.
+      if (procScanFails >= 5 && !procScanAlerted && cfg.alerts !== false
+          && Date.now() >= quietUntil && Date.now() - startedAt >= ALERT_QUIET_BOOT_MS) {
+        procScanAlerted = true;
+        queueAlert('⚠️ Détection de jeu à l\'arrêt',
+          'Windows refuse de lister les process (`tasklist`). Le mode jeu et l\'éco réseau sont figés dans leur état actuel — antivirus ou stratégie de sécurité, probablement.',
+          0xFAA61A);
+      }
+      return resolve(null);
+    }
+    if (procScanFails) { log('tasklist de nouveau opérationnel après', procScanFails, 'échec(s)'); procScanFails = 0; procScanAlerted = false; }
     resolve(parseTasklistCsv(out)); // parsing dans logic.js (testé : casse, PID multiples, lignes invalides)
   });
 });
@@ -1089,9 +1150,29 @@ const exitGameMode = async () => {
   const names = cfg.stoppedByGame.filter((n) => n !== '-' && isSafeName(n)); // '-' = marqueur « rien à couper »
   names.sort((a, b) => (b === 'saliox') - (a === 'saliox')); // saliox relancé en premier
   for (const n of names) await pm2(['start', n]);
+  // La liste est vidée dans TOUS les cas, même en cas d'échec. Y garder des noms serait pire que le
+  // mal : ça bloquerait en permanence l'application des MAJ et le `pm2 save` (qui abandonne au bout
+  // de 20 reports, donc le dump de reboot pourrit), ça exclurait ces bots du bandeau « à remettre en
+  // ordre », et exitGameMode se rappellerait à chaque tick — un spawn pm2 par tick, indéfiniment.
   cfg.stoppedByGame = [];
   saveCfg();
-  log('mode jeu OFF — relancés :', names.join(', ') || '(aucun)');
+  // On republie l'état AVANT que le tick n'en tire des conclusions : sans ça, la suite du tick
+  // travaillait sur la lecture pm2 faite au DÉBUT, quand ces bots étaient encore arrêtés — d'où une
+  // fausse alerte « N bots devraient être en ligne » et une pastille rouge dans la zone de
+  // notification après CHAQUE partie.
+  await refreshBots();
+  const enLigne = new Set(statusCache.bots.filter((b) => b.status === 'online').map((b) => b.name));
+  const perdus = names.filter((n) => !enLigne.has(n));
+  log('mode jeu OFF — relancés :', names.join(', ') || '(aucun)',
+    perdus.length ? `— ÉCHEC de relance : ${perdus.join(', ')}` : '');
+  if (perdus.length) {
+    // Un bot que le mode jeu a coupé et n'a pas su rallumer, c'est exactement le silence que ce
+    // panel existe pour supprimer (cas réel : le démon pm2 redémarre pendant la partie et perd la
+    // définition du process).
+    queueAlert('⚠️ Bots non relancés après la partie',
+      `Le mode jeu n'a pas réussi à redémarrer : **${perdus.join(', ')}**. Utilise « Remettre en ordre » ou vérifie leur dossier.`,
+      0xED4245);
+  }
   updateTray();
 };
 
@@ -1440,6 +1521,9 @@ ipcMain.handle('panel:status', () => ({
   updateBlockers: updateReady ? updateBlockers() : [], // pourquoi la MAJ prête n'est pas encore appliquée
   autoApplyUpdates: cfg.autoApplyUpdates !== false,
   lastSaveAt: cfg.lastSaveAt || 0, // dernier `pm2 save` (ce qui reviendra au reboot)
+  // Nombre d'alertes différées par le plafond horaire, sur la dernière heure : sans ça, l'écran
+  // affichait « alertes activées » alors que certaines n'étaient jamais parties.
+  alertsSuppressed: (alertsSuppressed = alertsSuppressed.filter((t) => Date.now() - t < 3600 * 1000)).length,
   cfgWriteFailed,                 // les réglages ne s'écrivent plus sur le disque → bandeau (jamais silencieux)
   cfgPath: cfgWriteFailed ? cfgPath() : '', // le chemin n'est utile que pour dire OÙ regarder
   needFix: needFix(),             // bots « Auto boot » éteints sans que tu l'aies demandé
@@ -1740,8 +1824,18 @@ ipcMain.handle('panel:checkUpdate', async () => {
 // Applique la mise à jour téléchargée et redémarre (bouton « Redémarrer & appliquer »).
 ipcMain.handle('panel:applyUpdate', () => {
   if (!updateReady || !updaterRef) return { ok: false };
-  quitting = true;
-  setTimeout(() => { try { updaterRef.quitAndInstall(); } catch {} }, 200);
+  // PAS de `quitting = true` ici : il est redondant (quitAndInstall → app.quit() → 'before-quit' le
+  // pose déjà, et avant la fermeture des fenêtres), et surtout il est POSÉ D'AVANCE. Si l'installeur
+  // est absent ou mis en quarantaine par l'antivirus, l'application ne redémarre pas et se retrouve
+  // avec `quitting` collé à true : fermer la fenêtre ne la réduit plus dans la zone de notification,
+  // elle QUITTE — et les bots coupés par le mode jeu ne sont plus surveillés.
+  setTimeout(() => {
+    try { updaterRef.quitAndInstall(); }
+    catch (e) {
+      log('quitAndInstall a échoué :', e.message);
+      pushUpd({ state: 'error', message: `Le redémarrage a échoué : ${e.message}` });
+    }
+  }, 200);
   return { ok: true };
 });
 
@@ -1876,6 +1970,17 @@ else {
       for (let i = 0; i < 30 && busy; i++) await new Promise((r) => setTimeout(r, 200));
       try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.some((n) => n !== '-')) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
       try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
+      // Dernière chance pour une sauvegarde pm2 restée en attente (reportée par le mode jeu) : c'est
+      // ce dump que pm2 restaure au prochain démarrage du PC. Sans ça, tout démarrage/arrêt fait
+      // pendant une longue partie disparaissait à l'extinction. On est ici APRÈS exitGameMode, donc
+      // la liste est de nouveau représentative.
+      try {
+        if (pm2SavePending) {
+          const r = await pm2(['save']);
+          log('pm2 save de fermeture :', r.ok ? 'OK' : 'échec');
+          if (r.ok) { pm2SavePending = false; cfg.lastSaveAt = Date.now(); saveCfg(); }
+        }
+      } catch (err) { log('quit pm2 save', err.message); }
       clearTimeout(deadline);
       finish();
     })();

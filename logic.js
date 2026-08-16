@@ -121,8 +121,19 @@ const classifyErrorFr = (logText) => {
   if (/EADDRINUSE/i.test(last)) return 'Port déjà utilisé';
   if (/heap out of memory|ENOMEM/i.test(last)) return 'Mémoire saturée';
   if (/ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENETUNREACH/i.test(last)) return 'Connexion réseau refusée ou coupée';
-  return (last.split('\n').pop() || '').slice(0, 120);
+  return redactSensitive(last.split('\n').pop() || '').slice(0, 120);
 };
+
+// Quand aucune règle ne reconnaît l'erreur, on renvoie la dernière ligne BRUTE du log — et ce texte
+// part vers Discord dans l'alerte. Une ligne de pile ou une erreur réseau y met couramment le chemin
+// personnel complet (« C:\Users\<prénom>\… ») et parfois une adresse IP. Le panel ne doit JAMAIS
+// faire sortir d'IP de la machine ; on garde donc la ligne (c'est le cas où elle sert le plus) mais
+// on remplace ces deux motifs.
+const redactSensitive = (s) => String(s || '')
+  .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]')
+  .replace(/\b(?:[0-9a-f]{0,4}:){3,7}[0-9a-f]{0,4}\b/gi, '[ipv6]')
+  .replace(/[A-Za-z]:\\Users\\[^\\/\s"']+/gi, 'C:\\Users\\[…]')
+  .replace(/\/(?:home|Users)\/[^/\s"']+/g, '/home/[…]');
 
 // ---------- Alertes : arrêt volontaire vs panne ----------
 // Un arrêt PROPRE (`pm2 stop`) laisse le statut 'stopped' SANS faire grimper le compteur de
@@ -301,5 +312,5 @@ module.exports = {
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
-  TRANSIENT_STATUS, TRANSIENT_MAX_TICKS,
+  TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive,
 };
