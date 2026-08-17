@@ -555,6 +555,33 @@ const remplirMenuLangues = () => {
   }
 };
 remplirMenuLangues();
+
+// Les longs textes explicatifs sont REPLIÉS par défaut et dépliés par un « ? » posé à côté du titre
+// de leur section. Ils font un quart de la hauteur de la fenêtre : les garder dépliés obligeait à
+// faire défiler pour voir des réglages, alors que ce sont des explications lues une fois.
+// On ne replie que les textes PUREMENT explicatifs (ceux portant data-i18n-html) : les zones qui
+// affichent un état (incidents, statut de MAJ, dernière sauvegarde, résultat du test d'alerte)
+// restent visibles.
+const preparerAides = () => {
+  document.querySelectorAll('.card').forEach((carte) => {
+    const titre = carte.querySelector('h2');
+    const aides = [...carte.querySelectorAll('.hint[data-i18n-html], .hint > span[data-i18n-html]')]
+      .map((el) => (el.classList.contains('hint') ? el : el.parentElement))
+      .filter((el, i, arr) => arr.indexOf(el) === i);
+    if (!titre || !aides.length || titre.nextElementSibling?.classList?.contains('aide-btn')) return;
+    aides.forEach((el) => el.classList.add('replie'));
+    const b = document.createElement('button');
+    b.className = 'aide-btn';
+    b.textContent = '?';
+    b.addEventListener('click', () => {
+      const ouvert = aides[0].classList.contains('replie');
+      aides.forEach((el) => el.classList.toggle('replie', !ouvert));
+      b.classList.toggle('ouvert', ouvert);
+    });
+    titre.appendChild(b);
+  });
+};
+preparerAides();
 $('lang-select').addEventListener('change', async (e) => {
   const choix = e.target.value;
   appliquerLangue(choix);               // effet immédiat, sans attendre l'aller-retour disque

@@ -10,16 +10,23 @@
     --txt: #e6e8f0; --mut: #9aa0b5; --accent: #5865F2; --ok: #3ba55d; --err: #ed4245; --warn: #faa61a;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--txt); font: 14px/1.45 "Segoe UI", sans-serif; padding: 22px; user-select: none; }
-  h1 { font-size: 20px; display: flex; align-items: center; gap: 10px; }
+  body { background: var(--bg); color: var(--txt); font: 13.5px/1.4 "Segoe UI", sans-serif; padding: 12px 14px 2px; user-select: none; }
+  h1 { font-size: 17px; display: flex; align-items: center; gap: 9px; margin-bottom: 2px; }
   h1 .sub { font-size: 12px; color: var(--mut); font-weight: normal; }
-  .banner { margin: 14px 0; padding: 10px 14px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
+  .banner { margin: 8px 0; padding: 7px 12px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
   .banner.game { border-color: var(--warn); background: #2a230f; }
-  .grid { display: grid; grid-template-columns: 1fr 380px; gap: 16px; align-items: start; }
-  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
-  .card h2 { font-size: 15px; margin-bottom: 12px; color: #c8cdff; }
-  .bot { display: flex; align-items: center; gap: 10px; padding: 10px 8px; border-radius: 8px; }
+  /* Mise en page en COLONNES qui se remplissent : les cartes se répartissent d'elles-mêmes selon la
+     largeur disponible, au lieu d'être empilées dans une colonne fixe de 380 px. Sur un écran
+     maximisé, tout tient sans descendre. */
+  .grid { column-width: 330px; column-gap: 13px; }
+  .card { break-inside: avoid; -webkit-column-break-inside: avoid; margin-bottom: 11px; }
+  /* La liste des bots est la zone principale : elle ouvre la première colonne et peut respirer. */
+  .card.bots { column-span: none; }
+  /* Sous ~840 px de large, une seule colonne — on retrouve l'empilement d'origine. */
+  @media (max-width: 700px) { .grid { column-width: auto; column-count: 1; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px; }
+  .card h2 { font-size: 14px; margin-bottom: 7px; color: #c8cdff; }
+  .bot { display: flex; align-items: center; gap: 9px; padding: 6px 7px; border-radius: 8px; }
   .bot:nth-child(odd) { background: var(--card2); }
   .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
   .dot.online { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
@@ -34,22 +41,22 @@
   .btn:disabled { opacity: .45; cursor: default; }
   label.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--mut); cursor: pointer; white-space: nowrap; }
   input[type=checkbox] { accent-color: var(--accent); }
-  .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; flex-wrap: wrap; }
+  .row { display: flex; align-items: center; gap: 9px; margin: 5px 0; flex-wrap: wrap; }
   .switch { position: relative; width: 40px; height: 22px; flex: none; }
   .switch input { display: none; }
   .switch span { position: absolute; inset: 0; background: #3a3f52; border-radius: 22px; transition: .15s; cursor: pointer; }
   .switch span::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: .15s; }
   .switch input:checked + span { background: var(--ok); }
   .switch input:checked + span::after { left: 21px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-height: 180px; overflow-y: auto; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; max-height: 120px; overflow-y: auto; }
   .chip { background: #262a3a; border: 1px solid var(--line); border-radius: 14px; padding: 3px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
   .chip b { color: var(--err); cursor: pointer; font-weight: 700; }
   input[type=text], input[type=number] { background: #12141d; color: var(--txt); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font-size: 13px; }
   input[type=number] { width: 70px; }
-  .hint { color: var(--mut); font-size: 11.5px; margin-top: 6px; }
+  .hint { color: var(--mut); font-size: 11px; line-height: 1.45; margin-top: 4px; }
   .tc-warn { background: #3a2a12; border: 1px solid #6b4e1f; border-radius: 8px; padding: 12px 14px; color: #f0dcae; font-size: 13px; line-height: 1.5; }
   .stopped-banner { color: var(--warn); font-size: 12.5px; margin-top: 8px; }
-  .cardhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .cardhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
   .cardhead h2 { margin-bottom: 0; }
   .sechead { font-size: 12.5px; color: var(--mut); margin: 12px 0 4px; text-transform: uppercase; letter-spacing: .4px; }
   .about-btn { margin-left: auto; }
@@ -63,6 +70,17 @@
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   .btn.armed { background: #e5484d; border-color: #e5484d; color: #fff; animation: armpulse 1s ease-in-out infinite; }
   @keyframes armpulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+  /* Textes d'aide : repliés par défaut, dépliés par le « ? » de leur section. Ils représentaient un
+     quart de la hauteur totale de la fenêtre pour de la documentation qu'on lit une fois. */
+  /* Sur un écran modeste, c'est la LISTE DES BOTS qui déborde (elle grandit avec le nombre de bots).
+     On lui donne son propre défilement plutôt que d'en donner un à la page : les réglages restent
+     tous visibles, et seule la liste défile — et seulement si elle est vraiment trop longue. */
+  #bots { max-height: calc(100vh - 372px); overflow-y: auto; }
+  .hint.replie { display: none; }
+  .aide-btn { background: none; border: 1px solid var(--line); color: var(--mut); border-radius: 50%;
+              width: 17px; height: 17px; line-height: 1; font-size: 11px; cursor: pointer; padding: 0;
+              margin-left: 6px; flex: none; }
+  .aide-btn:hover, .aide-btn.ouvert { background: var(--accent); border-color: var(--accent); color: #fff; }
   .lang-select { background: #2b2f3f; color: var(--txt); border: 1px solid var(--line); border-radius: 7px;
                  padding: 4px 8px; font-size: 12px; cursor: pointer; font-family: inherit; }
   .lang-select:hover { background: #353a4e; }
@@ -79,7 +97,7 @@
 
   /* Carte de mise à jour — EN HAUT de la fenêtre : tout le parcours (dispo → téléchargement → install)
      se fait ici, plus besoin d'aller le chercher dans ⚙️ Réglages. */
-  .updcard { margin: 14px 0 0; border: 1px solid #3b4270; border-radius: 12px; padding: 13px 15px;
+  .updcard { margin: 8px 0 0; border: 1px solid #3b4270; border-radius: 12px; padding: 13px 15px;
              background: linear-gradient(135deg, #1c2040 0%, #191c2a 62%); position: relative; overflow: hidden; }
   .updcard.hidden { display: none; }
   .updcard::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); }
@@ -110,7 +128,7 @@
   <div id="banner" class="banner" data-i18n="banner.loading">Chargement…</div>
 
   <div class="grid">
-    <div class="card">
+    <div class="card bots">
       <div class="cardhead">
         <h2 data-i18n="bots.title">🤖 Bots (pm2)</h2>
         <div style="display:flex;gap:6px">
@@ -123,8 +141,7 @@
       <div class="hint" data-i18n-html="bots.hint">« Auto boot » : le bot est (re)mis en ligne à l'ouverture de session Windows. « Coupé en jeu » : ce bot est arrêté quand le mode jeu se déclenche (si « seulement les bots cochés »).</div>
     </div>
 
-    <div>
-      <div class="card">
+    <div class="card">
         <h2 data-i18n="gm.title">🎮 Mode jeu</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="gm-enabled"><span></span></label>
@@ -143,14 +160,20 @@
         </div>
         <div id="gm-stopped" class="stopped-banner"></div>
 
-        <h2 style="margin-top:16px" data-i18n="lownet.title">🌐 Faible usage internet</h2>
+      </div>
+
+      <div class="card">
+        <h2 data-i18n="lownet.title">🌐 Faible usage internet</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="gm-lownet"><span></span></label>
           <div data-i18n="lownet.enable">Priorité réseau au jeu en ligne</div>
         </div>
         <div class="hint" data-i18n-html="lownet.hint">Pendant une partie en ligne : les gros téléchargements des bots (listes anti-scam, sauvegardes chiffrées) sont mis en pause et leur priorité est abaissée — automatiquement plus strict si ta connexion est lente. Tout revient à la normale à la fin de la partie. Indépendant du mode jeu : utile pour les bots que tu laisses tourner.</div>
 
-        <h2 style="margin-top:16px" data-i18n="games.title">🕹️ Jeux détectés (process)</h2>
+      </div>
+
+      <div class="card">
+        <h2 data-i18n="games.title">🕹️ Jeux détectés (process)</h2>
         <div class="row">
           <input type="text" id="game-add" data-i18n-ph="games.ph" placeholder="MonJeu.exe" style="flex:1">
           <button class="btn primary" id="game-add-btn" data-i18n="games.add">Ajouter</button>
@@ -165,7 +188,7 @@
         <div class="hint" data-i18n-html="games.hint">« Programmes ouverts » liste ce qui tourne sur TON PC (jeu ou logiciel inconnu de la liste par défaut) : lance le jeu puis choisis-le — c'est le plus précis. « Scanner » fouille les bibliothèques Steam/Epic (1×/jour automatique, jamais en continu).</div>
       </div>
 
-      <div class="card" style="margin-top:16px">
+      <div class="card">
         <h2 data-i18n="set.title">⚙️ Réglages</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-autolaunch"><span></span></label>
@@ -182,7 +205,10 @@
 
         <div class="hint" id="save-info" data-i18n-title="set.saveInfoTitle" title="pm2 restaure cette liste au démarrage du PC — elle est réenregistrée après chaque démarrage/arrêt fait ici."></div>
 
-        <h2 style="margin-top:16px" data-i18n="alerts.title">🔔 Alertes (bot qui tombe)</h2>
+      </div>
+
+      <div class="card">
+        <h2 data-i18n="alerts.title">🔔 Alertes (bot qui tombe)</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-alerts"><span></span></label>
           <div data-i18n-html="alerts.enable">Me prévenir quand un bot <b>tombe</b> ou <b>redémarre en boucle</b></div>
@@ -203,7 +229,10 @@
         </div>
         <div class="hint"><span data-i18n-html="alerts.hint">Le <b>webhook Discord</b> est le plus utile : il te touche même en pleine partie ou absent du PC. Dans Discord : <b>Paramètres du salon → Intégrations → Webhooks → Nouveau webhook → Copier l'URL</b>. L'alerte indique <b>la cause en français</b> (Internet coupé, token invalide, module manquant…).</span><span id="alert-status"></span></div>
 
-        <h2 style="margin-top:16px" data-i18n="rpc.title">🎮 Rich Presence Discord</h2>
+      </div>
+
+      <div class="card">
+        <h2 data-i18n="rpc.title">🎮 Rich Presence Discord</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-rpc"><span></span></label>
           <div data-i18n="rpc.enable">Afficher « 🤖 Gère X bots en ligne » sur mon profil Discord</div>
@@ -213,7 +242,10 @@
         </div>
         <div class="hint"><span data-i18n-html="rpc.hint">Rien à configurer : ça fonctionne dès l'activation (il faut juste que <b>Discord soit ouvert</b> sur ce PC). Le champ ci-dessus n'est utile que si tu veux afficher <b>ta propre</b> application Discord — dans ce cas, colle son <b>Application ID</b> (discord.com/developers/applications → General Information).</span><span id="rpc-status"></span></div>
 
-        <h2 style="margin-top:16px" data-i18n="upd.title">🔄 Mises à jour</h2>
+      </div>
+
+      <div class="card">
+        <h2 data-i18n="upd.title">🔄 Mises à jour</h2>
         <div class="row">
           <span style="color:var(--mut);font-size:12.5px"><span data-i18n="upd.version">Version :</span> <b id="upd-version">—</b></span>
           <button class="btn primary" id="upd-check" data-i18n="upd.check">Vérifier les mises à jour</button>
@@ -224,18 +256,23 @@
           <div data-i18n-html="upd.auto">Installer les mises à jour <b>toutes seules</b> <span class="mut11">(jamais pendant une partie ni une manip sur les bots)</span></div>
         </div>
 
-        <h2 style="margin-top:16px" data-i18n="heal.title">🔧 Relance automatique</h2>
+      </div>
+
+      <div class="card">
+        <h2 data-i18n="heal.title">🔧 Relance automatique</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-autoheal"><span></span></label>
           <div data-i18n-html="heal.enable">Redémarrer tout seul un bot <b>tombé</b> <span class="mut11">(après 5 min, puis 15 min, puis 1 h)</span></div>
         </div>
         <div class="hint" data-i18n-html="heal.hint">Quand pm2 a épuisé ses propres relances, le bot reste mort jusqu'à ce que tu t'en aperçoives. Le panel réessaie à ta place, puis <b>arrête au bout de 3 essais</b> : un bot qui refuse de repartir trois fois a un vrai problème, et l'alerte doit rester visible. Ne touche jamais un bot que <b>tu</b> as arrêté, ni un bot coupé par le mode jeu.</div>
 
-        <h2 style="margin-top:16px" data-i18n="inc.title">📓 Derniers incidents</h2>
+      </div>
+
+      <div class="card">
+        <h2 data-i18n="inc.title">📓 Derniers incidents</h2>
         <div id="incidents" class="hint"></div>
         <div id="upd-status" class="hint"></div>
       </div>
-    </div>
   </div>
 
 <div id="modal" class="modal hidden"><div class="modal-box" id="modal-box"></div></div>
