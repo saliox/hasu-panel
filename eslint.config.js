@@ -57,10 +57,10 @@ module.exports = [
     rules: regles,
   },
   {
-    // ui/i18n.js est chargé des DEUX côtés : par la fenêtre (balise <script>) et par le processus
+    // ui/i18n.js et les fichiers de langue sont chargés des DEUX côtés : par la fenêtre (balise <script>) et par le processus
     // principal (`require`), pour que le menu de la zone de notification parle la même langue que
     // l'écran sans dupliquer le dictionnaire. Il voit donc les deux jeux de globales.
-    files: ['ui/i18n.js'],
+    files: ['ui/i18n.js', 'ui/lang/*.js'],
     languageOptions: {
       ecmaVersion: 2023, sourceType: 'script',
       globals: { ...browserGlobals, module: 'writable', exports: 'writable', require: 'readonly' },

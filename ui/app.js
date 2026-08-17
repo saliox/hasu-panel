@@ -10,6 +10,10 @@ const appliquerLangue = (l) => {
   if (l === langCourante) return;
   langCourante = window.i18n.setLang(l);
   document.documentElement.lang = langCourante;
+  // L'arabe s'écrit de droite à gauche : c'est toute la mise en page qui bascule, pas juste le texte.
+  document.documentElement.dir = window.i18n.isRtl(langCourante) ? 'rtl' : 'ltr';
+  const sel = $('lang-select');
+  if (sel && sel.value !== langCourante) sel.value = langCourante;
   window.i18n.applyStatic();
   lastBotsHtml = lastBannerHtml = lastGamesHtml = lastSuggestHtml = null;
   lastUpdHtml = lastUpdCls = lastWarnHtml = lastIncHtml = null;
@@ -359,10 +363,11 @@ const closeModal = () => { $('modal').classList.add('hidden'); $('modal-box').in
 
 const aboutHTML = () => {
   const v = cur?.cfg?.version || '';
-  // Le corps anglais vit dans about-en.js (8 Ko de prose : il noierait le dictionnaire des libellés).
-  // Le français reste écrit ici, c'est la langue d'origine, celle qu'on relit et modifie en premier.
-  if (langCourante === 'en' && window.ABOUT_EN) {
-    return window.ABOUT_EN.split('{v}').join(esc(v))
+  // Le corps de l'aide vit dans le fichier de la langue (ui/lang/<code>.js), aux côtés de ses
+  // libellés : les deux décrivent les mêmes boutons, les séparer les ferait diverger.
+  const corps = window.i18n.about();
+  if (corps) {
+    return corps.split('{v}').join(esc(v))
       + `<div class="modal-actions"><button class="btn primary" id="modal-close">${t('logs.close')}</button></div>`;
   }
   return `
@@ -526,10 +531,22 @@ document.addEventListener('click', async (e) => {
 });
 
 $('about-btn').addEventListener('click', () => openModal(aboutHTML()));
-$('lang-btn').addEventListener('click', async () => {
-  const suivante = langCourante === 'fr' ? 'en' : 'fr';
-  appliquerLangue(suivante);            // effet immédiat, sans attendre l'aller-retour disque
-  await window.panel.setSetting('lang', suivante);
+// Le menu est REMPLI depuis les fichiers de langue réellement chargés : une liste écrite en dur ici
+// se désynchroniserait dès qu'on ajoute ou retire une langue.
+const remplirMenuLangues = () => {
+  const sel = $('lang-select');
+  if (!sel || sel.options.length) return;
+  for (const { code, nom } of window.i18n.langues()) {
+    const o = document.createElement('option');
+    o.value = code; o.textContent = nom;
+    sel.appendChild(o);
+  }
+};
+remplirMenuLangues();
+$('lang-select').addEventListener('change', async (e) => {
+  const choix = e.target.value;
+  appliquerLangue(choix);               // effet immédiat, sans attendre l'aller-retour disque
+  await window.panel.setSetting('lang', choix);
   await refresh();
 });
 const startImport = async (picker) => {

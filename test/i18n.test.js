@@ -1,51 +1,110 @@
-// Garde-fou du dictionnaire de traduction.
+// Garde-fou du dictionnaire de traduction (14 langues).
 //
-// POURQUOI : `t()` retombe volontairement sur le français quand une clé manque en anglais — c'est
-// mieux qu'un bouton vide. Mais cette tolérance rend l'oubli INVISIBLE : l'interface reste utilisable,
-// juste à moitié traduite, et personne ne s'en aperçoit. Ces tests transforment l'oubli en échec.
+// POURQUOI : `t()` retombe volontairement sur le français quand une clé manque — c'est mieux qu'un
+// bouton vide. Mais cette tolérance rend l'oubli INVISIBLE : l'interface reste utilisable, juste à
+// moitié traduite, et personne ne s'en aperçoit. Avec 14 langues, un contrôle à l'œil est illusoire.
+// Ces tests transforment chaque oubli en échec.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { DICT, t, setLang } = require('../ui/i18n');
+const i18n = require('../ui/i18n');
 
-const cles = (l) => Object.keys(DICT[l]).sort();
+const DIR = path.join(__dirname, '..', 'ui', 'lang');
+const CODES = i18n.ORDRE;
+const L = {};
+for (const c of CODES) L[c] = require(path.join(DIR, c + '.js'));
+const REF = L.fr; // le français est la langue d'origine : c'est lui qui fait référence
 
-test('i18n : les deux langues ont EXACTEMENT les mêmes clés', () => {
-  const fr = cles('fr'), en = cles('en');
-  const manqueEn = fr.filter((k) => !DICT.en[k]);
-  const manqueFr = en.filter((k) => !DICT.fr[k]);
-  assert.deepEqual(manqueEn, [], `clés absentes de l'anglais (elles resteront en français) : ${manqueEn.join(', ')}`);
-  assert.deepEqual(manqueFr, [], `clés présentes en anglais mais pas en français : ${manqueFr.join(', ')}`);
+test('i18n : toutes les langues annoncées sont réellement présentes et chargées', () => {
+  const surDisque = fs.readdirSync(DIR).filter((f) => f.endsWith('.js')).map((f) => f.replace('.js', '')).sort();
+  assert.deepEqual([...CODES].sort(), surDisque,
+    'un fichier de langue sur le disque n\'est pas dans ORDRE (il ne sera pas proposé), ou l\'inverse');
+  assert.equal(i18n.langues().length, CODES.length);
+});
+
+test('i18n : chaque langue porte un nom écrit DANS cette langue', () => {
+  // « Deutsch », pas « Allemand » : le menu doit être lisible par qui ne parle pas français.
+  for (const c of CODES) {
+    assert.equal(typeof L[c].nom, 'string', `${c} : nom manquant`);
+    assert.ok(L[c].nom.trim().length > 0, `${c} : nom vide`);
+  }
+  assert.equal(new Set(CODES.map((c) => L[c].nom)).size, CODES.length, 'deux langues portent le même nom');
+});
+
+test('i18n : toutes les langues ont EXACTEMENT les clés du français', () => {
+  const ref = Object.keys(REF.ui).sort();
+  for (const c of CODES) {
+    const k = Object.keys(L[c].ui).sort();
+    const manque = ref.filter((x) => !L[c].ui[x]);
+    const enTrop = k.filter((x) => REF.ui[x] === undefined);
+    assert.deepEqual(manque, [], `${c} : clés manquantes (elles resteront en français) → ${manque.slice(0, 6).join(', ')}`);
+    assert.deepEqual(enTrop, [], `${c} : clés inconnues → ${enTrop.slice(0, 6).join(', ')}`);
+  }
 });
 
 test('i18n : aucune valeur vide (un libellé vide = un bouton muet)', () => {
-  for (const l of ['fr', 'en']) {
-    for (const [k, v] of Object.entries(DICT[l])) {
-      assert.equal(typeof v, 'string', `${l}/${k} n'est pas une chaîne`);
-      assert.ok(v.trim().length > 0, `${l}/${k} est vide`);
+  for (const c of CODES) {
+    for (const [k, v] of Object.entries(L[c].ui)) {
+      assert.equal(typeof v, 'string', `${c}/${k} n'est pas une chaîne`);
+      assert.ok(v.trim().length > 0, `${c}/${k} est vide`);
     }
   }
 });
 
-test('i18n : les emplacements {x} sont les MÊMES dans les deux langues', () => {
-  // Un {n} oublié dans la traduction anglaise afficherait une phrase amputée de son chiffre.
-  const trous = (s) => (s.match(/\{[a-zA-Z]+\}/g) || []).sort().join(',');
-  for (const k of Object.keys(DICT.fr)) {
-    assert.equal(trous(DICT.en[k]), trous(DICT.fr[k]), `emplacements différents pour « ${k} »`);
+test('i18n : les emplacements {x} sont identiques à ceux du français', () => {
+  // Un {n} oublié dans une traduction afficherait une phrase amputée de son chiffre.
+  const trous = (s) => (String(s).match(/\{[a-zA-Z]+\}/g) || []).sort().join(',');
+  for (const c of CODES) {
+    for (const k of Object.keys(REF.ui)) {
+      assert.equal(trous(L[c].ui[k]), trous(REF.ui[k]), `${c} : emplacements différents pour « ${k} »`);
+    }
   }
 });
 
-test('i18n : t() remplit les emplacements et retombe proprement', () => {
-  setLang('fr');
-  assert.match(t('gm.online', { on: 3, total: 5 }), /3\/5/);
-  assert.equal(t('cle.qui.nexiste.pas'), 'cle.qui.nexiste.pas', 'une clé absente reste VISIBLE, donc repérable');
-  setLang('en');
-  assert.match(t('gm.online', { on: 1, total: 2 }), /1\/2/);
-  assert.match(t('gm.online', { on: 1, total: 2 }), /online/);
-  setLang('xx'); // langue inconnue → français, jamais de page blanche
-  assert.equal(t('upd.later'), DICT.fr['upd.later']);
-  setLang('fr');
+test('i18n : les balises HTML sont conservées à l\'identique', () => {
+  // Une <b> ouverte sans être fermée casse la mise en page de toute la zone.
+  const balises = (s) => (String(s).match(/<\/?[a-z]+[^>]*>/gi) || []).map((x) => x.toLowerCase()).sort().join('|');
+  for (const c of CODES) {
+    for (const k of Object.keys(REF.ui)) {
+      assert.equal(balises(L[c].ui[k]), balises(REF.ui[k]), `${c} : balises différentes pour « ${k} »`);
+    }
+  }
+});
+
+test('i18n : la fenêtre « À propos » a le même nombre de sections partout', () => {
+  const n = (s) => (String(s).match(/<h3>/g) || []).length;
+  const ref = n(REF.about);
+  assert.ok(ref >= 10, 'le français doit avoir ses 11 sections');
+  for (const c of CODES) {
+    assert.equal(n(L[c].about), ref, `${c} : ${n(L[c].about)} sections contre ${ref} en français`);
+    assert.ok(L[c].about.includes('{v}'), `${c} : l'emplacement {v} (numéro de version) a disparu de « À propos »`);
+  }
+});
+
+test('i18n : les noms propres ne sont pas traduits', () => {
+  // « pm2 » devenu « pm2 (gestionnaire) » ou Discord traduit rendrait l'aide fausse.
+  for (const c of CODES) {
+    assert.ok(/\bpm2\b/.test(L[c].about), `${c} : « pm2 » a disparu de « À propos »`);
+    assert.ok(/Discord/.test(L[c].about), `${c} : « Discord » a disparu de « À propos »`);
+  }
+});
+
+test('i18n : t() bascule, remplit les emplacements et retombe proprement', () => {
+  for (const c of CODES) {
+    i18n.setLang(c);
+    assert.equal(i18n.getLang(), c);
+    assert.match(i18n.t('gm.online', { on: 3, total: 5 }), /3\/5/, `${c} : emplacements non remplis`);
+    assert.ok(i18n.about().length > 500, `${c} : « À propos » vide`);
+  }
+  i18n.setLang('xx'); // langue inconnue → français, jamais de page blanche
+  assert.equal(i18n.getLang(), 'fr');
+  assert.equal(i18n.t('cle.qui.nexiste.pas'), 'cle.qui.nexiste.pas', 'une clé absente reste VISIBLE, donc repérable');
+});
+
+test('i18n : seul l\'arabe est marqué écriture de droite à gauche', () => {
+  assert.equal(i18n.isRtl('ar'), true);
+  for (const c of CODES.filter((x) => x !== 'ar')) assert.equal(i18n.isRtl(c), false, `${c} ne doit pas être RTL`);
 });
 
 test('i18n : toute clé utilisée dans le code EXISTE dans le dictionnaire', () => {
@@ -54,17 +113,17 @@ test('i18n : toute clé utilisée dans le code EXISTE dans le dictionnaire', () 
   const lire = (f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
   const src = lire('ui/app.js') + lire('main.js');
   const utilisees = new Set([...src.matchAll(/\bt\(\s*'([a-zA-Z][\w.]*)'/g)].map((m) => m[1]));
-  const inconnues = [...utilisees].filter((k) => DICT.fr[k] === undefined);
+  const inconnues = [...utilisees].filter((k) => REF.ui[k] === undefined);
   assert.deepEqual(inconnues, [], `clés utilisées mais absentes du dictionnaire : ${inconnues.join(', ')}`);
 });
 
-test('i18n : le corps anglais de « À propos » couvre les mêmes sections que le français', () => {
-  // Il vit dans son propre fichier : rien ne garantit qu'il suive quand on enrichit la version FR.
-  const fr = fs.readFileSync(path.join(__dirname, '..', 'ui', 'app.js'), 'utf8');
-  const en = fs.readFileSync(path.join(__dirname, '..', 'ui', 'about-en.js'), 'utf8');
-  const iA = fr.indexOf('const aboutHTML');
-  const blocFr = fr.slice(iA, fr.indexOf('\n};', iA));
-  const nFr = (blocFr.match(/<h3>/g) || []).length;
-  const nEn = (en.match(/<h3>/g) || []).length;
-  assert.equal(nEn, nFr, `« À propos » : ${nFr} sections en français contre ${nEn} en anglais`);
+test('i18n : le HTML charge bien TOUS les fichiers de langue', () => {
+  // Un fichier oublié dans index.html ne s'enregistre pas côté fenêtre : la langue disparaît du menu
+  // alors que les tests, eux, la trouvent (ils passent par require). Panne visible seulement à l'écran.
+  const html = fs.readFileSync(path.join(__dirname, '..', 'ui', 'index.html'), 'utf8');
+  const manquants = CODES.filter((c) => !html.includes(`lang/${c}.js`));
+  assert.deepEqual(manquants, [], `langues non chargées par index.html : ${manquants.join(', ')}`);
+  // …et dans le bon ordre : i18n.js les assemble, il doit venir APRÈS.
+  assert.ok(html.indexOf('lang/fr.js') < html.indexOf('i18n.js'), 'i18n.js doit être chargé après les langues');
+  assert.ok(html.indexOf('i18n.js') < html.indexOf('app.js'), 'app.js doit être chargé après i18n.js');
 });

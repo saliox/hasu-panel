@@ -335,9 +335,15 @@ const loadCfg = () => {
       // MÉMORISÉE — elle repassait donc devant la nouvelle taille calculée à chaque lancement. On oublie
       // les bornes mémorisées UNE SEULE FOIS ; tout redimensionnement fait ensuite est respecté.
       winSizeV2: true,
+      // MIGRATION `winSizeV3` : la fenêtre s'ouvrait déjà « grande » (~1650×930 sur un écran 1080p)
+      // mais pas MAXIMISÉE — ce qui se lit encore comme une petite fenêtre posée au milieu de l'écran.
+      // On la maximise UNE fois ; si tu la restaures ensuite, rememberBounds enregistre ce choix et il
+      // est respecté à tous les lancements suivants. Les bornes mémorisées, elles, sont conservées :
+      // ce sont celles qui reviennent quand tu quittes le plein écran.
+      winSizeV3: true,
       winBounds: (raw.winSizeV2 === true && raw.winBounds && ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(raw.winBounds[k])))
         ? { x: raw.winBounds.x, y: raw.winBounds.y, width: raw.winBounds.width, height: raw.winBounds.height } : null,
-      winMaximized: raw.winSizeV2 === true && raw.winMaximized === true,
+      winMaximized: raw.winSizeV3 === true ? raw.winMaximized === true : true,
       updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),

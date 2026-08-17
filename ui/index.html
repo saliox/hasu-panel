@@ -63,6 +63,14 @@
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   .btn.armed { background: #e5484d; border-color: #e5484d; color: #fff; animation: armpulse 1s ease-in-out infinite; }
   @keyframes armpulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+  .lang-select { background: #2b2f3f; color: var(--txt); border: 1px solid var(--line); border-radius: 7px;
+                 padding: 4px 8px; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .lang-select:hover { background: #353a4e; }
+  /* Écriture de droite à gauche (arabe) : on bascule toute la mise en page, pas seulement le texte. */
+  html[dir="rtl"] .updcard::before { left: auto; right: 0; }
+  html[dir="rtl"] .updcard-act { margin-left: 0; margin-right: auto; }
+  html[dir="rtl"] .bot .meta { text-align: right; }
+  html[dir="rtl"] .about-btn { margin-left: 0; margin-right: 6px; }
   .phrase { color: var(--mut); font-size: 12.5px; display: inline-flex; align-items: center; gap: 6px; }
   .mut12 { color: var(--mut); font-size: 12px; }
   .mut11 { color: var(--mut); font-size: 11px; }
@@ -96,7 +104,7 @@
 </style>
 </head>
 <body>
-  <h1>🛡️ Hasu Panel <span class="sub" data-i18n="app.sub">gestion des bots pm2 · mode jeu</span> <button class="btn" id="lang-btn" data-i18n="btn.lang" data-i18n-title="btn.langTitle" title="Switch the panel to English" style="margin-left:auto">🇬🇧 English</button><button class="btn about-btn" id="about-btn" data-i18n="btn.about" style="margin-left:6px">ℹ️ À propos</button></h1>
+  <h1>🛡️ Hasu Panel <span class="sub" data-i18n="app.sub">gestion des bots pm2 · mode jeu</span> <select id="lang-select" class="lang-select" data-i18n-title="btn.langTitle" title="Langue de l'interface" style="margin-left:auto"></select><button class="btn about-btn" id="about-btn" data-i18n="btn.about" style="margin-left:6px">ℹ️ À propos</button></h1>
   <div id="updcard" class="updcard hidden"></div>
   <div id="cfgwarn" class="updcard err hidden"></div>
   <div id="banner" class="banner" data-i18n="banner.loading">Chargement…</div>
@@ -231,8 +239,21 @@
   </div>
 
 <div id="modal" class="modal hidden"><div class="modal-box" id="modal-box"></div></div>
+<script src="lang/fr.js"></script>
+<script src="lang/en.js"></script>
+<script src="lang/es.js"></script>
+<script src="lang/pt.js"></script>
+<script src="lang/de.js"></script>
+<script src="lang/it.js"></script>
+<script src="lang/nl.js"></script>
+<script src="lang/pl.js"></script>
+<script src="lang/ru.js"></script>
+<script src="lang/tr.js"></script>
+<script src="lang/ar.js"></script>
+<script src="lang/zh.js"></script>
+<script src="lang/ja.js"></script>
+<script src="lang/ko.js"></script>
 <script src="i18n.js"></script>
-<script src="about-en.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
