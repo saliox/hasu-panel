@@ -313,27 +313,16 @@ const render = (st) => {
 
   // Mises à jour
   $('upd-version').textContent = st.cfg.version || '—';
-  const applyBtn = $('upd-apply');
-  applyBtn.style.display = st.updateReady ? '' : 'none';
-  if (st.updateReady && !updBusy) {
-    // Avec l'installation automatique, on explique POURQUOI elle attend encore (au lieu de laisser croire
-    // qu'il faut absolument cliquer). « fenêtre ouverte » est normal : elle s'installera dès que tu fermes.
-    const bl = st.updateBlockers || [];
-    $('upd-status').innerHTML = st.autoApplyUpdates === false
-      ? t('upd.readyManual')
-      : bl.length
-        ? t('upd.readyWaiting', { list: esc(bl.filter((b) => b !== 'blk.window').map((b) => t(b)).join(', ')) })
-        : t('upd.readySoon');
-  }
-  // …et on n'écrase PAS un état vivant de l'updater. `available`/`downloading` n'arrivent qu'une fois
-  // par événement : ce sondage de 3 s effaçait le message juste après, laissant une zone vide pendant
-  // tout le téléchargement. `st.updateStatus` est consulté en plus de `upd.s`, qui peut ne pas encore
-  // avoir été alimenté au premier rendu après une réouverture de la fenêtre.
-  else if (!updBusy && !st.updateReady && !updMsg) {
-    const vivant = (upd.s || st.updateStatus || {}).state;
-    if (vivant !== 'available' && vivant !== 'downloading') {
-      $('upd-status').textContent = st.cfg.packaged ? '' : 'ℹ️ L\'auto-update est actif seulement dans la version installée (Setup.exe).';
-    }
+  // ANTI-DOUBLON : dès qu'une mise à jour est en cours ou prête, TOUT se passe dans la carte du haut —
+  // barre de progression, notes de version, bouton d'installation, motif d'attente. Ce panneau ne
+  // répète plus rien : il masque même son propre bouton « Redémarrer & appliquer », qui faisait
+  // doublon avec « Installer et redémarrer » de la carte. Il ne sert plus qu'à la vérification
+  // manuelle et à son résultat.
+  const enCoursOuPrete = st.updateReady || ['downloading', 'available', 'downloaded'].includes((upd.s || st.updateStatus || {}).state);
+  if (enCoursOuPrete) {
+    if (!updBusy) $('upd-status').textContent = '';
+  } else if (!updBusy && !updMsg) {
+    $('upd-status').textContent = st.cfg.packaged ? '' : t('upd.dev');
   }
   // Le bouton n'est grisé QUE pendant un travail réellement en cours. Avant, l'état `available`
   // (poussé une seule fois) le désactivait sans que rien ne le réactive : si le téléchargement
@@ -647,11 +636,6 @@ $('upd-check').addEventListener('click', async () => {
   finally { $('upd-check').disabled = false; updBusy = false; } // le bouton se réactive quoi qu'il arrive
   refresh();
 });
-$('upd-apply').addEventListener('click', async () => {
-  $('upd-apply').disabled = true;
-  $('upd-status').textContent = '🔄 Application de la mise à jour et redémarrage…';
-  await window.panel.applyUpdate();
-});
 
 // Progression du téléchargement de la MAJ, poussée EN DIRECT par le main (event update-status).
 const renderUpdateStatus = (s) => {
@@ -660,26 +644,12 @@ const renderUpdateStatus = (s) => {
   if (s.state === 'downloading' || s.state === 'available') upd.sawDl = true;
   if (s.state === 'downloaded' && s.version !== upd.dismissed) upd.dismissed = ''; // nouvelle version = on ré-affiche
   paintUpdCard();
-  const zone = $('upd-status'); // (renommé : `st` désigne l'objet de statut partout ailleurs)
-  if (s.state === 'downloading') {
-    const pct = Math.max(0, Math.min(100, s.percent || 0));
-    const speed = s.bps ? ` · ${fmtBps(s.bps)}` : '';
-    const size = (s.transferred && s.total) ? ` · ${(s.transferred / 1e6).toFixed(0)}/${(s.total / 1e6).toFixed(0)} Mo` : '';
-    zone.innerHTML = `⬇️ Téléchargement de la mise à jour… <b>${pct}%</b>${speed}${size}`
-      + `<div class="upd-bar"><div class="upd-bar-fill" style="width:${pct}%"></div></div>`;
-    $('upd-check').disabled = true;
-    $('upd-apply').style.display = 'none';
-  } else if (s.state === 'downloaded') {
-    zone.innerHTML = '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».';
-    $('upd-check').disabled = false;
-    $('upd-apply').style.display = '';
-  } else if (s.state === 'available') {
-    zone.innerHTML = `⬇️ Nouvelle version <b>${esc(s.version || '')}</b> trouvée — téléchargement…`;
-    $('upd-check').disabled = true;
-  } else if (s.state === 'error') {
-    zone.innerHTML = `⚠️ MàJ : ${esc(s.message || 'erreur')}`;
-    $('upd-check').disabled = false;
-  }
+  // ANTI-DOUBLON : la carte du haut est le SEUL endroit qui montre le déroulé d'une mise à jour
+  // (barre de progression, version prête, erreur). Ce panneau répétait exactement la même chose
+  // quelques centaines de pixels plus bas — deux barres de téléchargement à l'écran en même temps.
+  // Il ne garde que ce que la carte n'affiche pas : le résultat d'une vérification MANUELLE.
+  $('upd-status').textContent = '';
+  $('upd-check').disabled = (s.state === 'downloading');
 };
 if (window.panel.onUpdate) window.panel.onUpdate(renderUpdateStatus);
 // Le webhook s'enregistre AUSSI à la frappe (anti-perte) : `change` ne se déclenche qu'à la perte de
