@@ -63,6 +63,9 @@
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   .btn.armed { background: #e5484d; border-color: #e5484d; color: #fff; animation: armpulse 1s ease-in-out infinite; }
   @keyframes armpulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+  .phrase { color: var(--mut); font-size: 12.5px; display: inline-flex; align-items: center; gap: 6px; }
+  .mut12 { color: var(--mut); font-size: 12px; }
+  .mut11 { color: var(--mut); font-size: 11px; }
   .upd-bar { height: 8px; background: #12141d; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-top: 6px; max-width: 360px; }
   .upd-bar-fill { height: 100%; background: var(--accent); border-radius: 6px; transition: width .2s ease; }
 
@@ -93,138 +96,134 @@
 </style>
 </head>
 <body>
-  <h1>🛡️ Hasu Panel <span class="sub">gestion des bots pm2 · mode jeu</span> <button class="btn about-btn" id="about-btn">ℹ️ À propos</button></h1>
+  <h1>🛡️ Hasu Panel <span class="sub" data-i18n="app.sub">gestion des bots pm2 · mode jeu</span> <button class="btn" id="lang-btn" data-i18n="btn.lang" data-i18n-title="btn.langTitle" title="Switch the panel to English" style="margin-left:auto">🇬🇧 English</button><button class="btn about-btn" id="about-btn" data-i18n="btn.about" style="margin-left:6px">ℹ️ À propos</button></h1>
   <div id="updcard" class="updcard hidden"></div>
   <div id="cfgwarn" class="updcard err hidden"></div>
-  <div id="banner" class="banner">Chargement…</div>
+  <div id="banner" class="banner" data-i18n="banner.loading">Chargement…</div>
 
   <div class="grid">
     <div class="card">
       <div class="cardhead">
-        <h2>🤖 Bots (pm2)</h2>
+        <h2 data-i18n="bots.title">🤖 Bots (pm2)</h2>
         <div style="display:flex;gap:6px">
-          <button class="btn primary" id="import-btn" title="Choisir le fichier principal du bot (index.js, bot.py…)">➕ Importer (fichier)</button>
-          <button class="btn" id="import-dir-btn" title="Choisir le DOSSIER du bot — le fichier principal est détecté automatiquement">📁 Importer (dossier)</button>
-          <button class="btn danger" id="stop-all-btn" title="Arrêter TOUS les bots en ligne (clique une 2e fois pour confirmer)">⏹ Tout arrêter</button>
+          <button class="btn primary" id="import-btn" data-i18n="bots.import" data-i18n-title="bots.importTitle" title="Choisir le fichier principal du bot (index.js, bot.py…)">➕ Importer (fichier)</button>
+          <button class="btn" id="import-dir-btn" data-i18n="bots.importDir" data-i18n-title="bots.importDirTitle" title="Choisir le DOSSIER du bot — le fichier principal est détecté automatiquement">📁 Importer (dossier)</button>
+          <button class="btn danger" id="stop-all-btn" data-i18n="bots.stopAll" data-i18n-title="bots.stopAllTitle" title="Arrêter TOUS les bots en ligne (clique une 2e fois pour confirmer)">⏹ Tout arrêter</button>
         </div>
       </div>
       <div id="bots"></div>
-      <div class="hint">« Auto boot » : le bot est (re)mis en ligne à l'ouverture de session Windows. « Coupé en jeu » : ce bot est arrêté quand le mode jeu se déclenche (si « seulement les bots cochés »).</div>
+      <div class="hint" data-i18n-html="bots.hint">« Auto boot » : le bot est (re)mis en ligne à l'ouverture de session Windows. « Coupé en jeu » : ce bot est arrêté quand le mode jeu se déclenche (si « seulement les bots cochés »).</div>
     </div>
 
     <div>
       <div class="card">
-        <h2>🎮 Mode jeu</h2>
+        <h2 data-i18n="gm.title">🎮 Mode jeu</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="gm-enabled"><span></span></label>
-          <div>Couper des bots quand un jeu est détecté</div>
+          <div data-i18n="gm.enable">Couper des bots quand un jeu est détecté</div>
         </div>
         <div class="row" style="margin-left:6px">
-          <label class="chk"><input type="radio" name="gm-scope" id="gm-all"> Tous les bots</label>
-          <label class="chk"><input type="radio" name="gm-scope" id="gm-some"> Seulement les bots cochés « Coupé en jeu »</label>
+          <label class="chk"><input type="radio" name="gm-scope" id="gm-all"> <span data-i18n="gm.all">Tous les bots</span></label>
+          <label class="chk"><input type="radio" name="gm-scope" id="gm-some"> <span data-i18n="gm.some">Seulement les bots cochés « Coupé en jeu »</span></label>
         </div>
         <div class="row">
-          <span style="color:var(--mut);font-size:12.5px">Relancer les bots</span>
-          <input type="number" id="gm-grace" min="10" max="3600" step="10">
-          <span style="color:var(--mut);font-size:12.5px">s après la fermeture du jeu</span>
+          <span class="phrase" data-i18n-input="gm.grace" data-input="gm-grace">Relancer les bots <input type="number" id="gm-grace" min="10" max="3600" step="10"> s après la fermeture du jeu</span>
         </div>
         <div class="row">
           <label class="switch"><input type="checkbox" id="gm-soloskip"><span></span></label>
-          <div>Ignorer les jeux <b>solo</b> <span style="color:var(--mut);font-size:12px">(ne couper que si le jeu est vraiment en ligne)</span></div>
+          <div data-i18n-html="gm.soloskip">Ignorer les jeux <b>solo</b> <span class="mut12">(ne couper que si le jeu est vraiment en ligne)</span></div>
         </div>
         <div id="gm-stopped" class="stopped-banner"></div>
 
-        <h2 style="margin-top:16px">🌐 Faible usage internet</h2>
+        <h2 style="margin-top:16px" data-i18n="lownet.title">🌐 Faible usage internet</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="gm-lownet"><span></span></label>
-          <div>Priorité réseau au jeu en ligne</div>
+          <div data-i18n="lownet.enable">Priorité réseau au jeu en ligne</div>
         </div>
-        <div class="hint">Pendant une partie en ligne : les gros téléchargements des bots (listes anti-scam, sauvegardes chiffrées) sont mis en pause et leur priorité est abaissée — automatiquement plus strict si ta connexion est lente. Tout revient à la normale à la fin de la partie. Indépendant du mode jeu : utile pour les bots que tu laisses tourner.</div>
+        <div class="hint" data-i18n-html="lownet.hint">Pendant une partie en ligne : les gros téléchargements des bots (listes anti-scam, sauvegardes chiffrées) sont mis en pause et leur priorité est abaissée — automatiquement plus strict si ta connexion est lente. Tout revient à la normale à la fin de la partie. Indépendant du mode jeu : utile pour les bots que tu laisses tourner.</div>
 
-        <h2 style="margin-top:16px">🕹️ Jeux détectés (process)</h2>
+        <h2 style="margin-top:16px" data-i18n="games.title">🕹️ Jeux détectés (process)</h2>
         <div class="row">
-          <input type="text" id="game-add" placeholder="MonJeu.exe" style="flex:1">
-          <button class="btn primary" id="game-add-btn">Ajouter</button>
+          <input type="text" id="game-add" data-i18n-ph="games.ph" placeholder="MonJeu.exe" style="flex:1">
+          <button class="btn primary" id="game-add-btn" data-i18n="games.add">Ajouter</button>
         </div>
         <div class="row">
-          <button class="btn" id="game-pick-btn" title="Choisir parmi les fenêtres ouvertes (lance le jeu d'abord)">📋 Programmes ouverts</button>
-          <button class="btn" id="game-exe-btn" title="Parcourir le disque pour choisir le .exe du jeu">📁 Choisir un .exe</button>
-          <button class="btn" id="game-scan-btn" title="Cherche les jeux installés (Steam, Epic) absents de la liste">🔍 Scanner</button>
+          <button class="btn" id="game-pick-btn" data-i18n="games.pick" data-i18n-title="games.pickTitle" title="Choisir parmi les fenêtres ouvertes (lance le jeu d'abord)">📋 Programmes ouverts</button>
+          <button class="btn" id="game-exe-btn" data-i18n="games.exe" data-i18n-title="games.exeTitle" title="Parcourir le disque pour choisir le .exe du jeu">📁 Choisir un .exe</button>
+          <button class="btn" id="game-scan-btn" data-i18n="games.scan" data-i18n-title="games.scanTitle" title="Cherche les jeux installés (Steam, Epic) absents de la liste">🔍 Scanner</button>
         </div>
         <div id="game-suggest" class="stopped-banner"></div>
         <div class="chips" id="games"></div>
-        <div class="hint">« Programmes ouverts » liste ce qui tourne sur TON PC (jeu ou logiciel inconnu de la liste par défaut) : lance le jeu puis choisis-le — c'est le plus précis. « Scanner » fouille les bibliothèques Steam/Epic (1×/jour automatique, jamais en continu).</div>
+        <div class="hint" data-i18n-html="games.hint">« Programmes ouverts » liste ce qui tourne sur TON PC (jeu ou logiciel inconnu de la liste par défaut) : lance le jeu puis choisis-le — c'est le plus précis. « Scanner » fouille les bibliothèques Steam/Epic (1×/jour automatique, jamais en continu).</div>
       </div>
 
       <div class="card" style="margin-top:16px">
-        <h2>⚙️ Réglages</h2>
+        <h2 data-i18n="set.title">⚙️ Réglages</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-autolaunch"><span></span></label>
-          <div>Lancer le panel au démarrage de Windows <span id="dev-note" style="color:var(--mut);font-size:11px"></span></div>
+          <div><span data-i18n="set.autolaunch">Lancer le panel au démarrage de Windows</span> <span id="dev-note" style="color:var(--mut);font-size:11px"></span></div>
         </div>
         <div class="row">
-          <span style="color:var(--mut);font-size:12.5px">Vérifier les jeux / bots toutes les</span>
-          <input type="number" id="set-poll" min="5" max="120" step="5">
-          <span style="color:var(--mut);font-size:12.5px">secondes</span>
+          <span class="phrase" data-i18n-input="set.poll" data-input="set-poll">Vérifier les jeux / bots toutes les <input type="number" id="set-poll" min="5" max="120" step="5"> secondes</span>
         </div>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-scanauto"><span></span></label>
-          <div>Chercher de nouveaux jeux installés <b>1×/jour</b> <span id="set-scaninfo" style="color:var(--mut);font-size:11px"></span></div>
+          <div><span data-i18n-html="set.scanauto">Chercher de nouveaux jeux installés <b>1×/jour</b></span> <span id="set-scaninfo" style="color:var(--mut);font-size:11px"></span></div>
         </div>
-        <div class="hint">La vérification ci-dessus ne lit que la liste des process (très léger). Le scan disque des jeux, lui, ne tourne <b>jamais en continu</b> : 1×/jour maximum, ou via le bouton « 🔍 Scanner ».</div>
+        <div class="hint" data-i18n-html="set.scanHint">La vérification ci-dessus ne lit que la liste des process (très léger). Le scan disque des jeux, lui, ne tourne <b>jamais en continu</b> : 1×/jour maximum, ou via le bouton « 🔍 Scanner ».</div>
 
-        <div class="hint" id="save-info" title="pm2 restaure cette liste au démarrage du PC — elle est réenregistrée après chaque démarrage/arrêt fait ici."></div>
+        <div class="hint" id="save-info" data-i18n-title="set.saveInfoTitle" title="pm2 restaure cette liste au démarrage du PC — elle est réenregistrée après chaque démarrage/arrêt fait ici."></div>
 
-        <h2 style="margin-top:16px">🔔 Alertes (bot qui tombe)</h2>
+        <h2 style="margin-top:16px" data-i18n="alerts.title">🔔 Alertes (bot qui tombe)</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-alerts"><span></span></label>
-          <div>Me prévenir quand un bot <b>tombe</b> ou <b>redémarre en boucle</b></div>
+          <div data-i18n-html="alerts.enable">Me prévenir quand un bot <b>tombe</b> ou <b>redémarre en boucle</b></div>
         </div>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-alert-toast"><span></span></label>
-          <div>Notification Windows (utile seulement si je suis devant le PC)</div>
+          <div data-i18n="alerts.toast">Notification Windows (utile seulement si je suis devant le PC)</div>
         </div>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-alert-sound"><span></span></label>
-          <div>Petit son avec la notification</div>
-          <input type="range" id="set-alert-volume" min="1" max="100" step="1" style="flex:1;max-width:160px" title="Volume du son">
+          <div data-i18n="alerts.sound">Petit son avec la notification</div>
+          <input type="range" id="set-alert-volume" min="1" max="100" step="1" style="flex:1;max-width:160px" data-i18n-title="alerts.volTitle" title="Volume du son">
           <span id="alert-vol-val" style="color:var(--mut);font-size:12px;min-width:38px"></span>
         </div>
         <div class="row">
-          <input type="text" id="set-alert-webhook" placeholder="https://discord.com/api/webhooks/… (te prévient même en jeu)" style="flex:1" maxlength="300">
-          <button class="btn" id="alert-test">Tester</button>
+          <input type="text" id="set-alert-webhook" data-i18n-ph="alerts.webhookPh" placeholder="https://discord.com/api/webhooks/… (te prévient même en jeu)" style="flex:1" maxlength="300">
+          <button class="btn" id="alert-test" data-i18n="alerts.test">Tester</button>
         </div>
-        <div class="hint">Le <b>webhook Discord</b> est le plus utile : il te touche même en pleine partie ou absent du PC. Dans Discord : <b>Paramètres du salon → Intégrations → Webhooks → Nouveau webhook → Copier l'URL</b>. L'alerte indique <b>la cause en français</b> (Internet coupé, token invalide, module manquant…).<span id="alert-status"></span></div>
+        <div class="hint"><span data-i18n-html="alerts.hint">Le <b>webhook Discord</b> est le plus utile : il te touche même en pleine partie ou absent du PC. Dans Discord : <b>Paramètres du salon → Intégrations → Webhooks → Nouveau webhook → Copier l'URL</b>. L'alerte indique <b>la cause en français</b> (Internet coupé, token invalide, module manquant…).</span><span id="alert-status"></span></div>
 
-        <h2 style="margin-top:16px">🎮 Rich Presence Discord</h2>
+        <h2 style="margin-top:16px" data-i18n="rpc.title">🎮 Rich Presence Discord</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-rpc"><span></span></label>
-          <div>Afficher « 🤖 Gère X bots en ligne » sur mon profil Discord</div>
+          <div data-i18n="rpc.enable">Afficher « 🤖 Gère X bots en ligne » sur mon profil Discord</div>
         </div>
         <div class="row">
-          <input type="text" id="set-rpc-id" placeholder="Laisse vide — application Hasu Panel utilisée par défaut" style="flex:1" maxlength="40">
+          <input type="text" id="set-rpc-id" data-i18n-ph="rpc.idPh" placeholder="Laisse vide — application Hasu Panel utilisée par défaut" style="flex:1" maxlength="40">
         </div>
-        <div class="hint">Rien à configurer : ça fonctionne dès l'activation (il faut juste que <b>Discord soit ouvert</b> sur ce PC). Le champ ci-dessus n'est utile que si tu veux afficher <b>ta propre</b> application Discord — dans ce cas, colle son <b>Application ID</b> (discord.com/developers/applications → General Information).<span id="rpc-status"></span></div>
+        <div class="hint"><span data-i18n-html="rpc.hint">Rien à configurer : ça fonctionne dès l'activation (il faut juste que <b>Discord soit ouvert</b> sur ce PC). Le champ ci-dessus n'est utile que si tu veux afficher <b>ta propre</b> application Discord — dans ce cas, colle son <b>Application ID</b> (discord.com/developers/applications → General Information).</span><span id="rpc-status"></span></div>
 
-        <h2 style="margin-top:16px">🔄 Mises à jour</h2>
+        <h2 style="margin-top:16px" data-i18n="upd.title">🔄 Mises à jour</h2>
         <div class="row">
-          <span style="color:var(--mut);font-size:12.5px">Version : <b id="upd-version">—</b></span>
-          <button class="btn primary" id="upd-check">Vérifier les mises à jour</button>
-          <button class="btn" id="upd-apply" style="display:none">Redémarrer & appliquer</button>
+          <span style="color:var(--mut);font-size:12.5px"><span data-i18n="upd.version">Version :</span> <b id="upd-version">—</b></span>
+          <button class="btn primary" id="upd-check" data-i18n="upd.check">Vérifier les mises à jour</button>
+          <button class="btn" id="upd-apply" data-i18n="upd.apply" style="display:none">Redémarrer & appliquer</button>
         </div>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-autoupdate"><span></span></label>
-          <div>Installer les mises à jour <b>toutes seules</b> <span style="color:var(--mut);font-size:11px">(jamais pendant une partie ni une manip sur les bots)</span></div>
+          <div data-i18n-html="upd.auto">Installer les mises à jour <b>toutes seules</b> <span class="mut11">(jamais pendant une partie ni une manip sur les bots)</span></div>
         </div>
 
-        <h2 style="margin-top:16px">🔧 Relance automatique</h2>
+        <h2 style="margin-top:16px" data-i18n="heal.title">🔧 Relance automatique</h2>
         <div class="row">
           <label class="switch"><input type="checkbox" id="set-autoheal"><span></span></label>
-          <div>Redémarrer tout seul un bot <b>tombé</b> <span style="color:var(--mut);font-size:11px">(après 5 min, puis 15 min, puis 1 h)</span></div>
+          <div data-i18n-html="heal.enable">Redémarrer tout seul un bot <b>tombé</b> <span class="mut11">(après 5 min, puis 15 min, puis 1 h)</span></div>
         </div>
-        <div class="hint">Quand pm2 a épuisé ses propres relances, le bot reste mort jusqu'à ce que tu t'en aperçoives. Le panel réessaie à ta place, puis <b>arrête au bout de 3 essais</b> : un bot qui refuse de repartir trois fois a un vrai problème, et l'alerte doit rester visible. Ne touche jamais un bot que <b>tu</b> as arrêté, ni un bot coupé par le mode jeu.</div>
+        <div class="hint" data-i18n-html="heal.hint">Quand pm2 a épuisé ses propres relances, le bot reste mort jusqu'à ce que tu t'en aperçoives. Le panel réessaie à ta place, puis <b>arrête au bout de 3 essais</b> : un bot qui refuse de repartir trois fois a un vrai problème, et l'alerte doit rester visible. Ne touche jamais un bot que <b>tu</b> as arrêté, ni un bot coupé par le mode jeu.</div>
 
-        <h2 style="margin-top:16px">📓 Derniers incidents</h2>
+        <h2 style="margin-top:16px" data-i18n="inc.title">📓 Derniers incidents</h2>
         <div id="incidents" class="hint"></div>
         <div id="upd-status" class="hint"></div>
       </div>
@@ -232,6 +231,8 @@
   </div>
 
 <div id="modal" class="modal hidden"><div class="modal-box" id="modal-box"></div></div>
+<script src="i18n.js"></script>
+<script src="about-en.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

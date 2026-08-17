@@ -1,5 +1,20 @@
 // UI du panel — rendu de l'état + envoi des actions via window.panel (preload).
 const $ = (id) => document.getElementById(id);
+// Traductions : le dictionnaire est chargé par <script src="i18n.js"> AVANT ce fichier, et partagé
+// avec le processus principal (menu de la zone de notification).
+const t = (k, v) => window.i18n.t(k, v);
+let langCourante = 'fr';
+// Repeint TOUT ce qui est traduit : le HTML statique (attributs data-i18n*) et, via les gardes de
+// signature remises à zéro, chaque zone dynamique au prochain rendu.
+const appliquerLangue = (l) => {
+  if (l === langCourante) return;
+  langCourante = window.i18n.setLang(l);
+  document.documentElement.lang = langCourante;
+  window.i18n.applyStatic();
+  lastBotsHtml = lastBannerHtml = lastGamesHtml = lastSuggestHtml = null;
+  lastUpdHtml = lastUpdCls = lastWarnHtml = lastIncHtml = null;
+  if (cur) render(cur);
+};
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 const fmtUptime = (ts) => {
@@ -56,7 +71,7 @@ const paintUpdCard = () => {
     // « Plus tard » : on s'efface, mais l'installation automatique, elle, suit son cours.
   } else if (s.state === 'downloading') {
     const pct = Math.max(0, Math.min(100, Math.round(s.percent || 0)));
-    html = head('⬇️', 'Téléchargement de la mise à jour…', `<b style="font-size:15px">${pct}%</b>`)
+    html = head('⬇️', t('upd.cardDownloading'), `<b style="font-size:15px">${pct}%</b>`)
       + `<div class="upd-bar"><div class="upd-bar-fill live" style="width:${pct}%"></div></div>`
       + `<div class="updcard-prog"><span>${s.bps ? esc(fmtBps(s.bps)) : ''}</span>`
       + `<span>${(s.transferred && s.total) ? `${esc(fmtMo(s.transferred))} / ${esc(fmtMo(s.total))}` : ''}</span></div>`;
@@ -64,28 +79,27 @@ const paintUpdCard = () => {
     cls += ' ready';
     // « fenêtre ouverte » est TOUJOURS dans les blockers tant que tu regardes l'écran : l'afficher tel quel
     // ferait croire à un blocage. On l'exprime en clair et on ne liste que les autres raisons.
-    const others = (upd.blockers || []).filter((b) => b !== 'fenêtre ouverte');
+    const others = (upd.blockers || []).filter((b) => b !== 'blk.window').map((b) => t(b));
     const why = upd.auto === false
-      ? 'Installation automatique désactivée — applique-la quand tu veux.'
-      : others.length
-        ? `Elle s'installera toute seule dès que possible — en attente : ${esc(others.join(', '))}.`
-        : 'Elle s\'installera toute seule dès que tu fermeras cette fenêtre.';
+      ? t('upd.whyManual')
+      : others.length ? t('upd.whyWaiting', { list: esc(others.join(', ')) })
+        : t('upd.whyWindow');
     // Un redémarrage raté (installeur en quarantaine antivirus, fichier verrouillé) arrive alors que
     // `updateReady` est TOUJOURS vrai : sans ce cas, l'erreur ne s'affichait nulle part et le bouton
     // restait bloqué sur « Redémarrage… » pour toujours.
     const rate = s.state === 'error' ? `<div class="updcard-why" style="color:var(--err)">${esc(s.message || 'échec')}</div>` : '';
-    html = head('✅', 'Mise à jour prête à être installée',
-      '<button class="btn primary big" data-upd="apply">Installer et redémarrer</button>'
-      + '<button class="btn" data-upd="later" title="Masquer cette carte">Plus tard</button>')
+    html = head('✅', t('upd.cardReady'),
+      `<button class="btn primary big" data-upd="apply">${t('upd.install')}</button>`
+      + `<button class="btn" data-upd="later" title="${t('upd.laterTitle')}">${t('upd.later')}</button>`)
       + notes + rate + `<div class="updcard-why">${why}</div>`;
   } else if (s.state === 'available') {
-    html = head('🎉', `Nouvelle version disponible`, '<span style="color:var(--mut);font-size:12px">préparation…</span>') + notes;
+    html = head('🎉', t('upd.cardAvailable'), `<span class="mut12">${t('upd.cardPreparing')}</span>`) + notes;
   } else if (s.state === 'error' && upd.sawDl) {
     // Une erreur de simple vérification (PC hors ligne) ne mérite pas une bannière rouge plein écran :
     // on ne l'affiche que si un téléchargement était réellement engagé.
     cls += ' err';
-    html = head('⚠️', 'Mise à jour interrompue',
-      '<button class="btn" data-upd="retry">Réessayer</button>')
+    html = head('⚠️', t('upd.cardBroken'),
+      `<button class="btn" data-upd="retry">${t('upd.retry')}</button>`)
       + `<div class="updcard-why">${esc(s.message || 'erreur inconnue')}</div>`;
   }
 
@@ -99,7 +113,7 @@ $('updcard').addEventListener('click', async (e) => {
   if (!a) return;
   if (a === 'apply') {
     e.target.disabled = true;
-    e.target.textContent = 'Redémarrage…';
+    e.target.textContent = t('upd.restarting');
     await window.panel.applyUpdate();
   } else if (a === 'later') {
     upd.dismissed = upd.s?.version || '-';
@@ -123,12 +137,15 @@ addEventListener('blur', () => { sourisEnfoncee = false; }); // relâché hors f
 
 const render = (st) => {
   cur = st;
+  // La langue vient du processus principal : elle survit au redémarrage, et l'écran s'y aligne même
+  // si le choix a été fait ailleurs (autre fenêtre, config éditée à la main).
+  if (st.lang && st.lang !== langCourante) appliquerLangue(st.lang);
   // Réglages qui ne s'enregistrent plus : ça doit se VOIR. Ce mode de panne a duré six semaines sans
   // le moindre signe (fichier lisible mais plus écrit), et il fait perdre webhook et préférences.
   const warnHtml = st.cfgWriteFailed
-    ? `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">Tes réglages ne s'enregistrent plus</div>`
-      + `<div class="updcard-ver">Ils sont conservés dans une copie de secours et restent actifs, mais le fichier principal refuse l'écriture.</div></div></div>`
-      + `<div class="updcard-why">Fichier : ${esc(st.cfgPath || '')} — regarde du côté de l'antivirus, d'une synchronisation de dossier, ou d'un disque plein.</div>`
+    ? `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">${t('cfg.failTitle')}</div>`
+      + `<div class="updcard-ver">${t('cfg.failBody')}</div></div></div>`
+      + `<div class="updcard-why">${t('cfg.failWhy', { path: esc(st.cfgPath || '') })}</div>`
     : '';
   if (warnHtml !== lastWarnHtml) {
     lastWarnHtml = warnHtml;
@@ -145,17 +162,17 @@ const render = (st) => {
     // « actif » seulement si le drapeau que LISENT les bots a bien pu être écrit : sinon le bandeau
     // annonçait une fonctionnalité dont la moitié ne s'appliquait pas (les bots ne différaient rien).
     const lownet = st.lowNetActive
-      ? (st.lowNetFlagOk === false
-        ? ' · ⚠️ éco réseau : priorités appliquées, mais le signal envoyé aux bots n’est pas passé'
-        : ' · 🌐 faible usage internet actif')
+      ? (st.lowNetFlagOk === false ? t('lownet.broken') : t('lownet.active'))
       : '';
     bannerHtml = (!st.online && st.cfg.gameMode.soloSkip !== false)
-      ? `🎮 <b>${esc(st.game)}</b> détecté — partie <b>solo</b> : les bots restent en ligne${lownet}`
-      : `🎮 <b>Jeu en ligne :</b>&nbsp;${esc(st.game)}${st.stoppedByGame.length ? ` — <b>${st.stoppedByGame.length} bot(s) coupé(s)</b> (relance auto à la fin de la partie)` : st.cfg.gameMode.enabled ? ' — aucun bot à couper' : ' — mode jeu désactivé'}${lownet}`;
+      ? t('gm.bannerSolo', { game: esc(st.game) }) + lownet
+      : t('gm.banner', { game: esc(st.game) })
+        + (st.stoppedByGame.length ? t('gm.bannerCut', { n: st.stoppedByGame.length })
+          : st.cfg.gameMode.enabled ? t('gm.bannerNone') : t('gm.bannerOff')) + lownet;
   } else {
     const on = st.bots.filter((b) => b.status === 'online').length;
     bannerCls = 'banner';
-    bannerHtml = `🟢 <b>${on}/${st.bots.length}</b>&nbsp;bots en ligne — aucun jeu détecté`;
+    bannerHtml = t('gm.online', { on, total: st.bots.length });
   }
   if (bannerHtml !== lastBannerHtml) { lastBannerHtml = bannerHtml; banner.className = bannerCls; banner.innerHTML = bannerHtml; }
 
@@ -169,17 +186,17 @@ const render = (st) => {
     return `<div class="bot">
       <span class="dot ${dot}" title="${esc(b.status)}"></span>
       <span class="name">${esc(b.name)}</span>
-      <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="Réseau du bot, mesuré via ses entrées/sorties (pour un bot Discord, quasi exclusivement du réseau + un peu de disque SQLite) — ↓ reçu · ↑ envoyé">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? '⏸ coupé par le mode jeu' : esc(b.status)} · ↻ ${b.restarts}</span>
-      <label class="chk" title="(Re)mis en ligne à l'ouverture de session Windows"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> Auto boot</label>
-      <label class="chk" title="Arrêté quand un jeu est détecté (mode « bots cochés »)"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> Coupé en jeu</label>
+      <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status)} · ↻ ${b.restarts}</span>
+      <label class="chk" title="${t('bots.autobootTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> ${t('bots.autoboot')}</label>
+      <label class="chk" title="${t('bots.gamestopTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> ${t('bots.gamestop')}</label>
       ${pendingBots.has(b.name)
         ? '<button class="btn" disabled>⏳…</button>'
         : b.status === 'online'
         ? `<button class="btn" data-act="restart" data-bot="${esc(b.name)}">⟳</button><button class="btn danger" data-act="stop" data-bot="${esc(b.name)}">⏹</button>`
         : `<button class="btn primary" data-act="start" data-bot="${esc(b.name)}">▶</button>`}
-      <button class="btn" data-logs="${esc(b.name)}" title="Voir les logs récents (crash, erreurs…)">📄</button>
-      <button class="btn" data-folder="${esc(b.name)}" title="Ouvrir le dossier du bot dans l'Explorateur">📂</button>
-      ${isImp ? `<button class="btn danger" data-remove="${esc(b.name)}" title="Arrêter et retirer ce bot de pm2 (ses fichiers ne sont pas touchés)">🗑</button>` : ''}
+      <button class="btn" data-logs="${esc(b.name)}" title="${t('bots.logsTitle')}">📄</button>
+      <button class="btn" data-folder="${esc(b.name)}" title="${t('bots.folderTitle')}">📂</button>
+      ${isImp ? `<button class="btn danger" data-remove="${esc(b.name)}" title="${t('bots.removeTitle')}">🗑</button>` : ''}
     </div>`;
   };
   const main = st.bots.filter((b) => !imported.includes(b.name));
@@ -199,9 +216,9 @@ const render = (st) => {
   } else if (!st.ready) {
     // Au démarrage, la fenêtre s'ouvre avant la fin de la première mesure. Afficher « aucun bot »
     // à ce moment-là est un mensonge inquiétant : on dit ce qui se passe réellement.
-    empty = '<div class="hint">⏳ Recherche des bots en cours…</div>';
+    empty = `<div class="hint">${t('bots.searching')}</div>`;
   } else {
-    empty = '<div class="hint">Aucun bot géré par pm2 pour l\'instant. Importe un bot avec « ➕ Importer » ci-dessus.</div>';
+    empty = `<div class="hint">${t('bots.none')}</div>`;
   }
   // pm2 muet : ne PAS afficher « aucun bot » (l'écran mentirait alors que tes bots sont peut-être tous morts).
   const health = st.pm2Health || { ok: true };
@@ -227,7 +244,7 @@ const render = (st) => {
   // perdu définitivement.
   const botsHtml = (!health.ok ? empty : '') + fixBanner + (
     main.map(botRow).join('') +
-    (imps.length ? `<div class="sechead">🧩 Bots importés</div>${imps.map(botRow).join('')}` : '')
+    (imps.length ? `<div class="sechead">${t('bots.imported')}</div>${imps.map(botRow).join('')}` : '')
   ) || (fixBanner + empty);
   if (botsHtml !== lastBotsHtml && !sourisEnfoncee) { lastBotsHtml = botsHtml; $('bots').innerHTML = botsHtml; }
 
@@ -251,8 +268,11 @@ const render = (st) => {
   $('set-autolaunch').checked = !!st.cfg.autoLaunch;
   if (document.activeElement !== $('set-poll')) $('set-poll').value = st.cfg.pollSec;
   $('set-scanauto').checked = st.cfg.scanAuto !== false;
-  $('set-scaninfo').textContent = st.cfg.lastScanAt ? `(dernier scan : ${new Date(st.cfg.lastScanAt).toLocaleString('fr-FR')})` : '(aucun scan pour l\'instant)';
-  $('dev-note').textContent = st.cfg.packaged ? '' : '(actif seulement dans la version .exe)';
+  const loc = langCourante === 'en' ? 'en-GB' : 'fr-FR';
+  $('set-scaninfo').textContent = st.cfg.lastScanAt
+    ? t('set.lastScan', { d: new Date(st.cfg.lastScanAt).toLocaleString(loc) })
+    : t('set.noScan');
+  $('dev-note').textContent = st.cfg.packaged ? '' : t('set.devOnly');
   $('set-rpc').checked = st.cfg.discordRpc !== false;
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
   $('set-autoupdate').checked = st.autoApplyUpdates !== false;
@@ -265,9 +285,9 @@ const render = (st) => {
   // Dernière sauvegarde pm2 = ce qui reviendra vraiment au prochain démarrage du PC.
   const sv = $('save-info');
   if (sv) sv.textContent = st.lastSaveAt
-    ? `Dernière sauvegarde pm2 : ${new Date(st.lastSaveAt).toLocaleString('fr-FR')}`
-    : 'Aucune sauvegarde pm2 depuis ce panel.';
-  $('rpc-status').textContent = st.cfg.discordRpc === false ? ' — désactivée.' : (st.cfg.discordAppId ? ' — ✅ activée.' : ' — ⚠️ colle ton Application ID pour l\'activer.');
+    ? t('set.saved', { d: new Date(st.lastSaveAt).toLocaleString(langCourante === 'en' ? 'en-GB' : 'fr-FR') })
+    : t('set.savedNever');
+  $('rpc-status').textContent = st.cfg.discordRpc === false ? t('rpc.off') : (st.cfg.discordAppId ? t('rpc.on') : t('rpc.needId'));
 
   $('set-autoheal').checked = st.autoHeal !== false;
 
@@ -281,7 +301,7 @@ const render = (st) => {
         + `<span style="opacity:.7">${esc(h)}</span> ${ICONES[i.kind] || '•'} <b>${esc(i.name)}</b>`
         + (i.cause ? ` — ${esc(i.cause)}` : '') + `</div>`;
     }).join('')
-    : 'Aucun incident enregistré. C\'est bon signe.';
+    : t('inc.none');
   if (incHtml !== lastIncHtml) { lastIncHtml = incHtml; $('incidents').innerHTML = incHtml; }
 
   // Mises à jour
@@ -293,10 +313,10 @@ const render = (st) => {
     // qu'il faut absolument cliquer). « fenêtre ouverte » est normal : elle s'installera dès que tu fermes.
     const bl = st.updateBlockers || [];
     $('upd-status').innerHTML = st.autoApplyUpdates === false
-      ? '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer » (installation automatique désactivée).'
+      ? t('upd.readyManual')
       : bl.length
-        ? `✅ <b>Mise à jour prête</b> — elle s'installera toute seule dès que possible.<br><span style="opacity:.75">En attente : ${esc(bl.join(', '))}.</span> Tu peux aussi l'appliquer maintenant.`
-        : '✅ <b>Mise à jour prête</b> — installation automatique imminente…';
+        ? t('upd.readyWaiting', { list: esc(bl.filter((b) => b !== 'blk.window').map((b) => t(b)).join(', ')) })
+        : t('upd.readySoon');
   }
   // …et on n'écrase PAS un état vivant de l'updater. `available`/`downloading` n'arrivent qu'une fois
   // par événement : ce sondage de 3 s effaçait le message juste après, laissant une zone vide pendant
@@ -339,6 +359,12 @@ const closeModal = () => { $('modal').classList.add('hidden'); $('modal-box').in
 
 const aboutHTML = () => {
   const v = cur?.cfg?.version || '';
+  // Le corps anglais vit dans about-en.js (8 Ko de prose : il noierait le dictionnaire des libellés).
+  // Le français reste écrit ici, c'est la langue d'origine, celle qu'on relit et modifie en premier.
+  if (langCourante === 'en' && window.ABOUT_EN) {
+    return window.ABOUT_EN.split('{v}').join(esc(v))
+      + `<div class="modal-actions"><button class="btn primary" id="modal-close">${t('logs.close')}</button></div>`;
+  }
   return `
   <h2>🛡️ Hasu Panel ${esc(v)} — c'est quoi ?</h2>
   <p>Un panneau de contrôle pour <b>tous tes bots</b> : ils tournent en arrière-plan grâce à <b>pm2</b>, et tu les gères ici sans toucher à la console.</p>
@@ -403,9 +429,8 @@ const renderLogsBody = (text) => {
   const lines = String(text || '').split('\n');
   const shown = f ? lines.filter((l) => l.toLowerCase().includes(f)) : lines;
   pre.textContent = shown.join('\n').trim()
-    || (f ? `Aucune ligne ne contient « ${logsFilter} ».`
-      : logsUnreadable ? 'Le fichier de log existe, mais il n\'a pas pu être lu (verrouillé, ou accès refusé).'
-        : 'Aucun log pour l\'instant.');
+    || (f ? t('logs.noMatch', { q: logsFilter })
+      : logsUnreadable ? t('logs.unreadable') : t('logs.empty'));
   pre.scrollTop = pre.scrollHeight; // le plus récent est en bas
 };
 let logsRaw = '';
@@ -430,7 +455,7 @@ const openLogs = async (name, which) => {
     logsUnreadable = !!(r && r.unreadable);
     if (r && !r.ok) { $('logs-pre').textContent = r.error || 'Impossible de lire les logs.'; return; }
     renderLogsBody(logsRaw);
-  } catch { if ($('logs-pre')) $('logs-pre').textContent = 'Échec de lecture des logs.'; }
+  } catch { if ($('logs-pre')) $('logs-pre').textContent = t('logs.failed'); }
 };
 
 // Échap ferme la modale (removeMenu() a supprimé les raccourcis Electron par défaut → aucun n'existait).
@@ -501,6 +526,12 @@ document.addEventListener('click', async (e) => {
 });
 
 $('about-btn').addEventListener('click', () => openModal(aboutHTML()));
+$('lang-btn').addEventListener('click', async () => {
+  const suivante = langCourante === 'fr' ? 'en' : 'fr';
+  appliquerLangue(suivante);            // effet immédiat, sans attendre l'aller-retour disque
+  await window.panel.setSetting('lang', suivante);
+  await refresh();
+});
 const startImport = async (picker) => {
   const pick = await picker();
   if (!pick.ok) { if (pick.error) alert(pick.error); return; } // annulé = silencieux ; dossier sans fichier principal = message
@@ -523,23 +554,23 @@ $('stop-all-btn').addEventListener('click', async () => {
   const btn = $('stop-all-btn');
   if (!stopAllArmed) {
     stopAllArmed = true;
-    btn.classList.add('armed'); btn.textContent = '⏹ Confirmer ?';
-    stopAllTimer = setTimeout(() => { stopAllArmed = false; btn.classList.remove('armed'); btn.textContent = '⏹ Tout arrêter'; }, 4000);
+    btn.classList.add('armed'); btn.textContent = t('bots.stopAllArm');
+    stopAllTimer = setTimeout(() => { stopAllArmed = false; btn.classList.remove('armed'); btn.textContent = t('bots.stopAll'); }, 4000);
     return;
   }
   clearTimeout(stopAllTimer); stopAllArmed = false;
-  btn.classList.remove('armed'); btn.disabled = true; btn.textContent = '⏳ Arrêt…';
+  btn.classList.remove('armed'); btn.disabled = true; btn.textContent = t('bots.stopAllBusy');
   let r; try { r = await window.panel.stopAll(); } catch { r = null; }
-  btn.textContent = (r && r.ok) ? `✅ ${r.stopped} arrêté(s)` : '⚠️ Échec';
+  btn.textContent = (r && r.ok) ? t('bots.stopAllDone', { n: r.stopped }) : t('bots.stopAllFail');
   await refresh();
-  setTimeout(() => { btn.disabled = false; btn.textContent = '⏹ Tout arrêter'; }, 1600);
+  setTimeout(() => { btn.disabled = false; btn.textContent = t('bots.stopAll'); }, 1600);
 });
 
 // Mises à jour : vérification manuelle + application.
 $('upd-check').addEventListener('click', async () => {
   updBusy = true; updMsg = '';
   $('upd-check').disabled = true;
-  $('upd-status').textContent = '⏳ Recherche de mise à jour…';
+  $('upd-status').textContent = t('upd.searching');
   // Le `finally` plus bas garantit la réactivation du bouton : sans lui, une exception ou un retour
   // inattendu du main laissait « Vérifier les mises à jour » grisé jusqu'au redémarrage du panel.
   let r; try { r = await window.panel.checkUpdate(); } catch (e) { r = { state: 'error', message: e && e.message }; }
@@ -549,12 +580,12 @@ $('upd-check').addEventListener('click', async () => {
   // d'interpolation brute dans innerHTML. Le reste du gabarit contient du <b> volontaire, donc on
   // échappe les valeurs une par une plutôt que la chaîne entière.
   const msg = {
-    dev: 'ℹ️ L\'auto-update ne fonctionne que dans la version installée (Setup.exe), pas en développement.',
-    uptodate: `✅ Tu as déjà la dernière version (${esc(r.current || '')}).`,
-    available: `⬇️ Nouvelle version <b>${esc(r.version || '')}</b> trouvée — téléchargement en cours, elle sera prête dans un instant.`,
-    downloaded: '✅ <b>Mise à jour prête</b> — clique « Redémarrer & appliquer ».',
-    error: `⚠️ Impossible de vérifier maintenant${r.message ? ' (' + esc(r.message) + ')' : ''}. Réessaie plus tard.`,
-  }[r.state] || '⚠️ Réponse inattendue.';
+    dev: t('upd.dev'),
+    uptodate: t('upd.uptodate', { v: esc(r.current || '') }),
+    available: t('upd.availableMsg', { v: esc(r.version || '') }),
+    downloaded: t('upd.readyMsg'),
+    error: t('upd.errorMsg', { d: r.message ? ' (' + esc(r.message) + ')' : '' }),
+  }[r.state] || t('upd.unexpected');
   updMsg = msg;
   try { $('upd-status').innerHTML = msg; }
   finally { $('upd-check').disabled = false; updBusy = false; } // le bouton se réactive quoi qu'il arrive

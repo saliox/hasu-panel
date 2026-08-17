@@ -38,22 +38,22 @@ let updateReadyAt = 0, updateReadyVersion = '', updateApplying = false;
 const UPDATE_GRACE_MS = 5 * 60 * 1000; // laisse passer 5 min après le téléchargement (anti-boucle)
 const updateBlockers = () => {
   const b = [];
-  if (statusCache.game) b.push('jeu en cours');                       // ne jamais couper pendant une partie
-  if (gameUnknown && Date.now() - gameUnknownSince < GAME_UNKNOWN_MAX_MS) b.push('partie en cours inconnue'); // dans le doute on ne redémarre pas sous le nez du joueur — mais pas indéfiniment
-  if (busy) b.push('transition mode jeu');                            // une bascule de bots est en cours
-  if (actionsInFlight.size) b.push('action bot en cours');
-  if (stopAllInFlight) b.push('arrêt global en cours');
-  if (cfg.stoppedByGame.some((n) => n !== '-')) b.push('bots coupés par le mode jeu'); // '-' = aucune cible // on ne redémarre pas là-dessus
-  if (cfg.lowNetApplied) b.push('éco réseau active');
-  if (isWindowVisible()) b.push('fenêtre ouverte'); // tu es en train de t'en servir
-  if (Date.now() - updateReadyAt < UPDATE_GRACE_MS) b.push('délai de grâce');
+  if (statusCache.game) b.push('blk.game');                       // ne jamais couper pendant une partie
+  if (gameUnknown && Date.now() - gameUnknownSince < GAME_UNKNOWN_MAX_MS) b.push('blk.unknown'); // dans le doute on ne redémarre pas sous le nez du joueur — mais pas indéfiniment
+  if (busy) b.push('blk.busy');                            // une bascule de bots est en cours
+  if (actionsInFlight.size) b.push('blk.action');
+  if (stopAllInFlight) b.push('blk.stopAll');
+  if (cfg.stoppedByGame.some((n) => n !== '-')) b.push('blk.parked'); // '-' = aucune cible // on ne redémarre pas là-dessus
+  if (cfg.lowNetApplied) b.push('blk.lownet');
+  if (isWindowVisible()) b.push('blk.window'); // tu es en train de t'en servir
+  if (Date.now() - updateReadyAt < UPDATE_GRACE_MS) b.push('blk.grace');
   return b;
 };
 const maybeAutoApplyUpdate = () => {
   if (!updateReady || updateApplying || !updaterRef || !app.isPackaged) return;
   if (cfg.autoApplyUpdates === false) return;
   const blockers = updateBlockers();
-  if (blockers.length) { if (Date.now() % 600000 < 20000) log('MAJ en attente —', blockers.join(', ')); return; }
+  if (blockers.length) { if (Date.now() % 600000 < 20000) log('MAJ en attente —', blockers.map((k) => t(k)).join(', ')); return; }
   updateApplying = true;
   cfg.updatedFrom = app.getVersion(); saveCfg();       // pour annoncer « mis à jour vers X » au retour
   log('MAJ appliquée automatiquement :', app.getVersion(), '→', updateReadyVersion, '(redémarrage silencieux)');
@@ -108,6 +108,9 @@ const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 // NAME_RE / RESERVED_NAMES / isPublicIp étaient importés sans jamais servir ici : ils sont utilisés
 // À L'INTÉRIEUR de validators.js (par isSafeName) et de logic.js (par hasEstablishedPublic).
 const { EXE_RE, isSafeName, isSafeNewName, BAD_SHELL_RE } = require('./validators');
+// Traductions PARTAGÉES avec la fenêtre (ui/i18n.js est chargé des deux côtés) : le menu de la zone
+// de notification doit parler la même langue que l'écran, sans dupliquer un second dictionnaire.
+const { t, setLang } = require('./ui/i18n');
 // Logique PURE (décisions, parsing, calculs) : extraite pour la même raison — c'est ce module qui est
 // couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
 const {
@@ -189,6 +192,7 @@ const DEFAULTS = {
   lastSaveAt: 0,            // dernier « pm2 save » réussi (ce qui reviendra au prochain démarrage)
   autoApplyUpdates: true,   // installer la MAJ tout seul dès que c'est sans risque (jamais en pleine partie)
   autoHeal: true,           // retenter de relancer un bot tombé (5 min, 15 min, 1 h, puis on laisse l'alerte parler)
+  lang: 'fr',               // langue de l'interface ('fr' | 'en') — bouton dans l'en-tête de la fenêtre
   incidents: [],            // 40 derniers événements {at, name, kind, cause} → onglet « incidents »
   // État de surveillance PERSISTÉ : il ne vivait qu'en mémoire, donc un redémarrage du panel — que la
   // mise à jour automatique provoque elle-même — perdait les alertes en attente de réessai et les
@@ -319,6 +323,7 @@ const loadCfg = () => {
       alertSound: raw.alertSound !== false, alertVolume: clampInt(raw.alertVolume, 1, 100, 10),
       autoApplyUpdates: raw.autoApplyUpdates !== false,
       autoHeal: raw.autoHeal !== false,
+      lang: raw.lang === 'en' ? 'en' : 'fr', // toute autre valeur retombe sur le français
       // Historique et état de surveillance : nettoyage dans logic.js, donc TESTÉ (pollution de
       // prototype, horodatages corrompus, structures inattendues). Ces données alimentent des
       // relances `pm2 start` : rien de douteux ne doit franchir cette ligne.
@@ -1619,24 +1624,25 @@ const updateTray = () => {
     if (bad !== trayBad) { trayBad = bad; tray.setImage(trayIcon(bad)); }
   } catch {}
   const tip = statusCache.game
-    ? `Hasu Panel — 🎮 ${statusCache.game}${statusCache.online ? ' (en ligne)' : ' (solo)'}${stopped.length ? ` · ${stopped.length} bot(s) coupé(s)` : ''}${cfg.lowNetApplied ? ' · 🌐 éco réseau' : ''}`
-    : `Hasu Panel — ${statusCache.bots.filter((b) => b.status === 'online').length}/${statusCache.bots.length} bots en ligne`;
+    ? `Hasu Panel — 🎮 ${statusCache.game}${statusCache.online ? t('tray.online') : t('tray.solo')}`
+      + `${stopped.length ? t('tray.cut', { n: stopped.length }) : ''}${cfg.lowNetApplied ? t('tray.low') : ''}`
+    : t('tray.tipBots', { on: statusCache.bots.filter((b) => b.status === 'online').length, total: statusCache.bots.length });
   if (tip !== lastTip) { lastTip = tip; tray.setToolTip(tip); } // même garde que le menu : pas d'appel natif inutile
   // Le menu du tray ne change QUE si son contenu change (mode jeu, MAJ prête). Avant, on reconstruisait
   // un Menu natif à CHAQUE tick (toutes les 10-30 s, 24h/24) pour un résultat identique — travail inutile
   // côté Windows, et ça pouvait refermer le menu sous le curseur pile au moment où tu cliquais.
-  const menuSig = `${cfg.gameMode.enabled}|${updateReady}`;
+  const menuSig = `${cfg.gameMode.enabled}|${updateReady}|${cfg.lang}`; // la langue en fait partie : sinon le menu resterait en français
   if (menuSig === lastMenuSig) return;
   lastMenuSig = menuSig;
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Ouvrir le panel', click: () => showWindow() },
+    { label: t('tray.open'), click: () => showWindow() },
     {
-      label: `Mode jeu : ${cfg.gameMode.enabled ? 'activé ✔' : 'désactivé'}`,
+      label: t('tray.game', { v: cfg.gameMode.enabled ? t('tray.on') : t('tray.off') }),
       click: async () => { cfg.gameMode.enabled = !cfg.gameMode.enabled; saveCfg(); if (!cfg.gameMode.enabled && cfg.stoppedByGame.length) await withGameLock(exitGameMode); updateTray(); }
     },
-    ...(updateReady ? [{ label: '🔄 Mise à jour prête — appliquer & redémarrer', click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
+    ...(updateReady ? [{ label: t('tray.update'), click: () => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch {} } }] : []),
     { type: 'separator' },
-    { label: 'Quitter', click: () => { quitting = true; app.quit(); } } // le nettoyage passe par before-quit (restaure les bots + drapeaux)
+    { label: t('tray.quit'), click: () => { quitting = true; app.quit(); } } // le nettoyage passe par before-quit (restaure les bots + drapeaux)
   ]));
 };
 
@@ -1741,6 +1747,7 @@ ipcMain.handle('panel:status', () => ({
   alertsSuppressed: (alertsSuppressed = alertsSuppressed.filter((t) => Date.now() - t < 3600 * 1000)).length,
   ready: firstTickDone,           // false = première mesure en cours (≠ « aucun bot »)
   autoHeal: cfg.autoHeal !== false,
+  lang: cfg.lang === 'en' ? 'en' : 'fr',
   incidents: (cfg.incidents || []).slice(-20).reverse(), // le plus récent en premier
   cfgWriteFailed,                 // les réglages ne s'écrivent plus sur le disque → bandeau (jamais silencieux)
   cfgPath: cfgWriteFailed ? cfgPath() : '', // le chemin n'est utile que pour dire OÙ regarder
@@ -1998,6 +2005,8 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'discordAppId') { cfg.discordAppId = String(value || '').trim().slice(0, 40); saveCfg(); startRpc(); return { ok: true }; }
   if (key === 'autoApplyUpdates') { cfg.autoApplyUpdates = !!value; saveCfg(); return { ok: true }; }
   if (key === 'autoHeal') { cfg.autoHeal = !!value; saveCfg(); return { ok: true }; }
+  // La langue vaut aussi pour le menu de la zone de notification : on le reconstruit tout de suite.
+  if (key === 'lang') { cfg.lang = value === 'en' ? 'en' : 'fr'; setLang(cfg.lang); saveCfg(); updateTray(true); return { ok: true }; }
   if (key === 'alerts') { cfg.alerts = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertToast') { cfg.alertToast = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertSound') { cfg.alertSound = !!value; saveCfg(); if (cfg.alertSound) playSoftSound(); return { ok: true }; } // aperçu immédiat
@@ -2132,6 +2141,7 @@ else {
   app.whenReady().then(async () => {
     cfg = loadCfg();
     hydrateRuntime(); // reprend les alertes suivies et les relances en cours d'avant le redémarrage
+    setLang(cfg.lang); // le menu du tray et les alertes suivent la langue choisie dans la fenêtre
     resolvePm2Runner(); // node.exe + pm2/bin/pm2 → appels pm2 sans cmd.exe (zéro process fantôme)
     // Sans AppUserModelId, Windows 10/11 n'affiche AUCUNE notification d'une app Electron.
     // DOIT être identique au `build.appId` du package.json ('hasu.panel') : c'est cet identifiant que
