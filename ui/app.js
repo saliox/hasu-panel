@@ -190,7 +190,7 @@ const render = (st) => {
     return `<div class="bot">
       <span class="dot ${dot}" title="${esc(b.status)}"></span>
       <span class="name">${esc(b.name)}</span>
-      <span class="meta">${b.status === 'online' ? `⏱ ${fmtUptime(b.uptime)} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status)} · ↻ ${b.restarts}</span>
+      <span class="meta">${b.status === 'online' ? `${t('bots.uptime', { v: fmtUptime(b.uptime) })} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status)} · ↻ ${b.restarts}</span>
       <label class="chk" title="${t('bots.autobootTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> ${t('bots.autoboot')}</label>
       <label class="chk" title="${t('bots.gamestopTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> ${t('bots.gamestop')}</label>
       ${pendingBots.has(b.name)
@@ -213,9 +213,8 @@ const render = (st) => {
       + 'Installe-le d\'abord, puis reviens installer pm2.<div class="row" style="margin-top:8px">'
       + '<button class="btn primary" id="tc-node">Télécharger Node.js</button></div></div>';
   } else if (!tc.pm2) {
-    empty = '<div class="tc-warn"><b>⚠️ pm2 n\'est pas installé.</b><br>pm2 est l\'outil qui garde tes bots en ligne. '
-      + 'Clique pour l\'installer automatiquement (sans droits administrateur).'
-      + '<div class="row" style="margin-top:8px"><button class="btn primary" id="tc-pm2">Installer pm2</button>'
+    empty = `<div class="tc-warn">${t('tc.pm2Missing')}`
+      + `<div class="row" style="margin-top:8px"><button class="btn primary" id="tc-pm2">${t('tc.pm2Install')}</button>`
       + '<span id="tc-pm2-status" style="color:var(--mut);font-size:12px"></span></div></div>';
   } else if (!st.ready) {
     // Au démarrage, la fenêtre s'ouvre avant la fin de la première mesure. Afficher « aucun bot »
@@ -228,14 +227,14 @@ const render = (st) => {
   const health = st.pm2Health || { ok: true };
   if (!health.ok) {
     const mins = health.since ? Math.max(1, Math.round((Date.now() - health.since) / 60000)) : 1;
-    empty = `<div class="tc-warn"><b>⚠️ pm2 ne répond plus depuis ~${mins} min.</b><br>`
-      + `L'état ci-dessous est le <b>dernier connu</b>, il n'est plus rafraîchi.${health.reason ? ` <span style="opacity:.7">(${esc(health.reason)})</span>` : ''}</div>`;
+    empty = `<div class="tc-warn">${t('tc.pm2Down', { min: mins })}`
+      + `${health.reason ? ` <span style="opacity:.7">(${esc(health.reason)})</span>` : ''}</div>`;
   }
   // Bandeau « X bots devraient être en ligne » (Auto boot coché, pas arrêtés par toi ni par le mode jeu).
   const nf = st.needFix || [];
   const fixBanner = nf.length
-    ? `<div class="tc-warn" style="border-color:#e2b341"><b>⚠️ ${nf.length} bot(s) devraient être en ligne :</b> ${esc(nf.join(', '))}`
-      + '<div class="row" style="margin-top:8px"><button class="btn primary" id="fix-all">Remettre en ordre</button>'
+    ? `<div class="tc-warn" style="border-color:#e2b341">${t('bots.fixBanner', { n: nf.length })} : ${esc(nf.join(', '))}`
+      + `<div class="row" style="margin-top:8px"><button class="btn primary" id="fix-all">${t('bots.fix')}</button>`
       + '<span id="fix-status" style="color:var(--mut);font-size:12px"></span></div></div>'
     : '';
   // La liste n'est RECONSTRUITE que si son contenu a changé. Attention : la comparaison porte sur du
@@ -281,6 +280,10 @@ const render = (st) => {
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
   $('set-autoupdate').checked = st.autoApplyUpdates !== false;
   $('set-alerts').checked = st.cfg.alerts !== false;
+  // Alertes différées par le plafond horaire : sans ça, l'écran affichait « alertes activées » alors
+  // que certaines n'étaient pas parties.
+  const supp = $('alert-status');
+  if (supp && !supp.textContent.trim()) supp.textContent = st.alertsSuppressed ? t('alerts.suppressed', { n: st.alertsSuppressed }) : '';
   $('set-alert-toast').checked = st.cfg.alertToast !== false;
   $('set-alert-sound').checked = st.cfg.alertSound !== false;
   if (document.activeElement !== $('set-alert-volume')) $('set-alert-volume').value = st.cfg.alertVolume || 10;
@@ -442,15 +445,15 @@ let logsRaw = '';
 const openLogs = async (name, which) => {
   which = which === 'err' ? 'err' : 'out';
   const tab = (id, label) => `<button class="btn${which === id ? ' primary' : ''}" data-logtab="${esc(name)}" data-which="${id}">${label}</button>`;
-  openModal(`<h3 style="margin:0 0 8px">📄 Logs — ${esc(name)}</h3>
+  openModal(`<h3 style="margin:0 0 8px">📄 ${t('logs.title', { name: esc(name) })}</h3>
     <div class="row" style="gap:6px;margin-bottom:8px;flex-wrap:wrap">
-      ${tab('out', 'Sortie')}${tab('err', '⚠️ Erreurs')}
-      <input type="text" id="logs-filter" placeholder="Filtrer…" style="flex:1;min-width:120px">
-      <button class="btn" id="logs-copy">📋 Copier</button>
-      <button class="btn" id="logs-folder" data-bot="${esc(name)}" title="Ouvrir le dossier des logs">📂</button>
+      ${tab('out', t('logs.out'))}${tab('err', '⚠️ ' + t('logs.err'))}
+      <input type="text" id="logs-filter" placeholder="${t('logs.filterPh')}" style="flex:1;min-width:120px">
+      <button class="btn" id="logs-copy">📋 ${t('logs.copy')}</button>
+      <button class="btn" id="logs-folder" data-bot="${esc(name)}" title="${t('logs.openFolder')}">📂</button>
     </div>
-    <pre id="logs-pre" style="max-height:56vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.5 Consolas,monospace;background:#0b0e16;color:#cdd6f4;padding:10px;border-radius:8px;margin:0">Chargement…</pre>
-    <div class="modal-actions"><button class="btn primary" id="modal-close">Fermer</button></div>`);
+    <pre id="logs-pre" style="max-height:56vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.5 Consolas,monospace;background:#0b0e16;color:#cdd6f4;padding:10px;border-radius:8px;margin:0">${t('banner.loading')}</pre>
+    <div class="modal-actions"><button class="btn primary" id="modal-close">${t('logs.close')}</button></div>`);
   const inp = $('logs-filter');
   if (inp) { inp.value = logsFilter; inp.addEventListener('input', () => { logsFilter = inp.value; renderLogsBody(logsRaw); }); }
   try {
@@ -474,10 +477,10 @@ document.addEventListener('click', async (e) => {
   if (t.id === 'tc-node') { window.open?.('https://nodejs.org/fr/download'); return; }
   if (t.id === 'tc-pm2') {
     t.disabled = true;
-    const zone = document.getElementById('tc-pm2-status'); if (zone) zone.textContent = ' ⏳ installation de pm2… (jusqu\'à 1 min)';
+    const zone = document.getElementById('tc-pm2-status'); if (zone) zone.textContent = t('tc.pm2Busy');
     let r; try { r = await window.panel.installPm2(); } catch { r = { ok: false }; }
-    if (r.ok) { if (zone) zone.textContent = ' ✅ pm2 installé !'; setTimeout(refresh, 800); }
-    else { t.disabled = false; if (zone) zone.textContent = r.reason === 'no-node' ? ' ❌ Node.js requis d\'abord.' : ' ❌ Échec — réessaie ou installe pm2 à la main.'; }
+    if (r.ok) { if (zone) zone.textContent = t('tc.pm2Ok'); setTimeout(refresh, 800); }
+    else { t.disabled = false; if (zone) zone.textContent = r.reason === 'no-node' ? window.i18n.t('tc.pm2NoNode') : window.i18n.t('tc.pm2Fail'); }
     return;
   }
   const addExe = t.closest?.('[data-addexe]');
@@ -495,9 +498,16 @@ document.addEventListener('click', async (e) => {
   if (t.dataset?.folder) { await window.panel.openFolder(t.dataset.folder); return; }
   if (t.id === 'fix-all') {
     t.disabled = true;
-    const s = $('fix-status'); if (s) s.textContent = ' ⏳ relance en cours…';
+    const s = $('fix-status'); if (s) s.textContent = window.i18n.t('bots.stopAllBusy');
     let r; try { r = await window.panel.fixAll(); } catch { r = null; }
-    if (s) s.textContent = r && r.ok ? ` ✅ ${r.started} relancé(s)` : ' ⚠️ échec';
+    // Le nombre annoncé est celui des bots RÉELLEMENT repartis, pas des bots tentés : quand une
+    // partie échoue, on le dit plutôt que d'annoncer un succès complet.
+    if (s) {
+      const rates = (r && r.failed) ? r.failed.length : 0;
+      s.textContent = !r || !r.ok ? window.i18n.t('bots.stopAllFail')
+        : rates ? window.i18n.t('bots.fixPartial', { n: r.started, k: rates })
+          : window.i18n.t('bots.fixDone', { n: r.started });
+    }
     setTimeout(refresh, 1200);
     return;
   }
@@ -505,7 +515,9 @@ document.addEventListener('click', async (e) => {
   if (t.dataset?.logtab) { openLogs(t.dataset.logtab, t.dataset.which); return; }
   if (t.id === 'logs-copy') {
     const pre = $('logs-pre');
-    if (pre) { try { await navigator.clipboard.writeText(pre.textContent || ''); t.textContent = '✅ Copié'; setTimeout(() => { t.textContent = '📋 Copier'; }, 1400); } catch {} }
+    // `t` désigne ici la CIBLE du clic (elle masque la fonction de traduction) : on passe par
+    // window.i18n.t directement plutôt que de renommer une variable utilisée dans tout le handler.
+    if (pre) { try { await navigator.clipboard.writeText(pre.textContent || ''); t.textContent = '✅'; setTimeout(() => { t.textContent = '📋 ' + window.i18n.t('logs.copy'); }, 1400); } catch {} }
     return;
   }
   if (t.id === 'logs-folder') { await window.panel.openFolder(t.dataset.bot, 'logs'); return; }

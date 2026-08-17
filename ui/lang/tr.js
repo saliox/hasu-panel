@@ -11,8 +11,7 @@
   const L = { nom: 'Türkçe', ui: {
     'app.sub': 'pm2 bot yöneticisi · oyun modu',
     'btn.about': 'ℹ️ Hakkında',
-    'btn.lang': '🇬🇧 English',
-    'btn.langTitle': 'Switch the panel to English',
+    'btn.langTitle': 'Arayüz dili',
     'banner.loading': 'Yükleniyor…',
     'bots.title': '🤖 Botlar (pm2)',
     'bots.import': '➕ İçe aktar (dosya)',
@@ -31,12 +30,9 @@
     'bots.imported': '🧩 İçe aktarılan botlar',
     'bots.autoboot': 'Otomatik başlat',
     'bots.gamestop': 'Oyunda durdur',
-    'bots.logs': '📄 Loglar',
-    'bots.folder': '📂',
-    'bots.remove': '🗑',
     'bots.uptime': '⏱ {v}',
     'bots.fix': 'Yeniden çevrimiçi yap',
-    'bots.fixBanner': '<b>{n}</b> bot çalışıyor olmalıydı',
+    'bots.fixBanner': '<b>{n}</b> bot çevrimiçi olmalı',
     'bots.fixDone': '✅ {n} bot yeniden başlatıldı',
     'bots.fixPartial': '⚠️ {n} yeniden başlatıldı, {k} hâlâ çevrimdışı',
     'gm.title': '🎮 Oyun modu',
@@ -84,7 +80,7 @@
     'alerts.hint': 'En işe yarayanı <b>Discord webhook</b>: maçın ortasında ya da bilgisayar başında değilken bile sana ulaşır. Discord\'da: <b>Kanal ayarları → Entegrasyonlar → Webhook\'lar → Yeni webhook → URL\'yi kopyala</b>. Uyarı <b>nedeni açık dille</b> yazar (internet kesik, geçersiz token, eksik modül…).',
     'alerts.suppressed': ' — ⚠️ bu saat içinde {n} uyarı ertelendi (spam önleme sınırı).',
     'rpc.title': '🎮 Discord Rich Presence',
-    'rpc.enable': 'Discord profilimde "🤖 X botu çevrimiçi yönetiyor" yaz',
+    'rpc.enable': 'Discord profilimde "🤖 Çevrimiçi X bot yönetiyor" yazsın',
     'rpc.idPh': 'Boş bırak — varsayılan olarak Hasu Panel uygulaması kullanılır',
     'rpc.hint': 'Ayarlanacak bir şey yok: açtığın anda çalışır (yeter ki bu bilgisayarda <b>Discord açık olsun</b>). Yukarıdaki alan yalnızca <b>kendi</b> Discord uygulamanı göstermek istersen gerekir — o zaman uygulamanın <b>Application ID</b> değerini yapıştır (discord.com/developers/applications → General Information).',
     'rpc.off': ' — kapalı.',
@@ -94,7 +90,7 @@
     'upd.version': 'Sürüm:',
     'upd.check': 'Güncellemeleri denetle',
     'upd.apply': 'Yeniden başlat & uygula',
-    'upd.auto': 'Güncellemeleri <b>kendi kendine</b> kur <span class="mut11">(asla oyun sırasında ya da botlarla uğraşırken değil)</span>',
+    'upd.auto': 'Güncellemeler <b>kendi kendine</b> kurulsun <span class="mut11">(asla oyun sırasında ya da botlarla uğraşırken değil)</span>',
     'upd.searching': '⏳ Güncelleme aranıyor…',
     'upd.dev': 'ℹ️ Otomatik güncelleme yalnızca kurulu sürümde (Setup.exe) çalışır, geliştirme ortamında değil.',
     'upd.uptodate': '✅ Zaten en son sürümdesin ({v}).',
@@ -116,12 +112,12 @@
     'upd.whyWaiting': 'Mümkün olur olmaz kendi kendine kurulacak — beklenen: {list}.',
     'upd.whyWindow': 'Bu pencereyi kapattığın anda kendi kendine kurulacak.',
     'heal.title': '🔧 Otomatik yeniden başlatma',
-    'heal.enable': '<b>Düşen</b> botu kendi kendine yeniden başlat <span class="mut11">(5 dk, sonra 15 dk, sonra 1 sa sonra)</span>',
-    'heal.hint': 'pm2 kendi yeniden başlatma haklarını tükettiğinde, sen fark edene kadar bot ölü kalır. Panel senin yerine dener, sonra <b>3 denemede durur</b>: üç kez geri gelmeyi reddeden botun gerçek bir sorunu vardır ve uyarı görünür kalmalıdır. <b>Senin</b> durdurduğun bir bota da, oyun modunun durdurduğu bir bota da asla dokunmaz.',
+    'heal.enable': '<b>Düşen</b> bot kendi kendine yeniden başlatılsın <span class="mut11">(5 dk, 15 dk ve 1 sa sonra)</span>',
+    'heal.hint': 'pm2 kendi yeniden başlatma haklarını tükettiğinde, sen fark edene kadar bot ölü kalır. Panel senin yerine dener, ama <b>3 denemeden sonra durur</b>: üç kez geri gelmeyi reddeden botun gerçek bir sorunu vardır ve uyarı görünür kalmalıdır. <b>Senin</b> durdurduğun bir bota da, oyun modunun durdurduğu bir bota da asla dokunmaz.',
     'inc.title': '📓 Son olaylar',
     'inc.none': 'Kayıtlı olay yok. Bu iyiye işaret.',
     'cfg.failTitle': 'Ayarların artık kaydedilmiyor',
-    'cfg.failBody': 'Bir yedek kopyada tutuluyorlar ve etkin kalıyorlar, ama ana dosya yazmayı reddediyor.',
+    'cfg.failBody': 'Bir yedek kopyada tutuluyorlar ve etkin kalıyorlar, ama ana dosya yazılmayı reddediyor.',
     'cfg.failWhy': 'Dosya: {path} — antivirüse, bir klasör eşitlemesine ya da dolu diske bak.',
     'logs.title': '{name} logları',
     'logs.out': 'Çıktı',
@@ -151,7 +147,7 @@
     'tray.online': ' (çevrimiçi)',
     'tray.solo': ' (tek kişilik)',
     'tray.cut': ' · {n} bot durduruldu',
-    'tray.low': ' · 🌐 düşük ağ',
+    'tray.low': ' · 🌐 ağ tasarrufu',
     'blk.game': 'bir oyun çalışıyor',
     'blk.unknown': 'oyun çalışıyor mu belirsiz',
     'blk.busy': 'oyun modu geçişi sürüyor',
@@ -206,9 +202,9 @@
   <p>Panel <b>kendi kendini günceller</b>: açılışta, sonra da her 6 saatte bir bakar ve her şey <b>pencerenin içinde</b> olup biter. Bir sürüm bulunur bulunmaz üstte bir kart belirir: yüzde, hız ve boyutla birlikte <b>ilerleme çubuğu</b>, ardından <b>sürüm notları</b> ve bir <b>"Kur ve yeniden başlat"</b> düğmesi. "Daha sonra" kartı gizler — kurulum yoluna devam eder.</p>
   <p>Aslında <b>hiçbir şeye tıklaman gerekmez</b>: güncelleme, riskli olmadığı anda kendi kendine kurulur. Bunu <b>asla</b> oyun sırasında, botlarla uğraşırken ya da sen pencereye bakarken yapmaz — kart zaten <b>neyi beklediğini</b> sana söyler. Pencereyi kapat, uygulanır. (⚙️ Ayarlar'dan kapatılabilir; "Güncellemeleri denetle" düğmesiyle de zorla denetim yaptırabilirsin.)</p>
   <h3>🔋 Kaynak dostu</h3>
-  <p>Panel gün boyu kendini belli etmeden çalışır: <b>bildirim alanına küçüldüğünde</b> <b>gözcülüğünü yavaşlatır</b> ve kimsenin bakmadığı görüntüyü hesaplamayı bırakır. Pencereyi yeniden açtığın anda her şey yine anında olur. (Oyun modu ya da düşük internet kullanımı etkinse hiçbir şeyi kaçırmamak için tepkisel kalır.)</p>
+  <p>Panel gün boyu kendini belli etmeden çalışır: <b>bildirim alanına küçültüldüğünde</b> <b>gözcülüğünü yavaşlatır</b> ve kimsenin bakmadığı görüntüyü hesaplamayı bırakır. Pencereyi yeniden açtığın anda her şey yine anında olur. (Oyun modu ya da düşük internet kullanımı etkinse hiçbir şeyi kaçırmamak için tepkisel kalır.)</p>
   <h3>🎮 Discord'daki görünürlüğün</h3>
-  <p>"Rich Presence" seçeneği Discord profilinde <b>"🤖 X botu çevrimiçi yönetiyor"</b> yazdırır (bir de oynadığın oyunu). <b>Ayarlanacak bir şey yok</b> — Discord'un açık olması yeter. Tamamen süs; ⚙️ Ayarlar'dan kapatılabilir.</p>
+  <p>"Rich Presence" seçeneği Discord profilinde <b>"🤖 Çevrimiçi X bot yönetiyor"</b> yazdırır (bir de oynadığın oyunu). <b>Ayarlanacak bir şey yok</b> — Discord'un açık olması yeter. Tamamen süs; ⚙️ Ayarlar'dan kapatılabilir.</p>
   <h3>🧰 Sıfır bir bilgisayarda (bir arkadaşta)</h3>
   <p>Botların <b>Node.js</b> ve <b>pm2</b>'ye ihtiyacı var. İkisinden biri eksikse panel bunu <b>fark eder</b> ve boş liste göstermek yerine doğru düğmeyi önerir ("Node.js indir" ya da "pm2 kur").</p>
   <h3>📁 Bilmekte fayda var</h3>

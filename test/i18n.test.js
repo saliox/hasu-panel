@@ -127,3 +127,21 @@ test('i18n : le HTML charge bien TOUS les fichiers de langue', () => {
   assert.ok(html.indexOf('lang/fr.js') < html.indexOf('i18n.js'), 'i18n.js doit être chargé après les langues');
   assert.ok(html.indexOf('i18n.js') < html.indexOf('app.js'), 'app.js doit être chargé après i18n.js');
 });
+
+test('i18n : aucune clé MORTE dans le dictionnaire', () => {
+  // Le sens inverse du test précédent. Quand le bouton à deux états est devenu un menu déroulant,
+  // « btn.lang » (« 🇬🇧 English ») a cessé de servir — mais il est resté traduit dans les 14 langues,
+  // et son voisin « btn.langTitle » décrivait encore un bouton disparu. Rien ne le signalait.
+  // Les clés sont référencées de deux façons : t('x') dans le JS, et data-i18n* dans le HTML.
+  const lire = (f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
+  const js = lire('ui/app.js') + lire('main.js');
+  const html = lire('ui/index.html');
+  const vues = new Set([
+    ...[...js.matchAll(/\bt\(\s*'([a-zA-Z][\w.]*)'/g)].map((m) => m[1]),
+    ...[...html.matchAll(/data-i18n(?:-html|-title|-ph|-input)?="([^"]+)"/g)].map((m) => m[1]),
+    // clés construites dynamiquement : les motifs de blocage viennent du main sous forme 'blk.*'
+    ...Object.keys(REF.ui).filter((k) => k.startsWith('blk.') && /b\.push\('blk\./.test(js)),
+  ]);
+  const mortes = Object.keys(REF.ui).filter((k) => !vues.has(k));
+  assert.deepEqual(mortes, [], `clés traduites dans 14 langues mais utilisées nulle part : ${mortes.join(', ')}`);
+});
