@@ -130,7 +130,7 @@ const {
   hasEstablishedPublic, classifyErrorFr, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
-  planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive,
+  planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
 } = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
@@ -270,6 +270,15 @@ const log = (...a) => {
 
 // ---------- Config ----------
 const cfgPath = () => path.join(app.getPath('userData'), 'panel-config.json');
+// Pause SYNCHRONE : on est sur le chemin de démarrage, avant que quoi que ce soit tourne, et il faut
+// que la config soit lue avant de continuer. Quelques dizaines de millisecondes le temps qu'un verrou
+// passager (antivirus, synchronisation) se relâche.
+const dodo = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
+// Erreurs qui peuvent DISPARAÎTRE toutes seules : elles seules méritent qu'on réessaie. Un JSON
+// invalide, lui, le restera — et il n'a même pas de `.code`, donc l'ancienne garde (`=== 'ENOENT'`)
+// ne l'attrapait pas : on gelait le thread principal 2 × 150 ms pour rien à chaque démarrage sur une
+// config abîmée. Mesuré : 316 ms de gel pour un fichier tronqué.
+const ERREURS_PASSAGERES = new Set(['EBUSY', 'EPERM', 'EACCES', 'EMFILE', 'ENFILE', 'EAGAIN', 'UNKNOWN']);
 // Entier borné : un scalaire corrompu/édité à la main (ex. pollSec="10x" → NaN) transformerait la
 // boucle de sondage en boucle folle (spawn continu de tasklist/pm2). On coerce + clamp comme les setters.
 const loadCfg = () => {
@@ -281,12 +290,15 @@ const loadCfg = () => {
   // Trois essais : au démarrage de session, Defender et les outils de synchronisation verrouillent
   // %APPDATA% pendant quelques dizaines de millisecondes. Un `catch {}` muet transformait ce verrou
   // passager en « fichier illisible » → valeurs d'usine.
-  const dodo = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
   const probe = (file) => {
     for (let i = 0; i < 3; i++) {
       try { return { ok: true, raw: JSON.parse(fs.readFileSync(file, 'utf8')), mtime: fs.statSync(file).mtimeMs }; }
       catch (e) {
-        if (e.code === 'ENOENT') return { ok: false }; // premier lancement : normal, inutile d'insister
+        // Premier lancement (ENOENT) ou contenu invalide : réessayer ne changera rien.
+        if (!ERREURS_PASSAGERES.has(e.code)) {
+          if (e.code !== 'ENOENT') log('config: contenu illisible', file, e.code || e.message, '(inutile de réessayer)');
+          return { ok: false };
+        }
         log('config: lecture impossible', file, e.code || e.message, `(essai ${i + 1}/3)`);
         if (i < 2) dodo(150);
       }
@@ -311,7 +323,14 @@ const loadCfg = () => {
     // le fait savoir.
     const presents = [cfgPath(), cfgPath() + '.bak'].filter((f) => { try { return fs.existsSync(f); } catch { return false; } });
     if (presents.length) {
-      for (const f of presents) { try { fs.copyFileSync(f, f + '.corrompu'); } catch (e) { log('config: copie de secours impossible', f, e.message); } }
+      // COPYFILE_EXCL : au DEUXIÈME incident, cette copie écrasait la mise de côté du premier — donc
+      // la seule archive des vrais réglages, remplacée par les valeurs d'usine gravées entre-temps.
+      // On garde la plus ancienne, c'est elle qui contient encore quelque chose.
+      for (const f of presents) {
+        try { fs.copyFileSync(f, f + '.corrompu', fs.constants.COPYFILE_EXCL); }
+        catch (e) { log(e.code === 'EEXIST' ? `config: ${f}.corrompu existe déjà (mise de côté du premier incident) → conservée`
+                                            : `config: copie de secours impossible ${f} ${e.message}`); }
+      }
       log('config: ILLISIBLE alors que les fichiers existent → copie dans *.corrompu, démarrage sur les valeurs d\'usine :', presents.join(', '));
       setTimeout(() => queueAlert('⚠️ Configuration illisible',
         'Le panel n\'a pas pu relire ses réglages et repart des valeurs d\'usine. Les anciens fichiers sont conservés à côté, suffixés `.corrompu`.', 0xED4245), 0);
@@ -369,6 +388,8 @@ const loadCfg = () => {
         ? { x: raw.winBounds.x, y: raw.winBounds.y, width: raw.winBounds.width, height: raw.winBounds.height } : null,
       winMaximized: raw.winSizeV3 === true ? raw.winMaximized === true : true,
       updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
+      // Chemin de la 2e installation déjà signalée : évite de réalerter à chaque démarrage.
+      dualWarnedFor: typeof raw.dualWarnedFor === 'string' ? raw.dualWarnedFor.slice(0, 500) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
       // Numéro d'ordre : borné comme tout le reste — édité à la main en « abc », il casserait la
@@ -406,26 +427,68 @@ const RE_SESSION = NOM_SESSION.length >= 3
 const masquer = (texte) => { const s = redactSensitive(texte); return RE_SESSION ? s.replace(RE_SESSION, '[…]') : s; };
 
 let cfgWriteFailed = false; // remonté dans panel:status → bandeau dans l'interface (échec bruyant)
+let cfgBakFailed = false;   // la COPIE DE SECOURS ne s'écrit plus : le filet est mort, il faut le dire
 let cfgSeq = 0;             // dernier numéro d'ordre écrit ; repart au-dessus de ce qu'on a lu au démarrage
 let cfgRepairNeeded = false; // le chargement a dû se rabattre sur la sauvegarde → remettre les deux d'accord
+// Écrit UNE copie et dit ce qui s'est réellement passé :
+//   'ok'        → écrite et relue conforme
+//   'perdu'     → écrite sans erreur, mais le disque ne contient pas ça (le mode de panne de juillet)
+//   'illisible' → écrite, impossible de vérifier (verrou passager) — on ne crie pas au loup
+//   'echec'     → l'écriture elle-même a échoué
+//
+// Les DEUX copies passent par temp + rename. Le .bak était écrit EN PLACE (troncature puis
+// remplissage) : une coupure au mauvais moment fabriquait exactement le fichier tronqué contre lequel
+// il existe — la seule des deux copies à ne pas survivre à l'événement qui justifie son existence.
+const ecrireCopie = (chemin, data) => {
+  const tmp = chemin + '.tmp';
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, chemin); // atomique sur NTFS
+  } catch (e) { log('saveCfg: écriture impossible', path.basename(chemin), e.message); return 'echec'; }
+  // Relecture dans SON PROPRE essai : dans le même `try` que l'écriture, un verrou passager de
+  // l'antivirus sur la LECTURE faisait conclure « écriture perdue » alors que le rename avait réussi
+  // — bandeau rouge et alerte Discord pour une écriture qui avait marché. loadCfg, lui, réessayait
+  // déjà trois fois cette même panne ; ici on ne réessayait pas du tout.
+  for (let i = 0; i < 3; i++) {
+    try { return fs.readFileSync(chemin, 'utf8') === data ? 'ok' : 'perdu'; }
+    catch { if (i < 2) dodo(50); }
+  }
+  return 'illisible';
+};
+
 const saveCfg = () => {
   cfg[CFG_SEQ] = ++cfgSeq;
   const data = JSON.stringify(cfg, null, 2);
-  const file = cfgPath(), tmp = file + '.tmp';
-  try { fs.writeFileSync(file + '.bak', data); } catch (e) { log('saveCfg .bak', e.message); }
-  let ok = false;
-  try {
-    fs.writeFileSync(tmp, data);
-    fs.renameSync(tmp, file); // atomique sur NTFS
-    ok = fs.readFileSync(file, 'utf8') === data;
-  } catch (e) { log('saveCfg', e.message); }
+  const file = cfgPath();
+  // La copie de secours d'ABORD : si le principal échoue, c'est elle la plus récente, donc celle sur
+  // laquelle loadCfg se rabattra.
+  const etatBak = ecrireCopie(file + '.bak', data);
+  const etatMain = ecrireCopie(file, data);
+  // Le .bak n'était JAMAIS relu : sa mort était totalement silencieuse, et l'alerte d'échec du
+  // principal promettait quand même « tes réglages sont conservés dans la copie de secours ».
+  const verdict = verdictEcriture(etatMain, etatBak);
+  const bakEtaitOk = !cfgBakFailed;
+  cfgBakFailed = verdict.bakMort;
+  // Un filet qui disparaît en silence, c'est le pire des deux mondes : tout a l'air normal jusqu'au
+  // jour où on en a besoin. On le dit UNE fois, à la bascule — pas à chaque enregistrement.
+  if (cfgBakFailed && bakEtaitOk) {
+    log('saveCfg: la COPIE DE SECOURS ne s\'écrit plus (' + etatBak + ') — le principal, lui, ' + (verdict.ok ? 'va bien' : 'non plus'));
+    if (verdict.ok) setTimeout(() => queueAlert('⚠️ Copie de secours des réglages en panne',
+      `Tes réglages s'enregistrent toujours, mais la copie de secours n'est plus écrite : en cas de coupure, ils seraient perdus. Regarde \`${masquer(cfgPath())}\` (antivirus, synchronisation, disque plein).`,
+      0xFAA61A), 0);
+  }
+  // 'illisible' = écrit mais invérifiable : on ne déclenche pas l'alarme sur une simple lecture ratée.
+  const ok = verdict.ok;
+  if (etatMain === 'illisible') log('saveCfg: écrit, mais relecture impossible pour vérifier');
   if (!ok && !cfgWriteFailed) {
     log('saveCfg: ÉCHEC SILENCIEUX — le fichier ne reflète pas ce qui a été écrit ; les réglages ne survivent que dans le .bak :', file);
     // Différé d'un tick : saveCfg peut être appelé pendant l'amorçage, avant que queueAlert soit défini.
     // Le chemin est MASQUÉ ici : cette alerte part vers le webhook Discord et contient le nom de
     // session Windows. Le journal local, lui, garde la version entière — c'est là qu'on en a besoin.
     setTimeout(() => queueAlert('⚠️ Réglages non enregistrés',
-      `Le panel n'arrive pas à écrire \`${masquer(file)}\`. Tes réglages sont conservés dans la copie de secours, mais vérifie ce dossier (antivirus, synchronisation, disque plein).`, 0xfaa61a), 0);
+      `Le panel n'arrive pas à écrire \`${masquer(file)}\`. ` + (cfgBakFailed
+        ? '**La copie de secours non plus** : les prochains réglages seront perdus. Regarde ce dossier tout de suite (antivirus, synchronisation, disque plein).'
+        : 'Tes réglages sont conservés dans la copie de secours, mais vérifie ce dossier (antivirus, synchronisation, disque plein).'), 0xfaa61a), 0);
   }
   cfgWriteFailed = !ok;
   return ok;
@@ -1842,13 +1905,25 @@ const reconcilerLanceurs = (forcer = null) => {
 // lequel démarre. On ne peut pas désinstaller à la place de l'utilisateur : on le lui dit, avec le
 // chemin exact, une seule fois par démarrage.
 let secondeInstall = '';
-const detecterSecondeInstallation = () => {
+const detecterSecondeInstallation = async () => {
   if (process.platform !== 'win32' || !app.isPackaged) return;
+  // La clé Run est la MEILLEURE source : une copie décompressée à la main quelque part sur le disque
+  // et inscrite au démarrage y figure littéralement, alors qu'aucune liste de chemins ne l'aurait
+  // devinée. On la lit ici plutôt que de jeter cette preuve.
+  const depuisRegistre = [];
+  try {
+    const runOut = await regLire(REG_RUN);
+    for (const v of parseRegQuery(runOut || '')) {
+      const m = String(v.data || '').match(/([A-Za-z]:[\\/][^"]*?HasuPanel\.exe)/i);
+      if (m) depuisRegistre.push(m[1]);
+    }
+  } catch { /* registre illisible : on se rabat sur les chemins connus */ }
   const candidats = [
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'hasu-panel', 'HasuPanel.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'HasuPanel', 'HasuPanel.exe'),
     path.join(process.env.ProgramFiles || '', 'HasuPanel', 'HasuPanel.exe'),
     path.join(process.env['ProgramFiles(x86)'] || '', 'HasuPanel', 'HasuPanel.exe'),
+    ...depuisRegistre,
   ].filter((p) => { try { return fs.existsSync(p); } catch { return false; } });
   const autres = autresInstallations(candidats, process.execPath);
   if (!autres.length) return;
@@ -1856,6 +1931,12 @@ const detecterSecondeInstallation = () => {
   log('DEUXIÈME INSTALLATION détectée :', autres.join(', '), '— celle qui tourne :', process.execPath);
   // L'alerte sort de la machine (webhook Discord) : on masque le nom de session Windows, comme partout
   // ailleurs dans le panel. Le chemin complet reste dans le journal local et dans le bandeau.
+  // Seul émetteur qui ignorait l'interrupteur des alertes, et sans aucune mémoire : toast + webhook
+  // à CHAQUE démarrage, sans moyen de l'arrêter. On ne réalerte que si le chemin CHANGE.
+  if (cfg.alerts === false) return;
+  const signature = autres.join('|');
+  if (cfg.dualWarnedFor === signature) return;
+  cfg.dualWarnedFor = signature; saveCfg();
   const affiche = autres.map((p) => masquer(p)).join('`\n`');
   setTimeout(() => queueAlert('⚠️ Deux installations du panel',
     `Une autre installation existe sur ce PC :\n\`${affiche}\`\nLes deux se lancent au démarrage et se mettent à jour chacune de leur côté. Désinstalle celle dont tu ne veux pas (Paramètres → Applications).`,
@@ -2363,7 +2444,7 @@ else {
     if (cfgRepairNeeded) { cfgRepairNeeded = false; log('config: réalignement du fichier principal sur la sauvegarde —', saveCfg() ? 'fait' : 'ÉCHEC'); }
     hydrateRuntime(); // reprend les alertes suivies et les relances en cours d'avant le redémarrage
     setLang(cfg.lang); // le menu du tray et les alertes suivent la langue choisie dans la fenêtre
-    detecterSecondeInstallation(); // (le ménage des lanceurs, lui, se fait dans `applyAutoLaunch` plus bas)
+    detecterSecondeInstallation().catch((e) => log('détection 2e installation', e.message)); // (le ménage des lanceurs se fait dans `applyAutoLaunch`)
     resolvePm2Runner(); // node.exe + pm2/bin/pm2 → appels pm2 sans cmd.exe (zéro process fantôme)
     // Sans AppUserModelId, Windows 10/11 n'affiche AUCUNE notification d'une app Electron.
     // DOIT être identique au `build.appId` du package.json ('hasu.panel') : c'est cet identifiant que
@@ -2463,6 +2544,14 @@ else {
           if (r.ok) { pm2SavePending = false; cfg.lastSaveAt = Date.now(); saveCfg(); }
         }
       } catch (err) { log('quit pm2 save', err.message); }
+      // Laisser partir ce qui attend dans la file : `app.exit(0)` tue le process net, et l'alerte
+      // « Bots non relancés après la partie » — justement celle qui compte le plus à ce moment — n'avait
+      // jamais le temps d'atteindre Discord. Borné à 3 s : on ne retarde pas la fermeture pour autant.
+      const finAttente = Date.now() + 3000;
+      while ((alertQueue.length || alertDraining) && Date.now() < finAttente) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (alertQueue.length) log('fermeture :', alertQueue.length, 'alerte(s) non parties (délai dépassé)');
       if (deadline) clearTimeout(deadline);
       finish();
     })();

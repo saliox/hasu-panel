@@ -372,6 +372,20 @@ const pickCfgSource = (main, bak) => {
 };
 
 
+// ---------- Enregistrement de la config : que conclure des deux écritures ? ----------
+// Chaque copie renvoie l'un de quatre états : 'ok' (écrite et relue conforme), 'perdu' (écrite sans
+// erreur mais le disque ne contient pas ça — le mode de panne qui a figé la config six semaines),
+// 'illisible' (écrite, mais impossible de relire pour vérifier) et 'echec' (l'écriture a échoué).
+//
+// La nuance qui compte : 'illisible' N'EST PAS un échec. Un verrou passager de l'antivirus sur la
+// LECTURE faisait conclure « écriture perdue » alors que le renommage avait réussi — bandeau rouge et
+// alerte Discord pour une écriture qui avait parfaitement marché.
+const verdictEcriture = (etatMain, etatBak) => ({
+  ok: etatMain === 'ok' || etatMain === 'illisible',
+  // Le filet est mort seulement si on SAIT qu'il l'est : là encore, invérifiable ≠ cassé.
+  bakMort: etatBak === 'echec' || etatBak === 'perdu',
+});
+
 // ---------- Lancement au démarrage de Windows ----------
 // En laissant Electron nommer notre valeur dans la clé Run, ce nom a dérivé : il suit `app.getName()`
 // aujourd'hui (`electron.app.HasuPanel`) et suivait l'AppUserModelId dans une version plus ancienne
@@ -549,5 +563,5 @@ module.exports = {
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,
-  parseRegQuery, parseStartupApproved, planLanceurs, LOGIN_ITEM, NOMS_HERITES, autresInstallations,
+  verdictEcriture, parseRegQuery, parseStartupApproved, planLanceurs, LOGIN_ITEM, NOMS_HERITES, autresInstallations,
 };

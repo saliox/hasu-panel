@@ -755,3 +755,36 @@ test('isDeliberateStop : un « pm2 stop » sur un bot DÉJÀ tombé compte comme
   // …et rester arrêté n'est pas un nouvel arrêt
   assert.equal(isDeliberateStop({ status: 'stopped', restarts: 2 }, { status: 'stopped', restarts: 2 }), false);
 });
+
+// ---------------------- enregistrement de la config : « invérifiable » n'est pas « perdu »
+// Défaut réel : la relecture de contrôle était dans le MÊME try que l'écriture. Un verrou passager de
+// l'antivirus sur la LECTURE faisait conclure « écriture perdue » alors que le renommage avait réussi
+// — bandeau rouge et alerte Discord pour une écriture parfaitement valide.
+const { verdictEcriture } = require('../logic');
+
+test('verdictEcriture : écrit et relu conforme → tout va bien', () => {
+  assert.deepEqual(verdictEcriture('ok', 'ok'), { ok: true, bakMort: false });
+});
+
+test('verdictEcriture : « perdu » est le SEUL vrai échec d\'écriture', () => {
+  // C'est le mode de panne qui a figé la config six semaines : aucune erreur levée, mais le disque
+  // ne contient pas ce qu'on vient d'écrire.
+  assert.equal(verdictEcriture('perdu', 'ok').ok, false);
+  assert.equal(verdictEcriture('echec', 'ok').ok, false);
+});
+
+test('verdictEcriture : « illisible » ne déclenche PAS l\'alarme', () => {
+  // Écrit, mais impossible de relire pour vérifier. On ne sait pas — et on ne crie pas au loup :
+  // c'est ce faux positif qui envoyait une alerte Discord pour une écriture réussie.
+  assert.equal(verdictEcriture('illisible', 'ok').ok, true);
+  assert.equal(verdictEcriture('ok', 'illisible').bakMort, false, 'idem pour la copie de secours');
+});
+
+test('verdictEcriture : la mort de la COPIE DE SECOURS est signalée séparément', () => {
+  // Elle n'était jamais relue : sa disparition était totalement silencieuse, pendant que l'alerte
+  // d'échec du principal promettait « tes réglages sont conservés dans la copie de secours ».
+  assert.deepEqual(verdictEcriture('ok', 'echec'), { ok: true, bakMort: true });
+  assert.deepEqual(verdictEcriture('ok', 'perdu'), { ok: true, bakMort: true });
+  // Le pire cas : les deux à terre. L'alerte doit alors dire la vérité, pas rassurer.
+  assert.deepEqual(verdictEcriture('perdu', 'perdu'), { ok: false, bakMort: true });
+});
