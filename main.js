@@ -258,14 +258,44 @@ const withGameLock = async (fn) => {
 };
 let prevIo = new Map(); // pid -> { read, write, at } : relevé E/S précédent, pour calculer les DÉBITS (octets/s) par delta
 
+// Dernières lignes gardées EN MÉMOIRE, quoi qu'il arrive au fichier. Le journal est le seul témoin de
+// presque toutes les pannes de ce panel ; s'il cesse de s'écrire, on perd jusqu'à la trace de ça.
+const logEnAttente = [];        // lignes qu'on n'a pas pu écrire : réémises dès que le fichier revient
+const LOG_ATTENTE_MAX = 300;
+let logWriteFailed = false;
+
 const log = (...a) => {
+  const ligne = `${new Date().toISOString()} ${a.join(' ')}`;
   try {
     const f = path.join(app.getPath('userData'), 'panel.log');
     // Rotation : au-delà de ~2 Mo on repart d'un fichier neuf (garde panel.log.1) — sinon une erreur
     // récurrente (pm2 cassé, updater en échec toutes les 6 h) ferait grossir le log sans fin.
     try { if (fs.statSync(f).size > 2 * 1024 * 1024) fs.renameSync(f, f + '.1'); } catch {}
-    fs.appendFileSync(f, `${new Date().toISOString()} ${a.join(' ')}\n`);
-  } catch {}
+    // Un verrou passager (antivirus, synchronisation) ne doit pas TROUER le journal : ce qui n'a pas pu
+    // s'écrire part avec la première ligne qui repasse. Sans ça, les minutes les plus intéressantes —
+    // celles d'une panne en cours — étaient précisément celles qui disparaissaient.
+    const rattrapage = logEnAttente.length ? logEnAttente.join('\n') + '\n' : '';
+    fs.appendFileSync(f, rattrapage + ligne + '\n');
+    logEnAttente.length = 0; // APRÈS le succès seulement : vider avant, c'était perdre la file entière
+    // à la première écriture qui échoue — mon premier jet en perdait plus qu'il n'en sauvait.
+    if (logWriteFailed) { logWriteFailed = false; try { fs.appendFileSync(f, `${new Date().toISOString()} journal de nouveau accessible\n`); } catch {} }
+  } catch (e) {
+    logEnAttente.push(ligne);
+    if (logEnAttente.length > LOG_ATTENTE_MAX) logEnAttente.shift();
+    // Le journal qui meurt en silence, c'est l'angle mort ultime : plus aucune panne n'est traçable — et
+    // rien ne le signale, puisque le moyen de signaler est justement ce qui est cassé. On le dit UNE
+    // fois par l'autre canal (webhook + toast), qui ne dépend pas du disque.
+    if (logWriteFailed) return;
+    logWriteFailed = true;
+    const raison = e && e.message ? e.message : 'raison inconnue';
+    setTimeout(() => {
+      try {
+        queueAlert('⚠️ Journal du panel bloqué',
+          `Le panel n'arrive plus à écrire son journal (\`${masquer(raison)}\`). Il continue de fonctionner normalement, et les lignes manquées seront réécrites dès que le fichier redeviendra accessible — mais si ça dure, plus aucune panne ne laissera de trace. Regarde ce dossier (antivirus, synchronisation, disque plein).`,
+          0xFAA61A);
+      } catch { /* même le canal d'alerte est indisponible : il ne reste que la file en mémoire */ }
+    }, 0);
+  }
 };
 
 // ---------- Config ----------
