@@ -310,14 +310,56 @@ const boundsAreVisible = (b, displays) => {
  * @param bak  {ok, raw, mtime} — copie de secours
  * @returns {source:'main'|'bak'|'defaults', raw?, warn?}
  */
+// Numéro d'ordre monotone, écrit DANS le contenu de la config à chaque enregistrement.
+//
+// POURQUOI PAS LES DATES : trancher « laquelle des deux copies est la plus récente » sur les dates de
+// modification, c'est faire confiance à une métadonnée que personne ne contrôle — un outil de
+// sauvegarde, un antivirus, une restauration, une copie de dossier, ou simplement un script de
+// diagnostic la font mentir. Un compteur voyage AVEC le contenu : il dit exactement ce qu'on veut
+// savoir, quel que soit ce que le système de fichiers raconte.
+//
+// SECOND EFFET, le plus important : le contenu change à CHAQUE enregistrement. La vérification
+// d'écriture de `saveCfg` (relire le fichier et comparer) était jusqu'ici vraie par accident dès que
+// les réglages n'avaient pas bougé — elle ne pouvait donc pas distinguer « écrit » de « écriture
+// perdue, mais l'ancien contenu était déjà identique ». Avec un compteur qui avance, elle détecte
+// enfin une écriture réellement perdue. C'est ce trou qui avait laissé la config se figer six
+// semaines sans le moindre signe.
+const CFG_SEQ = '_seq';
+const seqDe = (raw) => {
+  const n = Number(raw && raw[CFG_SEQ]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+};
+
+/**
+ * Choisit la copie de config qui fait foi, et renvoie le compteur le plus haut vu (`seq`) pour que
+ * l'enregistrement suivant reparte AU-DESSUS des deux — y compris après un repli sur la sauvegarde.
+ */
 const pickCfgSource = (main, bak) => {
   const okM = !!(main && main.ok), okB = !!(bak && bak.ok);
-  if (!okM && !okB) return { source: 'defaults' };
-  if (!okB) return { source: 'main', raw: main.raw };
-  if (!okM) return { source: 'bak', raw: bak.raw, warn: 'fichier principal illisible' };
+  if (!okM && !okB) return { source: 'defaults', seq: 0 };
+  if (!okB) return { source: 'main', raw: main.raw, seq: seqDe(main.raw) };
+  if (!okM) return { source: 'bak', raw: bak.raw, seq: seqDe(bak.raw), warn: 'fichier principal illisible' };
+  const sM = seqDe(main.raw), sB = seqDe(bak.raw);
+  const seq = Math.max(sM, sB);
+  // Contenus IDENTIQUES : il n'y a rien à départager, donc rien à signaler. Sans cette sortie, une
+  // date qui a bougé toute seule (outil de sauvegarde, antivirus, copie de dossier) déclenchait un
+  // avertissement alarmant et un « repli » sur une copie… rigoureusement identique. C'est ce qui
+  // s'est produit sur la machine : deux fichiers au même octet près, et un message de panne.
+  try {
+    if (JSON.stringify(main.raw) === JSON.stringify(bak.raw)) return { source: 'main', raw: main.raw, seq };
+  } catch { /* structure exotique : on continue avec les règles ci-dessous */ }
+  // Dès qu'UNE des deux copies porte un compteur, il tranche : une copie sans compteur a forcément
+  // été écrite par une version antérieure, donc avant.
+  if (seq > 0) {
+    if (sB > sM) return { source: 'bak', raw: bak.raw, seq, warn: 'sauvegarde plus récente que le fichier principal' };
+    // Compteurs égaux : c'est le même enregistrement. Le principal fait foi (il est écrit en dernier).
+    return { source: 'main', raw: main.raw, seq };
+  }
+  // Aucune des deux n'a de compteur : anciennes copies, on retombe sur les dates le temps d'un
+  // enregistrement — le prochain posera un compteur dans les deux.
   const tM = Number(main.mtime) || 0, tB = Number(bak.mtime) || 0;
-  if (tB > tM) return { source: 'bak', raw: bak.raw, warn: 'fichier principal périmé' };
-  return { source: 'main', raw: main.raw };
+  if (tB > tM) return { source: 'bak', raw: bak.raw, seq: 0, warn: 'fichier principal périmé' };
+  return { source: 'main', raw: main.raw, seq: 0 };
 };
 
 
@@ -483,7 +525,7 @@ module.exports = {
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert,
-  computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
+  computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,
   parseRegQuery, parseStartupApproved, planLanceurs, LOGIN_ITEM, autresInstallations,

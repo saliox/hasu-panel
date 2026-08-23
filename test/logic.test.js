@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, computeDefaultBounds, boundsAreVisible, pollDelayFor,
-  cleanNotes, pickCfgSource, decideAlert,
+  cleanNotes, pickCfgSource, seqDe, decideAlert,
 } = require('../logic');
 
 // ------------------------------------------- config : quelle copie charger ?
@@ -57,6 +57,88 @@ test('pickCfgSource : mtime absente ou corrompue ne fait pas basculer par erreur
   assert.equal(pickCfgSource(M({ v: 'a' }), M({ v: 'b' })).source, 'main');
   assert.equal(pickCfgSource(M({ v: 'a' }, NaN), M({ v: 'b' }, 9)).source, 'bak');
   assert.equal(pickCfgSource(M({ v: 'a' }, 9), M({ v: 'b' }, NaN)).source, 'main');
+});
+
+// ---------------------- config : le compteur d'ordre prime sur les dates de fichier
+// POURQUOI : les dates de modification ne sont pas fiables pour départager deux copies — une
+// sauvegarde, un antivirus, une restauration ou un simple script de diagnostic les font mentir.
+// Mesuré sur la machine : en 55 démarrages, l'avertissement « principal périmé » n'est apparu que
+// 3 fois, dont 2 provoquées par des écritures extérieures pendant un diagnostic. Le compteur, lui,
+// voyage AVEC le contenu : il dit ce qu'on veut savoir, quoi que raconte le système de fichiers.
+const S = (n, mtime, extra) => ({ ok: true, raw: { _seq: n, ...extra }, mtime });
+
+test('pickCfgSource : le compteur tranche même quand les dates disent l\'inverse', () => {
+  // Le principal a une date PLUS RÉCENTE mais un compteur plus BAS : c'est une vieille copie remise
+  // en place (restauration, synchronisation, copie de dossier). Les dates se trompent, le compteur non.
+  const r = pickCfgSource(S(4, 9000), S(7, 1000));
+  assert.equal(r.source, 'bak');
+  assert.equal(r.seq, 7, 'le prochain enregistrement doit repartir AU-DESSUS des deux');
+  assert.match(r.warn, /sauvegarde plus récente/);
+});
+
+test('pickCfgSource : compteur du principal plus haut → il gagne, sans avertissement', () => {
+  const r = pickCfgSource(S(9, 1000), S(8, 9000));
+  assert.equal(r.source, 'main');
+  assert.equal(r.warn, undefined);
+  assert.equal(r.seq, 9);
+});
+
+test('pickCfgSource : compteurs ÉGAUX → même enregistrement, le principal fait foi', () => {
+  // Il est écrit en dernier : à numéro égal, c'est lui la copie de référence.
+  const r = pickCfgSource(S(5, 1000, { v: 'a' }), S(5, 9000, { v: 'b' }));
+  assert.equal(r.source, 'main');
+  assert.equal(r.raw.v, 'a');
+  assert.equal(r.seq, 5);
+});
+
+test('pickCfgSource : une copie sans compteur a forcément été écrite avant', () => {
+  // Migration : la version qui pose des compteurs vient d'arriver. Celle qui en porte un est
+  // postérieure, quelle que soit sa date.
+  assert.equal(pickCfgSource(M({ v: 'ancien' }, 9000), S(1, 1000)).source, 'bak');
+  assert.equal(pickCfgSource(S(1, 1000), M({ v: 'ancien' }, 9000)).source, 'main');
+});
+
+test('pickCfgSource : sans aucun compteur, on retombe sur les dates (comportement d\'avant)', () => {
+  // Premier démarrage après la mise à jour : les deux copies sont anciennes. On ne casse rien, et le
+  // premier enregistrement posera un compteur dans les deux.
+  assert.equal(pickCfgSource(M({ v: 'a' }, 1000), M({ v: 'b' }, 2000)).source, 'bak');
+  assert.equal(pickCfgSource(M({ v: 'a' }, 2000), M({ v: 'b' }, 1000)).source, 'main');
+  assert.equal(pickCfgSource(M({ v: 'a' }, 1000), M({ v: 'b' }, 2000)).seq, 0);
+});
+
+test('pickCfgSource : compteur illisible ou absurde ne décide pas à la place des dates', () => {
+  for (const pourri of ['abc', -3, null, undefined, NaN, Infinity, {}]) {
+    const r = pickCfgSource({ ok: true, raw: { _seq: pourri }, mtime: 1000 }, S(2, 500));
+    assert.equal(r.source, 'bak', `_seq=${String(pourri)} doit compter pour absent`);
+    assert.equal(r.seq, 2);
+  }
+  assert.equal(seqDe({ _seq: 3.9 }), 3, 'un fractionnaire est tronqué, pas rejeté');
+  assert.equal(seqDe(null), 0);
+});
+
+test('pickCfgSource : contenus IDENTIQUES → aucun avertissement, quoi que disent les dates', () => {
+  // Le faux positif observé en vrai : les deux fichiers au même octet près, une date qui a bougé
+  // toute seule, et le panel annonçait « fichier principal périmé → repli ». Il n'y a rien à
+  // départager quand les contenus sont les mêmes — et donc rien à signaler.
+  const meme = { v: 'pareil', n: 1 };
+  const r = pickCfgSource({ ok: true, raw: { ...meme }, mtime: 1000 }, { ok: true, raw: { ...meme }, mtime: 9000 });
+  assert.equal(r.source, 'main');
+  assert.equal(r.warn, undefined, 'ne pas alarmer pour deux fichiers identiques');
+});
+
+test('pickCfgSource : contenus DIFFÉRENTS à date égale → on tranche quand même', () => {
+  // La sortie « identiques » ne doit pas avaler les vrais cas : ici les copies divergent réellement.
+  const r = pickCfgSource(M({ v: 'a' }, 1000), M({ v: 'b' }, 9000));
+  assert.equal(r.source, 'bak');
+  assert.match(r.warn, /périmé/);
+});
+
+test('pickCfgSource : le compteur remonte même quand une seule copie est lisible', () => {
+  // Sinon un enregistrement fait après un .bak illisible repartirait de zéro, donc DERRIÈRE la copie
+  // qu'on vient de lire — et le choix suivant redeviendrait arbitraire.
+  assert.equal(pickCfgSource(S(12, 1), KO).seq, 12);
+  assert.equal(pickCfgSource(KO, S(12, 1)).seq, 12);
+  assert.equal(pickCfgSource(KO, KO).seq, 0);
 });
 
 // ------------------------------------------------- notes de version (MAJ)

@@ -116,7 +116,7 @@ const { t, setLang } = require('./ui/i18n');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert,
-  computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, cleanNotes,
+  computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive,
 } = require('./logic');
@@ -280,7 +280,16 @@ const loadCfg = () => {
     return { ok: false };
   };
   const pick = pickCfgSource(probe(cfgPath()), probe(cfgPath() + '.bak'));
+  // On repart TOUJOURS au-dessus du plus haut compteur vu, y compris celui de la copie qu'on n'a pas
+  // retenue : sinon deux enregistrements pourraient porter le même numéro et le choix suivant serait
+  // arbitraire.
+  cfgSeq = Math.max(cfgSeq, pick.seq || 0);
   if (pick.warn) log('config:', pick.warn, '→ repli sur .bak');
+  // Repli utilisé = les deux copies ont divergé (typiquement une fermeture brutale entre l'écriture
+  // de la sauvegarde et celle du fichier principal — mise à jour, arrêt forcé, coupure). On les
+  // remet d'accord tout de suite, sinon l'avertissement revient à CHAQUE démarrage jusqu'au prochain
+  // enregistrement, et le fichier principal reste périmé sur le disque.
+  cfgRepairNeeded = pick.source === 'bak';
   if (pick.source === 'defaults') {
     // Repartir des valeurs d'usine est normal au tout premier lancement. Mais si des fichiers
     // EXISTENT et sont illisibles, le premier saveCfg venu écraserait les DEUX copies (le .bak est
@@ -348,6 +357,9 @@ const loadCfg = () => {
       updatedFrom: typeof raw.updatedFrom === 'string' ? raw.updatedFrom.slice(0, 20) : '',
       alertWebhook: typeof raw.alertWebhook === 'string' ? raw.alertWebhook.trim().slice(0, 300) : '',
       lastSaveAt: clampInt(raw.lastSaveAt, 0, Number.MAX_SAFE_INTEGER, 0),
+      // Numéro d'ordre : borné comme tout le reste — édité à la main en « abc », il casserait la
+      // comparaison des deux copies au lieu de la départager.
+      [CFG_SEQ]: clampInt(raw[CFG_SEQ], 0, Number.MAX_SAFE_INTEGER, 0),
       games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : [...DEFAULT_GAMES], // copie : sinon addGame muterait la constante
       stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
       imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
@@ -365,8 +377,16 @@ const loadCfg = () => {
 // que le fichier était parfaitement accessible en écriture). Un `catch` vide ne suffit pas : ici, l'appel
 // ne levait AUCUNE erreur. Le .bak est écrit AVANT le fichier principal pour que, si le rename échoue, la
 // copie saine soit la plus récente des deux — c'est ce qui permet à loadCfg de retomber dessus.
+//
+// La vérification ne valait toutefois QUE si le contenu changeait : relire et comparer était vrai
+// par accident dès que les réglages n'avaient pas bougé. D'où le compteur `_seq`, incrémenté ici à
+// chaque enregistrement — il rend la comparaison réellement discriminante, et il sert aussi à
+// départager les deux copies au chargement sans dépendre des dates de fichier.
 let cfgWriteFailed = false; // remonté dans panel:status → bandeau dans l'interface (échec bruyant)
+let cfgSeq = 0;             // dernier numéro d'ordre écrit ; repart au-dessus de ce qu'on a lu au démarrage
+let cfgRepairNeeded = false; // le chargement a dû se rabattre sur la sauvegarde → remettre les deux d'accord
 const saveCfg = () => {
+  cfg[CFG_SEQ] = ++cfgSeq;
   const data = JSON.stringify(cfg, null, 2);
   const file = cfgPath(), tmp = file + '.tmp';
   try { fs.writeFileSync(file + '.bak', data); } catch (e) { log('saveCfg .bak', e.message); }
@@ -2271,6 +2291,11 @@ else {
   app.on('second-instance', (_e, argv) => { if (!Array.isArray(argv) || !argv.includes('--hidden')) showWindow(); });
   app.whenReady().then(async () => {
     cfg = loadCfg();
+    // Les deux copies avaient divergé : on réaligne le fichier principal TOUT DE SUITE. Sans ça
+    // l'avertissement revenait à chaque démarrage et le fichier périmé restait sur le disque jusqu'au
+    // prochain enregistrement. Bonus : ça vérifie dès l'amorçage que le disque accepte nos écritures,
+    // donc le bandeau « réglages non enregistrés » se lève immédiatement si ce n'est pas le cas.
+    if (cfgRepairNeeded) { cfgRepairNeeded = false; log('config: réalignement du fichier principal sur la sauvegarde —', saveCfg() ? 'fait' : 'ÉCHEC'); }
     hydrateRuntime(); // reprend les alertes suivies et les relances en cours d'avant le redémarrage
     setLang(cfg.lang); // le menu du tray et les alertes suivent la langue choisie dans la fenêtre
     detecterSecondeInstallation(); // (le ménage des lanceurs, lui, se fait dans `applyAutoLaunch` plus bas)
