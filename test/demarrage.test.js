@@ -189,6 +189,17 @@ test('plus personne ne laisse Electron nommer l\'entrée de démarrage', () => {
   assert.equal(/getLoginItemSettings/.test(src), false, 'l\'état se lit dans le registre, pas via Electron');
 });
 
+test('ce que le panel ÉCRIT dans StartupApproved, il le relit comme « activé »', () => {
+  // Le lecteur et l'écrivain doivent rester d'accord : si la constante change et que le premier octet
+  // devient impair, le panel poserait un drapeau « désactivé » en croyant activer le démarrage — et
+  // l'interrupteur redeviendrait décoratif, exactement le bug d'origine.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const m = src.match(/const ACTIVE = '([0-9a-f]+)'/i);
+  assert.ok(m, 'la constante ACTIVE doit rester le seul endroit qui décrit ce format');
+  assert.equal(m[1].length, 24, '12 octets : 4 d\'état + 8 d\'horodatage, ce qu\'attend Windows');
+  assert.equal(parseStartupApproved(ligne(LOGIN_ITEM, m[1])).get(LOGIN_ITEM), true);
+});
+
 test('l\'identité de désinstallation est figée (sinon : deux entrées dans Applications)', () => {
   // Sans GUID épinglé, electron-builder le dérive de appId + productName : le jour où l'un des deux
   // bouge, l'installeur écrit une NOUVELLE entrée de désinstallation au lieu de remplacer l'ancienne,

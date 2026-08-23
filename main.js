@@ -1677,8 +1677,18 @@ const regEcrire = (nom, data) => new Promise((res) => {
   execFile(SYS('reg.exe'), ['add', REG_RUN, '/v', nom, '/t', 'REG_SZ', '/d', data, '/f'],
     { windowsHide: true, timeout: 10000 }, (err) => res(!err));
 });
-const regSupprimer = (nom) => new Promise((res) => {
-  execFile(SYS('reg.exe'), ['delete', REG_RUN, '/v', nom, '/f'], { windowsHide: true, timeout: 10000 }, (err) => res(!err));
+const regSupprimer = (cle, nom) => new Promise((res) => {
+  execFile(SYS('reg.exe'), ['delete', cle, '/v', nom, '/f'], { windowsHide: true, timeout: 10000 }, (err) => res(!err));
+});
+// Gestionnaire des tâches > Démarrage garde son « désactivé » ICI, à côté de la valeur Run et indexé
+// sur son nom. C'est LA raison pour laquelle l'interrupteur ne marchait pas : le panel posait bien la
+// valeur, Windows la laissait désactivée, et l'écran affichait « activé ». Poser une valeur ne suffit
+// donc pas — quand l'utilisateur demande explicitement le démarrage auto, il faut aussi lever ce
+// drapeau. On n'y touche QUE pour notre propre entrée, et uniquement sur un clic.
+const ACTIVE = '020000000000000000000000'; // 4 octets d'état + 8 d'horodatage, format attendu par Windows
+const regAutoriserDemarrage = (nom) => new Promise((res) => {
+  execFile(SYS('reg.exe'), ['add', REG_APPROVED, '/v', nom, '/t', 'REG_BINARY', '/d', ACTIVE, '/f'],
+    { windowsHide: true, timeout: 10000 }, (err) => res(!err));
 });
 
 // Un seul point d'entrée pour tout ce qui touche au démarrage automatique : lecture du registre,
@@ -1705,10 +1715,19 @@ const reconcilerLanceurs = (forcer = null) => {
       log(ok ? `démarrage auto : entrée « ${plan.nom} » posée` : `démarrage auto : écriture de « ${plan.nom} » IMPOSSIBLE`);
       if (!ok) return; // on ne purge pas à l'aveugle : mieux vaut un doublon qu'aucun lanceur
     }
+    // Clic explicite sur « activer » : on lève aussi le « désactivé » de Gestionnaire des tâches, sans
+    // quoi l'interrupteur reste décoratif — c'est exactement le bug signalé.
+    if (forcer === true) {
+      const ok = await regAutoriserDemarrage(plan.nom);
+      if (!ok) log('démarrage auto : le drapeau « autorisé » de Windows n\'a pas pu être posé');
+    }
     for (const nom of plan.supprimer) {
-      const ok = await regSupprimer(nom);
+      const ok = await regSupprimer(REG_RUN, nom);
       log(ok ? `entrée de démarrage en double supprimée : « ${nom} »`
              : `entrée de démarrage « ${nom} » : suppression impossible`);
+      // Le « désactivé » de l'ancienne entrée n'a plus d'objet : sans ça, Gestionnaire des tâches
+      // garde une ligne fantôme, et le drapeau resservirait si le nom réapparaissait un jour.
+      if (ok) await regSupprimer(REG_APPROVED, nom);
     }
     if (plan.autoLaunch !== cfg.autoLaunch) {
       log(`démarrage auto : l'état réel du système est « ${plan.autoLaunch ? 'activé' : 'désactivé'} » → l'écran s'aligne`);
