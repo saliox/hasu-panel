@@ -321,13 +321,16 @@ const pickCfgSource = (main, bak) => {
 };
 
 
-// ---------- Lancement au démarrage de Windows : repérer les doublons ----------
-// Electron nomme la valeur de la clé Run d'après l'AppUserModelId de l'application. Chaque fois que
-// cet identifiant a changé (com.saliox.hasupanel → hasu.panel), `setLoginItemSettings` a créé une
-// NOUVELLE valeur sans supprimer l'ancienne. Constaté sur cette machine : DEUX entrées lançant le
-// même exécutable, plus une tâche planifiée orpheline créée par une version depuis longtemps retirée.
-// Conséquence directe : l'interrupteur « Lancer au démarrage » ne pilote qu'UNE des trois — le
-// désactiver ne désactive rien, et le panel se lance quand même.
+// ---------- Lancement au démarrage de Windows ----------
+// En laissant Electron nommer notre valeur dans la clé Run, ce nom a dérivé : il suit `app.getName()`
+// aujourd'hui (`electron.app.HasuPanel`) et suivait l'AppUserModelId dans une version plus ancienne
+// (`com.saliox.hasupanel`). Chaque dérive a créé une NOUVELLE valeur sans supprimer l'ancienne.
+// Constaté sur cette machine : DEUX entrées lançant le même exécutable, plus une tâche planifiée
+// orpheline créée par une version depuis longtemps retirée du code. Conséquence directe :
+// l'interrupteur « Lancer au démarrage » n'en pilotait qu'UNE — le désactiver ne désactivait rien.
+//
+// On ne devine donc plus « laquelle est la nôtre » : on impose un nom constant et on l'écrit nous-mêmes.
+// Deviner était d'ailleurs pire que le mal — désigner la vivante comme orpheline l'aurait effacée.
 //
 // Analyse la sortie de `reg query …\\Run` : « <nom>    REG_SZ    <données> ».
 const parseRegQuery = (stdout) => {
@@ -339,14 +342,48 @@ const parseRegQuery = (stdout) => {
   return out;
 };
 
-// Valeurs à supprimer : celles qui lancent NOTRE exécutable sans être celle que gère Electron
-// aujourd'hui. On compare sur le chemin de l'exe, pas sur le nom : c'est le nom qui a dérivé.
-const orphanRunValues = (stdout, nomActuel, exe) => {
+// Le nom, fixe, de NOTRE valeur : écrit et relu par nous, jamais déduit d'une API dont la convention
+// de nommage peut changer d'une version d'Electron à l'autre. C'est ce qui referme la classe de bugs.
+const LOGIN_ITEM = 'HasuPanel';
+
+// Windows range les « désactivé » de Gestionnaire des tâches > Démarrage à côté, en binaire, indexés
+// sur le NOM de la valeur. Premier octet impair = désactivé (03, 07…), pair = actif (02, 06…).
+const parseStartupApproved = (stdout) => {
+  const m = new Map();
+  for (const v of parseRegQuery(stdout)) {
+    const premier = parseInt(String(v.data || '').trim().slice(0, 2), 16);
+    m.set(v.nom, Number.isNaN(premier) ? true : (premier & 1) === 0);
+  }
+  return m;
+};
+
+/**
+ * Décide, à partir du registre SEUL, ce qu'il faut écrire, ce qu'il faut effacer, et l'état à afficher.
+ * PURE : l'appelant fournit les deux sorties de `reg query` et exécute le plan.
+ *
+ * Nos entrées se reconnaissent au CHEMIN de l'exécutable, pas au nom : c'est le nom qui a dérivé.
+ * Quatre règles, dans cet ordre :
+ *  1. désactivé à la main dans Gestionnaire des tâches → on ne recrée RIEN, et l'écran le reflète ;
+ *  2. notre entrée est là → c'est activé, quoi qu'en dise une config revenue d'une sauvegarde ;
+ *  3. que des anciennes → migration : le réglage fait foi, et on écrit AVANT de purger (jamais de trou) ;
+ *  4. plus rien alors qu'on en avait posé une → retrait volontaire ailleurs, on le suit.
+ */
+const planLanceurs = ({ runOut = '', approvedOut = '', exe = '', autoLaunch = true, autoLaunchInit = true } = {}) => {
   const cible = String(exe || '').toLowerCase();
-  if (!cible) return [];
-  return parseRegQuery(stdout)
-    .filter((v) => v.nom !== nomActuel && v.data.toLowerCase().includes(cible))
-    .map((v) => v.nom);
+  const notres = cible ? parseRegQuery(runOut).filter((v) => v.data.toLowerCase().includes(cible)) : [];
+  const supprimer = notres.filter((v) => v.nom !== LOGIN_ITEM).map((v) => v.nom);
+  const present = notres.some((v) => v.nom === LOGIN_ITEM);
+  const approuve = parseStartupApproved(approvedOut);
+  const desactiveWindows = notres.length > 0 && notres.every((v) => approuve.get(v.nom) === false);
+
+  let etat;
+  if (desactiveWindows) etat = false;
+  else if (present) etat = true;
+  else if (supprimer.length) etat = !!autoLaunch;
+  else if (autoLaunchInit) etat = false;
+  else etat = !!autoLaunch;
+
+  return { ecrire: etat && !present, supprimer, autoLaunch: etat, nom: LOGIN_ITEM };
 };
 
 // ---------- Deux installations sur la même machine ----------
@@ -355,13 +392,6 @@ const orphanRunValues = (stdout, nomActuel, exe) => {
 // d'exister : elle se lance au démarrage et se met à jour de son côté, avec sa propre config.
 // Renvoie les installations trouvées AUTRES que celle qui tourne (comparaison insensible à la casse
 // et au sens des séparateurs, Windows acceptant les deux).
-// Purger les anciennes entrées de démarrage ne doit JAMAIS laisser l'utilisateur sans aucun lanceur :
-// si l'entrée au nom courant n'existe pas encore (le nom suit l'AppUserModelId, qui a changé), il faut
-// la reposer AVANT d'effacer les anciennes. Sauf si l'utilisateur les a toutes désactivées lui-même
-// dans Gestionnaire des tâches > Démarrage : là, recréer une entrée active irait contre son choix.
-const doitReposerLanceur = (stdout, nomActuel, autoLaunch, toutesDesactivees) =>
-  !!autoLaunch && !toutesDesactivees && !parseRegQuery(stdout).some((v) => v.nom === nomActuel);
-
 const autresInstallations = (chemins, exeActuel) => {
   const norm = (p) => String(p || '').replace(/\//g, '\\').toLowerCase();
   const moi = norm(exeActuel);
@@ -456,5 +486,5 @@ module.exports = {
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,
-  parseRegQuery, orphanRunValues, autresInstallations, doitReposerLanceur,
+  parseRegQuery, parseStartupApproved, planLanceurs, LOGIN_ITEM, autresInstallations,
 };

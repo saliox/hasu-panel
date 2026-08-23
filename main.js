@@ -118,7 +118,7 @@ const {
   hasEstablishedPublic, classifyErrorFr, decideAlert,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
-  orphanRunValues, autresInstallations, doitReposerLanceur, redactSensitive,
+  planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive,
 } = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
@@ -1559,23 +1559,13 @@ const restoreStartupDelay = () => {
     { windowsHide: true, timeout: 10000 }, () => {});
 };
 
+// Un seul chemin, celui de `reconcilerLanceurs` : écrire, purger et remettre l'écran d'accord se
+// décident ensemble, sur la même lecture du registre. Les faire séparément était précisément le bug —
+// l'interrupteur touchait une entrée pendant que deux autres continuaient de lancer le panel.
+// `fromToggle` : l'utilisateur vient de cliquer, son choix l'emporte sur ce que dit le système.
 const applyAutoLaunch = (fromToggle = false) => {
   if (!app.isPackaged) return; // en dev, ne pas enregistrer electron.exe
-  const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
-  if (fromToggle || !cfg.autoLaunchInit) {
-    // Bascule EXPLICITE (panel) ou 1er lancement → on (dé)pose la clé Run (HKCU, sans admin, nettoyée à la désinstallation).
-    app.setLoginItemSettings({ openAtLogin: !!cfg.autoLaunch, path: exe, args: ['--hidden', '--startup'] });
-    cfg.autoLaunchInit = true; saveCfg();
-    // L'interrupteur doit piloter TOUS les lanceurs. Sans ca, le desactiver ne retirait que la
-    // valeur Run courante : le panel se relancait quand meme via la tache planifiee et via l'entree
-    // heritee d'un ancien AppUserModelId. C'est le « ca ne marche pas vraiment » signale.
-    purgerLanceursEnDouble();
-  } else {
-    // Lancements suivants : l'OS fait foi → on respecte un « désactivé » fait dans Gestionnaire des tâches
-    // > Démarrage (avant, on ré-imposait openAtLogin=true à chaque démarrage, écrasant le choix de l'user).
-    try { const st = app.getLoginItemSettings(); if (typeof st.openAtLogin === 'boolean' && st.openAtLogin !== cfg.autoLaunch) { cfg.autoLaunch = st.openAtLogin; saveCfg(); } } catch {}
-  }
-  if (cfg.autoLaunch) disableStartupDelay(); else restoreStartupDelay();
+  reconcilerLanceurs(fromToggle ? !!cfg.autoLaunch : null);
 };
 
 // ---------- Rich Presence Discord ----------
@@ -1669,62 +1659,77 @@ const updateTray = () => {
 
 
 // ---------- Un seul lanceur, une seule installation ----------
-// PROBLÈME CONSTATÉ sur la machine : trois lanceurs au démarrage pour une seule application —
-// deux valeurs dans la clé Run (Electron la nomme d'après l'AppUserModelId, qui a changé en cours
-// de route, créant un doublon) et une tâche planifiée « HasuPanel » créée par une version depuis
-// longtemps retirée du code. L'interrupteur « Lancer au démarrage » ne pilote que la valeur
-// courante : le désactiver laissait donc les deux autres lancer le panel quand même.
-// On fait le ménage à chaque démarrage — c'est peu coûteux et ça se répare tout seul chez ceux qui
-// ont déjà des orphelines.
+// PROBLÈME CONSTATÉ sur la machine : trois lanceurs au démarrage pour une seule application — deux
+// valeurs dans la clé Run et une tâche planifiée « HasuPanel » créée par une version depuis longtemps
+// retirée du code. Les deux valeurs viennent de ce qu'on laissait Electron NOMMER la nôtre : ce nom
+// suit `app.getName()` aujourd'hui et suivait l'AppUserModelId hier, donc il a dérivé deux fois, sans
+// jamais nettoyer derrière lui. L'interrupteur ne pilotait que la dernière : le désactiver ne
+// désactivait rien de visible. C'est le « ça ne marche pas vraiment » signalé.
+//
+// On ne demande donc plus à Electron de gérer ça. Un nom constant (`LOGIN_ITEM`), écrit et relu par
+// nous : le nom ne peut plus dériver, et « laquelle est la nôtre » n'est plus une devinette.
 const REG_RUN = String.raw`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`;
-// L'AppUserModelId ne sert pas qu'aux notifications : Electron NOMME la valeur Run d'après lui. Chaque
-// fois qu'il a changé, une entrée de démarrage de plus est restée derrière, que l'interrupteur ne pilotait
-// plus. Une seule définition, ici, utilisée AUSSI pour savoir laquelle des entrées est la nôtre.
-const AUMID = app.isPackaged ? 'hasu.panel' : 'com.saliox.hasupanel';
+const REG_APPROVED = String.raw`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run`;
+const regLire = (cle) => new Promise((res) => {
+  execFile(SYS('reg.exe'), ['query', cle], { windowsHide: true, timeout: 10000 }, (err, out) => res(err ? '' : out));
+});
+const regEcrire = (nom, data) => new Promise((res) => {
+  execFile(SYS('reg.exe'), ['add', REG_RUN, '/v', nom, '/t', 'REG_SZ', '/d', data, '/f'],
+    { windowsHide: true, timeout: 10000 }, (err) => res(!err));
+});
+const regSupprimer = (nom) => new Promise((res) => {
+  execFile(SYS('reg.exe'), ['delete', REG_RUN, '/v', nom, '/f'], { windowsHide: true, timeout: 10000 }, (err) => res(!err));
+});
 
-const purgerLanceursEnDouble = () => {
-  if (process.platform !== 'win32' || !app.isPackaged) return;
-  // Le même chemin que celui posé par `applyAutoLaunch` : sinon la comparaison ne reconnaît pas nos
-  // propres entrées et la purge ne trouve rien.
-  const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
-  // 1) la tâche planifiée orpheline : plus aucun code ne la crée ni ne la pilote.
-  execFile(SYS('schtasks.exe'), ['/Query', '/TN', 'HasuPanel'], { windowsHide: true, timeout: 10000 }, (err) => {
-    if (err) return; // elle n'existe pas : rien à faire
-    execFile(SYS('schtasks.exe'), ['/Delete', '/TN', 'HasuPanel', '/F'], { windowsHide: true, timeout: 10000 }, (e2) => {
-      log(e2 ? 'tâche planifiée orpheline : suppression impossible — ' + e2.message
-            : 'tâche planifiée orpheline supprimée (elle lançait le panel en double au démarrage)');
-    });
-  });
-  // 2) les valeurs Run laissées par un ancien AppUserModelId.
-  execFile(SYS('reg.exe'), ['query', REG_RUN], { windowsHide: true, timeout: 10000 }, (err, out) => {
-    if (err) return;
-    // La nôtre est celle qui porte l'AppUserModelId courant. Surtout PAS `launchItems[0]` : cette liste
-    // contient justement les orphelines, dans l'ordre du registre — on effacerait la bonne au hasard.
-    const orphelines = orphanRunValues(out, AUMID, exe);
-    if (!orphelines.length) return;
-    // Désactivation faite à la main dans Gestionnaire des tâches > Démarrage : Windows garde la valeur
-    // Run et pose un drapeau à côté. On ne contourne pas ce choix en recréant une entrée active.
-    let toutesDesactivees = false;
-    try {
-      const items = (app.getLoginItemSettings().launchItems || [])
-        .filter((i) => String(i.path || '').replace(/^"|"$/g, '').toLowerCase() === exe.toLowerCase());
-      toutesDesactivees = items.length > 0 && items.every((i) => i.enabled === false);
-    } catch {}
-    if (doitReposerLanceur(out, AUMID, cfg.autoLaunch, toutesDesactivees)) {
-      // Jamais de trou : on repose l'entrée courante AVANT d'effacer les anciennes, sinon la purge
-      // laisserait le panel sans aucun lanceur alors que l'interrupteur dit « activé ».
-      try {
-        app.setLoginItemSettings({ openAtLogin: true, path: exe, args: ['--hidden', '--startup'] });
-        log('entrée de démarrage reposée sous son nom actuel avant la purge');
-      } catch (e) { log('entrée de démarrage : impossible de la reposer —', e.message); return; }
+// Un seul point d'entrée pour tout ce qui touche au démarrage automatique : lecture du registre,
+// écriture, purge et remise en accord de l'écran. Sérialisé, car deux passes concurrentes (démarrage
+// + bascule de l'interrupteur) écrivaient et effaçaient la même valeur en même temps.
+let reconcileEnCours = null;
+const reconcilerLanceurs = (forcer = null) => {
+  if (process.platform !== 'win32' || !app.isPackaged) return Promise.resolve();
+  if (reconcileEnCours) return reconcileEnCours.then(() => reconcilerLanceurs(forcer));
+  reconcileEnCours = (async () => {
+    const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+    if (forcer !== null) { cfg.autoLaunch = !!forcer; cfg.autoLaunchInit = true; saveCfg(); }
+    const [runOut, approvedOut] = await Promise.all([regLire(REG_RUN), regLire(REG_APPROVED)]);
+    // Sur une bascule explicite, le réglage l'emporte : pas de « l'OS fait foi », c'est l'utilisateur
+    // qui vient de cliquer. Sinon on lit ce que le registre raconte vraiment.
+    const plan = forcer !== null
+      ? { nom: LOGIN_ITEM, ecrire: !!forcer, autoLaunch: !!forcer,
+          supprimer: planLanceurs({ runOut, approvedOut, exe }).supprimer.concat(forcer ? [] : [LOGIN_ITEM]) }
+      : planLanceurs({ runOut, approvedOut, exe, autoLaunch: cfg.autoLaunch, autoLaunchInit: cfg.autoLaunchInit });
+
+    // TOUJOURS écrire avant de purger : l'inverse laisse une fenêtre où plus aucun lanceur n'existe.
+    if (plan.ecrire) {
+      const ok = await regEcrire(plan.nom, `"${exe}" --hidden --startup`);
+      log(ok ? `démarrage auto : entrée « ${plan.nom} » posée` : `démarrage auto : écriture de « ${plan.nom} » IMPOSSIBLE`);
+      if (!ok) return; // on ne purge pas à l'aveugle : mieux vaut un doublon qu'aucun lanceur
     }
-    for (const nom of orphelines) {
-      execFile(SYS('reg.exe'), ['delete', REG_RUN, '/v', nom, '/f'], { windowsHide: true, timeout: 10000 }, (e2) => {
-        log(e2 ? `entrée de démarrage en double « ${nom} » : suppression impossible — ${e2.message}`
-              : `entrée de démarrage en double supprimée : « ${nom} » (elle lançait le panel une 2e fois)`);
+    for (const nom of plan.supprimer) {
+      const ok = await regSupprimer(nom);
+      log(ok ? `entrée de démarrage en double supprimée : « ${nom} »`
+             : `entrée de démarrage « ${nom} » : suppression impossible`);
+    }
+    if (plan.autoLaunch !== cfg.autoLaunch) {
+      log(`démarrage auto : l'état réel du système est « ${plan.autoLaunch ? 'activé' : 'désactivé'} » → l'écran s'aligne`);
+      cfg.autoLaunch = plan.autoLaunch;
+    }
+    if (!cfg.autoLaunchInit) cfg.autoLaunchInit = true;
+    saveCfg();
+    if (cfg.autoLaunch) disableStartupDelay(); else restoreStartupDelay();
+
+    // La tâche planifiée orpheline : plus aucun code ne la crée ni ne la pilote, elle lançait juste
+    // le panel une fois de plus.
+    execFile(SYS('schtasks.exe'), ['/Query', '/TN', 'HasuPanel'], { windowsHide: true, timeout: 10000 }, (err) => {
+      if (err) return; // absente : rien à faire
+      execFile(SYS('schtasks.exe'), ['/Delete', '/TN', 'HasuPanel', '/F'], { windowsHide: true, timeout: 10000 }, (e2) => {
+        log(e2 ? 'tâche planifiée orpheline : suppression impossible — ' + e2.message
+              : 'tâche planifiée orpheline supprimée (elle lançait le panel en double au démarrage)');
       });
-    }
-  });
+    });
+  })().catch((e) => log('démarrage auto : réconciliation échouée —', e.message))
+    .finally(() => { reconcileEnCours = null; });
+  return reconcileEnCours;
 };
 
 // Une seconde installation du panel sur le même PC se lance au démarrage, se met à jour de son côté
@@ -2249,8 +2254,7 @@ else {
     cfg = loadCfg();
     hydrateRuntime(); // reprend les alertes suivies et les relances en cours d'avant le redémarrage
     setLang(cfg.lang); // le menu du tray et les alertes suivent la langue choisie dans la fenêtre
-    purgerLanceursEnDouble();   // un seul lanceur au démarrage, pas trois
-    detecterSecondeInstallation();
+    detecterSecondeInstallation(); // (le ménage des lanceurs, lui, se fait dans `applyAutoLaunch` plus bas)
     resolvePm2Runner(); // node.exe + pm2/bin/pm2 → appels pm2 sans cmd.exe (zéro process fantôme)
     // Sans AppUserModelId, Windows 10/11 n'affiche AUCUNE notification d'une app Electron.
     // DOIT être identique au `build.appId` du package.json ('hasu.panel') : c'est cet identifiant que
@@ -2258,7 +2262,7 @@ else {
     // et le bouton « Tester » répond quand même « envoyé » (l'API Electron, elle, ne se plaint pas).
     // ⚠️ Ne PAS « corriger » l'inverse en changeant build.appId : ça déplacerait %APPDATA%\hasu-panel
     // et ferait perdre leurs réglages à toutes les installations existantes.
-    try { app.setAppUserModelId(AUMID); } catch {}
+    try { app.setAppUserModelId(app.isPackaged ? 'hasu.panel' : 'com.saliox.hasupanel'); } catch {}
     // Au réveil du PC, tout paraît « tombé » quelques instants (réseau pas encore revenu) → on se tait
     // le temps que la machine se remette, sinon rafale d'alertes bidon à chaque sortie de veille.
     try { powerMonitor.on('resume', () => { quietUntil = Date.now() + ALERT_QUIET_RESUME_MS; log('réveil PC → alertes en silence 2 min'); }); } catch {}

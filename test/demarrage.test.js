@@ -3,25 +3,33 @@
 // POURQUOI CE FICHIER : sur la machine de développement, TROIS lanceurs démarraient le panel pour une
 // seule application — deux valeurs dans la clé Run et une tâche planifiée orpheline. L'interrupteur
 // « Lancer au démarrage » n'en pilotait qu'une : le désactiver ne désactivait rien, et le panel se
-// relançait quand même. Ces tests figent les règles de purge, car une purge trop large supprimerait
-// les entrées de démarrage d'AUTRES logiciels — c'est un registre partagé.
+// relançait quand même. La cause : on laissait Electron nommer notre valeur, et ce nom a dérivé deux
+// fois (AppUserModelId, puis app.getName()). Le panel impose désormais un nom constant.
+//
+// Ces tests figent DEUX invariants qui ont chacun déjà été violés :
+//   1. on ne supprime jamais l'entrée de démarrage d'un AUTRE logiciel — la clé Run est partagée ;
+//   2. on ne laisse jamais zéro lanceur alors que l'interrupteur dit « activé ».
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseRegQuery, orphanRunValues, autresInstallations, doitReposerLanceur } = require('../logic');
 const fs = require('node:fs');
 const path = require('node:path');
+const { parseRegQuery, parseStartupApproved, planLanceurs, LOGIN_ITEM, autresInstallations } = require('../logic');
 
 // Sortie réelle de `reg query HKCU\…\Run` relevée sur la machine (chemins raccourcis).
 const EXE = 'C:\\Users\\moi\\AppData\\Local\\Programs\\hasu-panel\\HasuPanel.exe';
+const ligne = (nom, data) => `    ${nom}    REG_SZ    ${data}`;
 const SORTIE = [
   '',
   'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run',
-  `    electron.app.HasuPanel    REG_SZ    ${EXE} --hidden --startup`,
-  `    com.saliox.hasupanel    REG_SZ    ${EXE} --hidden --startup`,
-  '    Discord    REG_SZ    "C:\\Users\\moi\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe',
-  '    Steam    REG_SZ    "C:\\Program Files (x86)\\Steam\\steam.exe" -silent',
+  ligne('electron.app.HasuPanel', `${EXE} --hidden --startup`),
+  ligne('com.saliox.hasupanel', `${EXE} --hidden --startup`),
+  ligne('Discord', '"C:\\Users\\moi\\AppData\\Local\\Discord\\Update.exe" --processStart Discord.exe'),
+  ligne('Steam', '"C:\\Program Files (x86)\\Steam\\steam.exe" -silent'),
   '',
 ].join('\n');
+const A_JOUR = [SORTIE, ligne(LOGIN_ITEM, `"${EXE}" --hidden --startup`)].join('\n');
+const SEULEMENT_NOUS = ['', ligne(LOGIN_ITEM, `"${EXE}" --hidden --startup`), ''].join('\n');
+const RIEN_A_NOUS = ['', ligne('Discord', 'C:\\Discord\\Update.exe'), ''].join('\n');
 
 test('parseRegQuery : lit nom et données, y compris avec espaces et guillemets', () => {
   const v = parseRegQuery(SORTIE);
@@ -34,32 +42,119 @@ test('parseRegQuery : entrée vide ou illisible ne plante pas', () => {
   for (const bad of ['', null, undefined, 'ERREUR : accès refusé']) assert.deepEqual(parseRegQuery(bad), []);
 });
 
-test('orphanRunValues : supprime le doublon, JAMAIS l\'entrée courante', () => {
-  // Le doublon vient d'un ancien AppUserModelId : Electron nomme la valeur d'après lui, donc chaque
-  // changement d'identifiant en créait une nouvelle sans retirer l'ancienne.
-  assert.deepEqual(orphanRunValues(SORTIE, 'electron.app.HasuPanel', EXE), ['com.saliox.hasupanel']);
-  // …et si c'est l'autre qui est la courante, c'est l'autre qu'on garde.
-  assert.deepEqual(orphanRunValues(SORTIE, 'com.saliox.hasupanel', EXE), ['electron.app.HasuPanel']);
+// ---------- parseStartupApproved ----------
+test('parseStartupApproved : octet pair = actif, impair = désactivé', () => {
+  const out = [
+    ligne('HasuPanel', '0200000000000000000000000000000000000000000000000000000000000000'), // REG_BINARY
+    ligne('Steam', '030000000000000000000000'),
+    ligne('Discord', '06000000'),
+    ligne('Autre', '07000000'),
+  ].join('\n');
+  const m = parseStartupApproved(out);
+  assert.equal(m.get('HasuPanel'), true);
+  assert.equal(m.get('Steam'), false);
+  assert.equal(m.get('Discord'), true);
+  assert.equal(m.get('Autre'), false);
 });
 
-test('orphanRunValues : ne touche JAMAIS au démarrage des autres logiciels', () => {
-  // Le registre Run est partagé : une purge trop large casserait le démarrage de Discord ou de Steam.
-  const cibles = orphanRunValues(SORTIE, 'electron.app.HasuPanel', EXE);
-  assert.equal(cibles.includes('Discord'), false);
-  assert.equal(cibles.includes('Steam'), false);
+test('parseStartupApproved : données illisibles → on suppose actif (jamais de faux « désactivé »)', () => {
+  // Se tromper dans ce sens ne fait que laisser le démarrage tel quel. Se tromper dans l'autre
+  // couperait le démarrage automatique de quelqu'un qui ne l'a jamais demandé.
+  const m = parseStartupApproved([ligne('X', 'zz'), ligne('Y', ' ')].join('\n'));
+  assert.equal(m.get('X'), true);
+  assert.equal(m.get('Y'), true);
+  assert.deepEqual([...parseStartupApproved('').keys()], []);
 });
 
-test('orphanRunValues : sans chemin d\'exécutable, on ne supprime RIEN', () => {
-  // Une valeur vide rendrait `includes('')` vrai pour TOUTE entrée : on effacerait tout le démarrage
-  // de la session. La garde est là pour ça.
-  for (const bad of ['', null, undefined]) assert.deepEqual(orphanRunValues(SORTIE, 'x', bad), []);
+// ---------- planLanceurs ----------
+test('planLanceurs : migration — on écrit la nôtre AVANT de purger les anciennes', () => {
+  // Cas exact de la machine : les deux entrées présentes sont des orphelines, aucune n'est la nôtre.
+  const p = planLanceurs({ runOut: SORTIE, exe: EXE, autoLaunch: true, autoLaunchInit: true });
+  assert.equal(p.ecrire, true, 'sans ça, la purge laissait le PC sans aucun lanceur');
+  assert.deepEqual(p.supprimer, ['electron.app.HasuPanel', 'com.saliox.hasupanel']);
+  assert.equal(p.autoLaunch, true);
+  assert.equal(p.nom, LOGIN_ITEM);
 });
 
-test('orphanRunValues : comparaison insensible à la casse', () => {
-  const sortie = `    vieux    REG_SZ    ${EXE.toUpperCase()} --hidden`;
-  assert.deepEqual(orphanRunValues(sortie, 'electron.app.HasuPanel', EXE.toLowerCase()), ['vieux']);
+test('planLanceurs : ne touche JAMAIS au démarrage des autres logiciels', () => {
+  // La clé Run est partagée : une purge trop large casserait le démarrage de Discord ou de Steam.
+  const p = planLanceurs({ runOut: SORTIE, exe: EXE, autoLaunch: true });
+  assert.equal(p.supprimer.includes('Discord'), false);
+  assert.equal(p.supprimer.includes('Steam'), false);
 });
 
+test('planLanceurs : sans chemin d\'exécutable, on ne supprime RIEN', () => {
+  // Une cible vide rendrait `includes('')` vrai pour TOUTE entrée : on effacerait tout le démarrage
+  // de la session. C'est la garde la plus importante du fichier.
+  for (const bad of ['', null, undefined]) {
+    const p = planLanceurs({ runOut: SORTIE, exe: bad, autoLaunch: true });
+    assert.deepEqual(p.supprimer, []);
+  }
+  assert.deepEqual(planLanceurs().supprimer, []);
+});
+
+test('planLanceurs : régime établi — rien à faire', () => {
+  const p = planLanceurs({ runOut: SEULEMENT_NOUS, exe: EXE, autoLaunch: true });
+  assert.deepEqual(p, { ecrire: false, supprimer: [], autoLaunch: true, nom: LOGIN_ITEM });
+});
+
+test('planLanceurs : notre entrée existe → l\'écran dit « activé », même si la config dit non', () => {
+  // Une config restaurée depuis une sauvegarde peut mentir. Le registre, lui, décrit ce qui va
+  // RÉELLEMENT se passer au prochain démarrage : c'est lui qui fait foi.
+  const p = planLanceurs({ runOut: SEULEMENT_NOUS, exe: EXE, autoLaunch: false });
+  assert.equal(p.autoLaunch, true);
+  assert.equal(p.ecrire, false);
+});
+
+test('planLanceurs : purge des anciennes une fois la nôtre en place', () => {
+  const p = planLanceurs({ runOut: A_JOUR, exe: EXE, autoLaunch: true });
+  assert.equal(p.ecrire, false, 'elle est déjà là : ne pas réécrire à chaque démarrage');
+  assert.deepEqual(p.supprimer, ['electron.app.HasuPanel', 'com.saliox.hasupanel']);
+});
+
+test('planLanceurs : désactivé à la main dans Gestionnaire des tâches → on respecte', () => {
+  // Windows garde la valeur Run et pose un drapeau à côté, indexé sur le NOM. Recréer une entrée sous
+  // un autre nom repartirait de zéro : elle serait active. C'est un contournement, pas une réparation.
+  const approvedOut = ligne(LOGIN_ITEM, '030000000000000000000000');
+  const p = planLanceurs({ runOut: SEULEMENT_NOUS, approvedOut, exe: EXE, autoLaunch: true });
+  assert.equal(p.ecrire, false);
+  assert.equal(p.autoLaunch, false, 'et l\'écran doit le montrer, sinon il ment');
+});
+
+test('planLanceurs : une seule des entrées désactivée ne suffit pas', () => {
+  // Si une orpheline est désactivée mais que la nôtre est active, le panel démarre bel et bien.
+  const approvedOut = ligne('com.saliox.hasupanel', '030000000000000000000000');
+  const p = planLanceurs({ runOut: A_JOUR, approvedOut, exe: EXE, autoLaunch: true });
+  assert.equal(p.autoLaunch, true);
+  assert.deepEqual(p.supprimer, ['electron.app.HasuPanel', 'com.saliox.hasupanel']);
+});
+
+test('planLanceurs : entrée retirée de l\'extérieur → l\'écran suit, on ne la recrée pas', () => {
+  const p = planLanceurs({ runOut: RIEN_A_NOUS, exe: EXE, autoLaunch: true, autoLaunchInit: true });
+  assert.equal(p.autoLaunch, false);
+  assert.equal(p.ecrire, false, 'la réimposer à chaque démarrage écraserait le choix de l\'utilisateur');
+});
+
+test('planLanceurs : tout premier lancement → on pose l\'entrée', () => {
+  const p = planLanceurs({ runOut: RIEN_A_NOUS, exe: EXE, autoLaunch: true, autoLaunchInit: false });
+  assert.equal(p.ecrire, true);
+  assert.equal(p.autoLaunch, true);
+});
+
+test('planLanceurs : premier lancement avec démarrage refusé → on n\'écrit rien', () => {
+  const p = planLanceurs({ runOut: RIEN_A_NOUS, exe: EXE, autoLaunch: false, autoLaunchInit: false });
+  assert.equal(p.ecrire, false);
+  assert.equal(p.autoLaunch, false);
+});
+
+test('planLanceurs : casse et guillemets ne masquent pas nos entrées', () => {
+  // Windows ignore la casse et le chemin est tantôt entre guillemets, tantôt nu selon qui l'a écrit.
+  const out = [ligne('vieux', `"${EXE.toUpperCase()}" --hidden`), ligne('autre', EXE.toLowerCase())].join('\n');
+  const p = planLanceurs({ runOut: out, exe: EXE, autoLaunch: true });
+  assert.deepEqual(p.supprimer, ['vieux', 'autre']);
+});
+
+// ---------- Deux installations ----------
 test('autresInstallations : ne signale pas celle qui tourne', () => {
   const moi = 'C:\\Users\\moi\\AppData\\Local\\Programs\\hasu-panel\\HasuPanel.exe';
   const autre = 'C:\\Program Files\\HasuPanel\\HasuPanel.exe';
@@ -84,63 +179,20 @@ test('autresInstallations : liste vide ou nulle', () => {
   assert.deepEqual(autresInstallations([null, undefined, ''], 'x'), []);
 });
 
-// ---------- Ne jamais laisser l'utilisateur sans aucun lanceur ----------
-// La purge efface les entrées portant un ANCIEN nom. Si l'entrée au nom courant n'a jamais été écrite
-// (c'est le cas exact ici : le nom a suivi l'AppUserModelId), purger sans reposer d'abord la bonne
-// coupait le démarrage automatique alors que l'interrupteur affichait « activé ».
-const EXE2 = 'C:\\Users\\moi\\AppData\\Local\\Programs\\hasu-panel\\HasuPanel.exe';
-const SANS_COURANTE = [
-  `    electron.app.HasuPanel    REG_SZ    ${EXE2} --hidden --startup`,
-  `    com.saliox.hasupanel    REG_SZ    ${EXE2} --hidden --startup`,
-].join('\n');
-const AVEC_COURANTE = SANS_COURANTE + `\n    hasu.panel    REG_SZ    ${EXE2} --hidden --startup`;
-
-test('doitReposerLanceur : entrée courante absente + démarrage voulu → on la repose', () => {
-  assert.equal(doitReposerLanceur(SANS_COURANTE, 'hasu.panel', true, false), true);
+// ---------- Invariants de code ----------
+test('plus personne ne laisse Electron nommer l\'entrée de démarrage', () => {
+  // C'est LA cause du bug d'origine : `setLoginItemSettings` nomme la valeur Run d'après une convention
+  // interne d'Electron, qui a déjà changé deux fois. Chaque changement = un lanceur de plus, hors de
+  // portée de l'interrupteur. Le panel écrit désormais sa valeur lui-même, sous un nom constant.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.equal(/setLoginItemSettings/.test(src), false, 'utiliser reg.exe avec LOGIN_ITEM à la place');
+  assert.equal(/getLoginItemSettings/.test(src), false, 'l\'état se lit dans le registre, pas via Electron');
 });
 
-test('doitReposerLanceur : entrée courante déjà là → rien à reposer', () => {
-  assert.equal(doitReposerLanceur(AVEC_COURANTE, 'hasu.panel', true, false), false);
-});
-
-test('doitReposerLanceur : démarrage désactivé → on ne recrée jamais rien', () => {
-  // Sinon la purge RÉACTIVERAIT le démarrage automatique que l'utilisateur venait de couper.
-  assert.equal(doitReposerLanceur(SANS_COURANTE, 'hasu.panel', false, false), false);
-});
-
-test('doitReposerLanceur : désactivé à la main dans Gestionnaire des tâches → on respecte', () => {
-  // Windows garde la valeur Run et pose un drapeau « désactivé » à côté, indexé sur le NOM de la valeur.
-  // Recréer une entrée sous un autre nom repartirait de zéro : elle serait active. C'est un contournement
-  // du choix de l'utilisateur, pas une réparation.
-  assert.equal(doitReposerLanceur(SANS_COURANTE, 'hasu.panel', true, true), false);
-});
-
-test('doitReposerLanceur : registre illisible → on ne repose pas à l\'aveugle', () => {
-  // Une sortie vide ferait croire « aucune entrée courante » et déclencherait une écriture registre
-  // gratuite à chaque démarrage. Ici il n'y a de toute façon rien à purger, donc rien à compenser.
-  assert.equal(doitReposerLanceur('', 'hasu.panel', true, false), true);
-  assert.equal(orphanRunValues('', 'hasu.panel', EXE2).length, 0, 'et surtout : rien à supprimer');
-});
-
-// ---------- Invariant : un seul identifiant nomme l'entrée de démarrage ----------
-test('AUMID packagé == build.appId (sinon : entrée de démarrage orpheline + zéro notification)', () => {
-  // C'est LA cause du bug d'origine. Electron nomme la valeur Run d'après l'AppUserModelId ; Windows
-  // associe les notifications au même identifiant, qui doit être celui du raccourci installé (build.appId).
-  // Un écart ici crée un lanceur de plus à chaque version et coupe les toasts, sans le moindre message.
-  const racine = path.join(__dirname, '..');
-  const src = fs.readFileSync(path.join(racine, 'main.js'), 'utf8');
-  const pkg = JSON.parse(fs.readFileSync(path.join(racine, 'package.json'), 'utf8'));
-  const m = src.match(/const AUMID = app\.isPackaged \? '([^']+)'/);
-  assert.ok(m, 'la constante AUMID doit rester le SEUL endroit qui décide de cet identifiant');
-  assert.equal(m[1], pkg.build.appId);
-  assert.equal(/setAppUserModelId\(/.test(src), true);
-  assert.equal(src.match(/setAppUserModelId\(/g).length, 1, 'un seul appel : deux valeurs = deux lanceurs');
-});
-
-test('l\'identité de désinstallation est figée (deux entrées dans Applications, sinon)', () => {
-  // Sans GUID épinglé, electron-builder le dérive de appId+productName : le jour où l'un des deux bouge,
-  // l'installeur écrit une NOUVELLE entrée de désinstallation au lieu de remplacer l'ancienne — et le PC
-  // se retrouve avec deux panels installés. Cette valeur est celle déjà posée sur les machines existantes.
+test('l\'identité de désinstallation est figée (sinon : deux entrées dans Applications)', () => {
+  // Sans GUID épinglé, electron-builder le dérive de appId + productName : le jour où l'un des deux
+  // bouge, l'installeur écrit une NOUVELLE entrée de désinstallation au lieu de remplacer l'ancienne,
+  // et le PC se retrouve avec deux panels installés. Cette valeur est celle déjà posée sur les machines.
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
   assert.equal(pkg.build.nsis.guid, '281f63ab-643c-53f0-8742-2f555b7705f7');
   assert.equal(pkg.build.nsis.perMachine, false, 'per-user : une install par session, sans admin');
