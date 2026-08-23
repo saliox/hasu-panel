@@ -133,6 +133,29 @@ test('pickCfgSource : contenus DIFFÉRENTS à date égale → on tranche quand m
   assert.match(r.warn, /périmé/);
 });
 
+test('pickCfgSource : un fichier principal MASQUÉ reste détecté — la sortie « identiques » ne le couvre pas', () => {
+  // LE scénario de la panne de juillet, établi par l'enquête : le fichier principal cesse d'être écrit
+  // (il est masqué par une couche de virtualisation) et se fige, pendant que le .bak continue d'avancer.
+  // L'avertissement est alors VRAI, et c'est le seul témoin — il ne doit surtout pas être étouffé.
+  //
+  // La sortie anticipée « contenus identiques » ne peut PAS le couvrir : le compteur fait partie du
+  // contenu, donc dès qu'un enregistrement est perdu les deux copies diffèrent forcément, ne serait-ce
+  // que par lui. C'est ce que ce test verrouille.
+  const gele = { _seq: 10, webhook: 'ancien', alerts: false };
+  const frais = { _seq: 57, webhook: 'a-jour', alerts: true };
+  const r = pickCfgSource({ ok: true, raw: gele, mtime: 1000 }, { ok: true, raw: frais, mtime: 2000 });
+  assert.equal(r.source, 'bak', 'les réglages à jour doivent être chargés');
+  assert.ok(r.warn, 'et la panne doit rester signalée');
+  assert.equal(r.raw.webhook, 'a-jour');
+  assert.equal(r.seq, 57, 'le prochain enregistrement passe devant les deux → il réaligne le principal');
+
+  // Même figé, si SEULE la date diffère et que le contenu est au même octet près, il n'y a rien à
+  // signaler : les deux copies portent le même enregistrement, aucun réglage n'est en retard.
+  const memeSauvegarde = { _seq: 10, webhook: 'ancien', alerts: false };
+  const q = pickCfgSource({ ok: true, raw: gele, mtime: 1000 }, { ok: true, raw: memeSauvegarde, mtime: 9999 });
+  assert.equal(q.warn, undefined);
+});
+
 test('pickCfgSource : le compteur remonte même quand une seule copie est lisible', () => {
   // Sinon un enregistrement fait après un .bak illisible repartirait de zéro, donc DERRIÈRE la copie
   // qu'on vient de lire — et le choix suivant redeviendrait arbitraire.
