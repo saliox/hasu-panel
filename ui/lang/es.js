@@ -115,6 +115,8 @@
     'heal.hint': 'Cuando pm2 ha agotado sus propios reinicios, el bot se queda muerto hasta que te das cuenta. El panel lo reintenta por ti y luego <b>se detiene al cabo de 3 intentos</b>: un bot que se niega a volver tres veces tiene un problema de verdad, y el aviso debe seguir a la vista. Nunca toca un bot que has parado <b>tú</b>, ni uno parado por el modo juego.',
     'inc.title': '📓 Últimos incidentes',
     'inc.none': 'Ningún incidente registrado. Buena señal.',
+    'dual.title': 'Dos instalaciones del panel en este PC',
+    'dual.body': 'Existe otra instalación: {path}. Las dos se inician con Windows y se actualizan por su cuenta. Desinstala la que no quieras (Configuración → Aplicaciones).',
     'cfg.failTitle': 'Tus ajustes ya no se guardan',
     'cfg.failBody': 'Se conservan en una copia de seguridad y siguen activos, pero el archivo principal no se deja escribir.',
     'cfg.failWhy': 'Archivo: {path} — revisa el antivirus, la sincronización de una carpeta o un disco lleno.',

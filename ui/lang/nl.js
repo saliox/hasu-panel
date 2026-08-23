@@ -115,6 +115,8 @@
     'heal.hint': 'Zodra pm2 zijn eigen herstarts heeft opgebruikt, blijft de bot dood tot jij het toevallig merkt. Het panel probeert het in jouw plaats, en <b>stopt na 3 pogingen</b>: een bot die er drie keer niet in slaagt terug te komen heeft een echt probleem, en de melding moet zichtbaar blijven. Het raakt nooit een bot aan die <b>jij</b> hebt gestopt, en ook geen bot die door de gamemodus is gestopt.',
     'inc.title': '📓 Recente incidenten',
     'inc.none': 'Geen incident geregistreerd. Dat is een goed teken.',
+    'dual.title': 'Twee installaties van het panel op deze pc',
+    'dual.body': 'Er bestaat nog een installatie: {path}. Allebei starten ze met Windows en werken ze zichzelf apart bij. Verwijder degene die je niet wilt (Instellingen → Apps).',
     'cfg.failTitle': 'Je instellingen worden niet meer opgeslagen',
     'cfg.failBody': 'Ze staan in een reservekopie en blijven actief, maar er kan niet meer naar het hoofdbestand worden geschreven.',
     'cfg.failWhy': 'Bestand: {path} — kijk naar je antivirus, een mapsynchronisatie of een volle schijf.',

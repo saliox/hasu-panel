@@ -115,6 +115,8 @@
     'heal.hint': 'Wenn pm2 seine eigenen Neustarts aufgebraucht hat, bleibt der Bot tot, bis es dir auffällt. Das Panel versucht es für dich, <b>hört aber nach 3 Versuchen auf</b>: Ein Bot, der dreimal nicht zurückkommt, hat ein echtes Problem, und der Alarm muss sichtbar bleiben. Einen Bot, den <b>du</b> gestoppt hast, rührt es nie an — genauso wenig einen, den der Spielmodus gestoppt hat.',
     'inc.title': '📓 Letzte Vorfälle',
     'inc.none': 'Kein Vorfall aufgezeichnet. Ein gutes Zeichen.',
+    'dual.title': 'Zwei Installationen des Panels auf diesem PC',
+    'dual.body': 'Es gibt eine weitere Installation: {path}. Beide starten mit Windows und aktualisieren sich getrennt. Deinstalliere die, die du nicht willst (Einstellungen → Apps).',
     'cfg.failTitle': 'Deine Einstellungen werden nicht mehr gespeichert',
     'cfg.failBody': 'Sie liegen in einer Sicherungskopie und bleiben aktiv, aber in die Hauptdatei lässt sich nicht mehr schreiben.',
     'cfg.failWhy': 'Datei: {path} — schau beim Virenscanner, bei einer Ordner-Synchronisierung oder bei einer vollen Festplatte nach.',

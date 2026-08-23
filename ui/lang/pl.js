@@ -115,6 +115,8 @@
     'heal.hint': 'Gdy pm2 wyczerpie własne restarty, bot pozostaje martwy, dopóki tego nie zauważysz. Panel próbuje za ciebie, a potem <b>przestaje po 3 próbach</b>: bot, który trzy razy odmawia startu, ma prawdziwy problem, a alert musi zostać widoczny. Nigdy nie rusza bota, którego zatrzymałeś <b>ty</b>, ani bota zatrzymanego przez tryb gry.',
     'inc.title': '📓 Ostatnie incydenty',
     'inc.none': 'Nie odnotowano żadnego incydentu. To dobry znak.',
+    'dual.title': 'Dwie instalacje panelu na tym komputerze',
+    'dual.body': 'Istnieje inna instalacja: {path}. Obie uruchamiają się z Windows i aktualizują osobno. Odinstaluj tę, której nie chcesz (Ustawienia → Aplikacje).',
     'cfg.failTitle': 'Twoje ustawienia przestały się zapisywać',
     'cfg.failBody': 'Są trzymane w kopii zapasowej i nadal działają, ale głównego pliku nie da się zapisać.',
     'cfg.failWhy': 'Plik: {path} — sprawdź antywirusa, synchronizację folderu albo pełny dysk.',

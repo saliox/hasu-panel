@@ -146,11 +146,15 @@ const render = (st) => {
   if (st.lang && st.lang !== langCourante) appliquerLangue(st.lang);
   // Réglages qui ne s'enregistrent plus : ça doit se VOIR. Ce mode de panne a duré six semaines sans
   // le moindre signe (fichier lisible mais plus écrit), et il fait perdre webhook et préférences.
+  const dualHtml = st.secondeInstall
+    ? `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">${t('dual.title')}</div>`
+      + `<div class="updcard-ver">${esc(t('dual.body', { path: st.secondeInstall }))}</div></div></div>`
+    : '';
   const warnHtml = st.cfgWriteFailed
-    ? `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">${t('cfg.failTitle')}</div>`
+    ? dualHtml + `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">${t('cfg.failTitle')}</div>`
       + `<div class="updcard-ver">${t('cfg.failBody')}</div></div></div>`
       + `<div class="updcard-why">${t('cfg.failWhy', { path: esc(st.cfgPath || '') })}</div>`
-    : '';
+    : dualHtml;
   if (warnHtml !== lastWarnHtml) {
     lastWarnHtml = warnHtml;
     const w = $('cfgwarn');

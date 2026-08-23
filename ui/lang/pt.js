@@ -115,6 +115,8 @@
     'heal.hint': 'Quando o pm2 esgota as próprias tentativas, o bot fica morto até você perceber. O panel tenta de novo no seu lugar e <b>para depois de 3 tentativas</b>: um bot que se recusa a voltar três vezes tem um problema de verdade, e o alerta precisa continuar visível. Ele nunca mexe num bot que <b>você</b> parou, nem num bot parado pelo modo jogo.',
     'inc.title': '📓 Últimos incidentes',
     'inc.none': 'Nenhum incidente registrado. Isso é bom sinal.',
+    'dual.title': 'Duas instalações do panel neste PC',
+    'dual.body': 'Existe outra instalação: {path}. As duas iniciam com o Windows e se atualizam sozinhas. Desinstale a que você não quer (Configurações → Aplicativos).',
     'cfg.failTitle': 'Seus ajustes não estão mais sendo salvos',
     'cfg.failBody': 'Eles ficam guardados numa cópia de segurança e continuam valendo, mas o arquivo principal recusa a gravação.',
     'cfg.failWhy': 'Arquivo: {path} — olhe o antivírus, alguma sincronização de pasta, ou um disco cheio.',

@@ -320,6 +320,62 @@ const pickCfgSource = (main, bak) => {
   return { source: 'main', raw: main.raw };
 };
 
+
+// ---------- Lancement au démarrage de Windows : repérer les doublons ----------
+// Electron nomme la valeur de la clé Run d'après l'AppUserModelId de l'application. Chaque fois que
+// cet identifiant a changé (com.saliox.hasupanel → hasu.panel), `setLoginItemSettings` a créé une
+// NOUVELLE valeur sans supprimer l'ancienne. Constaté sur cette machine : DEUX entrées lançant le
+// même exécutable, plus une tâche planifiée orpheline créée par une version depuis longtemps retirée.
+// Conséquence directe : l'interrupteur « Lancer au démarrage » ne pilote qu'UNE des trois — le
+// désactiver ne désactive rien, et le panel se lance quand même.
+//
+// Analyse la sortie de `reg query …\\Run` : « <nom>    REG_SZ    <données> ».
+const parseRegQuery = (stdout) => {
+  const out = [];
+  for (const ligne of String(stdout || '').split('\n')) {
+    const m = ligne.match(/^\s{4}(\S.*?)\s{4,}REG_[A-Z_]+\s{4,}(.*?)\s*$/);
+    if (m) out.push({ nom: m[1], data: m[2] });
+  }
+  return out;
+};
+
+// Valeurs à supprimer : celles qui lancent NOTRE exécutable sans être celle que gère Electron
+// aujourd'hui. On compare sur le chemin de l'exe, pas sur le nom : c'est le nom qui a dérivé.
+const orphanRunValues = (stdout, nomActuel, exe) => {
+  const cible = String(exe || '').toLowerCase();
+  if (!cible) return [];
+  return parseRegQuery(stdout)
+    .filter((v) => v.nom !== nomActuel && v.data.toLowerCase().includes(cible))
+    .map((v) => v.nom);
+};
+
+// ---------- Deux installations sur la même machine ----------
+// L'installeur met à jour EN PLACE tant que l'identifiant d'application ne change pas. Mais une
+// installation laissée par un identifiant différent, ou une copie décompressée à la main, continue
+// d'exister : elle se lance au démarrage et se met à jour de son côté, avec sa propre config.
+// Renvoie les installations trouvées AUTRES que celle qui tourne (comparaison insensible à la casse
+// et au sens des séparateurs, Windows acceptant les deux).
+// Purger les anciennes entrées de démarrage ne doit JAMAIS laisser l'utilisateur sans aucun lanceur :
+// si l'entrée au nom courant n'existe pas encore (le nom suit l'AppUserModelId, qui a changé), il faut
+// la reposer AVANT d'effacer les anciennes. Sauf si l'utilisateur les a toutes désactivées lui-même
+// dans Gestionnaire des tâches > Démarrage : là, recréer une entrée active irait contre son choix.
+const doitReposerLanceur = (stdout, nomActuel, autoLaunch, toutesDesactivees) =>
+  !!autoLaunch && !toutesDesactivees && !parseRegQuery(stdout).some((v) => v.nom === nomActuel);
+
+const autresInstallations = (chemins, exeActuel) => {
+  const norm = (p) => String(p || '').replace(/\//g, '\\').toLowerCase();
+  const moi = norm(exeActuel);
+  const vues = new Set();
+  const out = [];
+  for (const p of (chemins || [])) {
+    if (!p) continue;
+    const n = norm(p);
+    if (n === moi || vues.has(n)) continue;
+    vues.add(n);
+    out.push(p);
+  }
+  return out;
+};
 // ---------- Cadence de sondage ----------
 // Fenêtre visible → réactif. Dans la zone de notification → ralenti, SAUF si une bascule automatique
 // dépend du sondage (mode jeu / éco réseau), auquel cas on reste à 15 s max.
@@ -400,4 +456,5 @@ module.exports = {
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,
+  parseRegQuery, orphanRunValues, autresInstallations, doitReposerLanceur,
 };

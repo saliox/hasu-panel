@@ -115,6 +115,8 @@
     'heal.hint': 'Once pm2 has used up its own restarts, the bot stays dead until you happen to notice. The panel retries for you, then <b>stops after 3 attempts</b>: a bot that refuses to come back three times has a real problem, and the alert must stay visible. It never touches a bot <b>you</b> stopped, nor one stopped by game mode.',
     'inc.title': '📓 Recent incidents',
     'inc.none': 'No incident recorded. That is a good sign.',
+    'dual.title': 'Two installations of the panel on this PC',
+    'dual.body': 'Another installation exists: {path}. Both start with Windows and update on their own. Uninstall the one you do not want (Settings → Apps).',
     'cfg.failTitle': 'Your settings are no longer being saved',
     'cfg.failBody': 'They are kept in a backup copy and remain active, but the main file refuses to be written.',
     'cfg.failWhy': 'File: {path} — look at your antivirus, a folder sync, or a full disk.',

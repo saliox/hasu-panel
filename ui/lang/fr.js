@@ -115,6 +115,8 @@
     'heal.hint': 'Quand pm2 a épuisé ses propres relances, le bot reste mort jusqu\'à ce que tu t\'en aperçoives. Le panel réessaie à ta place, puis <b>arrête au bout de 3 essais</b> : un bot qui refuse de repartir trois fois a un vrai problème, et l\'alerte doit rester visible. Ne touche jamais un bot que <b>tu</b> as arrêté, ni un bot coupé par le mode jeu.',
     'inc.title': '📓 Derniers incidents',
     'inc.none': 'Aucun incident enregistré. C\'est bon signe.',
+    'dual.title': 'Deux installations du panel sur ce PC',
+    'dual.body': 'Une autre installation existe : {path}. Les deux se lancent au démarrage et se mettent à jour chacune de leur côté. Désinstalle celle dont tu ne veux pas (Paramètres → Applications).',
     'cfg.failTitle': 'Tes réglages ne s\'enregistrent plus',
     'cfg.failBody': 'Ils sont conservés dans une copie de secours et restent actifs, mais le fichier principal refuse l\'écriture.',
     'cfg.failWhy': 'Fichier : {path} — regarde du côté de l\'antivirus, d\'une synchronisation de dossier, ou d\'un disque plein.',

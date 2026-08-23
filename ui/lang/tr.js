@@ -115,6 +115,8 @@
     'heal.hint': 'pm2 kendi yeniden başlatma haklarını tükettiğinde, sen fark edene kadar bot ölü kalır. Panel senin yerine dener, ama <b>3 denemeden sonra durur</b>: üç kez geri gelmeyi reddeden botun gerçek bir sorunu vardır ve uyarı görünür kalmalıdır. <b>Senin</b> durdurduğun bir bota da, oyun modunun durdurduğu bir bota da asla dokunmaz.',
     'inc.title': '📓 Son olaylar',
     'inc.none': 'Kayıtlı olay yok. Bu iyiye işaret.',
+    'dual.title': 'Bu bilgisayarda panelin iki kurulumu var',
+    'dual.body': 'Başka bir kurulum var: {path}. İkisi de Windows ile başlıyor ve ayrı ayrı güncelleniyor. İstemediğini kaldır (Ayarlar → Uygulamalar).',
     'cfg.failTitle': 'Ayarların artık kaydedilmiyor',
     'cfg.failBody': 'Bir yedek kopyada tutuluyorlar ve etkin kalıyorlar, ama ana dosya yazılmayı reddediyor.',
     'cfg.failWhy': 'Dosya: {path} — antivirüse, bir klasör eşitlemesine ya da dolu diske bak.',
