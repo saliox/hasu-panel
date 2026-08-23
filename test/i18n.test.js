@@ -145,3 +145,30 @@ test('i18n : aucune clé MORTE dans le dictionnaire', () => {
   const mortes = Object.keys(REF.ui).filter((k) => !vues.has(k));
   assert.deepEqual(mortes, [], `clés traduites dans 14 langues mais utilisées nulle part : ${mortes.join(', ')}`);
 });
+
+// ---------------------- les 14 langues doivent être ATTEIGNABLES, pas seulement traduites
+// Défaut réel : trois bornes dans main.js ne laissaient passer que 'fr' et 'en'. Le menu déroulant en
+// proposait 14, le clic changeait l'écran une fraction de seconde, puis `panel:status` renvoyait 'fr'
+// et tout repartait en français — sans rien enregistrer. Les 12 autres langues étaient mort-nées, et
+// avec elles chaque clé qu'on y ajoutait.
+test('i18n : main.js ne borne plus la langue à fr/en', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const bornes = src.match(/=== 'en' \? 'en' : 'fr'/g) || [];
+  assert.deepEqual(bornes, [], 'une borne fr/en subsiste : les 12 autres langues seraient inatteignables');
+  assert.match(src, /ORDRE: LANGUES/, 'la liste des langues doit venir de ui/i18n.js, source unique');
+  // Les trois endroits qui filtrent une langue (chargement, panel:status, réglage) doivent tous
+  // s'appuyer sur cette liste : en oublier un suffit à faire rebondir le choix en français.
+  assert.equal((src.match(/LANGUES\.includes\(/g) || []).length, 3);
+});
+
+test('i18n : chaque langue proposée est réellement chargeable côté processus principal', () => {
+  // Le menu du tray et les alertes passent par le MÊME moteur, chargé par require (pas par <script>).
+  // Une langue listée mais absente du disque retomberait silencieusement en français.
+  const { ORDRE } = require('../ui/i18n');
+  for (const code of ORDRE) {
+    const p = path.join(__dirname, '..', 'ui', 'lang', code + '.js');
+    assert.ok(fs.existsSync(p), `ui/lang/${code}.js manque alors que la langue est proposée`);
+    const m = require(p);
+    assert.ok(m && m.ui && typeof m.nom === 'string', `ui/lang/${code}.js ne s'exporte pas correctement`);
+  }
+});

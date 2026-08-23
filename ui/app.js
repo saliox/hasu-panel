@@ -15,6 +15,9 @@ const appliquerLangue = (l) => {
   const sel = $('lang-select');
   if (sel && sel.value !== langCourante) sel.value = langCourante;
   window.i18n.applyStatic();
+  // applyStatic réécrit le texte des titres, ce qui EFFACE les boutons « ? » qu'on y avait posés :
+  // sans cette ligne, changer de langue faisait disparaître toutes les aides, définitivement.
+  preparerAides();
   lastBotsHtml = lastBannerHtml = lastGamesHtml = lastSuggestHtml = null;
   lastUpdHtml = lastUpdCls = lastWarnHtml = lastIncHtml = null;
   if (cur) render(cur);
@@ -561,7 +564,9 @@ const preparerAides = () => {
     const aides = [...carte.querySelectorAll('.hint[data-i18n-html], .hint > span[data-i18n-html]')]
       .map((el) => (el.classList.contains('hint') ? el : el.parentElement))
       .filter((el, i, arr) => arr.indexOf(el) === i);
-    if (!titre || !aides.length || titre.nextElementSibling?.classList?.contains('aide-btn')) return;
+    // Le bouton est un ENFANT du titre (titre.appendChild plus bas) : c'est là qu'il faut le chercher,
+    // sinon ce garde ne voit jamais rien et on empile un bouton de plus à chaque appel.
+    if (!titre || !aides.length || titre.querySelector('.aide-btn')) return;
     aides.forEach((el) => el.classList.add('replie'));
     const b = document.createElement('button');
     b.className = 'aide-btn';

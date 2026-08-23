@@ -110,7 +110,7 @@ const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
 const { EXE_RE, isSafeName, isSafeNewName, BAD_SHELL_RE } = require('./validators');
 // Traductions PARTAGÉES avec la fenêtre (ui/i18n.js est chargé des deux côtés) : le menu de la zone
 // de notification doit parler la même langue que l'écran, sans dupliquer un second dictionnaire.
-const { t, setLang } = require('./ui/i18n');
+const { t, setLang, ORDRE: LANGUES } = require('./ui/i18n');
 // Logique PURE (décisions, parsing, calculs) : extraite pour la même raison — c'est ce module qui est
 // couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
 const {
@@ -333,7 +333,7 @@ const loadCfg = () => {
       alertSound: raw.alertSound !== false, alertVolume: clampInt(raw.alertVolume, 1, 100, 10),
       autoApplyUpdates: raw.autoApplyUpdates !== false,
       autoHeal: raw.autoHeal !== false,
-      lang: raw.lang === 'en' ? 'en' : 'fr', // toute autre valeur retombe sur le français
+      lang: LANGUES.includes(raw.lang) ? raw.lang : 'fr', // toute langue inconnue retombe sur le français
       // Historique et état de surveillance : nettoyage dans logic.js, donc TESTÉ (pollution de
       // prototype, horodatages corrompus, structures inattendues). Ces données alimentent des
       // relances `pm2 start` : rien de douteux ne doit franchir cette ligne.
@@ -1385,6 +1385,7 @@ const exitGameMode = async () => {
       0xED4245);
   }
   updateTray();
+  return perdus.length === 0; // l'appelant en a besoin : un `pm2 save` après un échec grave « bots éteints »
 };
 
 // ---------- Boucle de surveillance ----------
@@ -1690,8 +1691,18 @@ const updateTray = () => {
 // nous : le nom ne peut plus dériver, et « laquelle est la nôtre » n'est plus une devinette.
 const REG_RUN = String.raw`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`;
 const REG_APPROVED = String.raw`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run`;
-const regLire = (cle) => new Promise((res) => {
-  execFile(SYS('reg.exe'), ['query', cle], { windowsHide: true, timeout: 10000 }, (err, out) => res(err ? '' : out));
+// Renvoie null quand la lecture a ÉCHOUÉ, '' quand la clé est vide OU légitimement absente : confondre
+// faisait conclure « plus aucune entrée de démarrage » sur un simple échec passager, ce qui coupait
+// le démarrage automatique de l'utilisateur et enregistrait ce choix qu'il n'avait pas fait.
+// `absentPossible` : cette clé peut légitimement ne pas exister — c'est le cas de StartupApproved, créée
+// au premier « désactiver » de Gestionnaire des tâches. La clé Run, elle, existe toujours : une erreur y
+// est une VRAIE erreur. On ne lit surtout PAS le message d'erreur pour trancher : reg.exe l'écrit dans la
+// page de codes OEM et il est traduit — la règle changerait avec la langue de Windows.
+const regLire = (cle, absentPossible = false) => new Promise((res) => {
+  execFile(SYS('reg.exe'), ['query', cle], { windowsHide: true, timeout: 10000 }, (err, out) => {
+    if (!err) return res(out);
+    res(absentPossible ? '' : null); // null = « je n'ai pas pu lire » → l'appelant ne décide rien
+  });
 });
 const regEcrire = (nom, data) => new Promise((res) => {
   execFile(SYS('reg.exe'), ['add', REG_RUN, '/v', nom, '/t', 'REG_SZ', '/d', data, '/f'],
@@ -1721,13 +1732,31 @@ const reconcilerLanceurs = (forcer = null) => {
   reconcileEnCours = (async () => {
     const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
     if (forcer !== null) { cfg.autoLaunch = !!forcer; cfg.autoLaunchInit = true; saveCfg(); }
-    const [runOut, approvedOut] = await Promise.all([regLire(REG_RUN), regLire(REG_APPROVED)]);
+    const [runOut, approvedOut] = await Promise.all([regLire(REG_RUN), regLire(REG_APPROVED, true)]);
+    if (runOut === null || approvedOut === null) {
+      log('démarrage auto : registre illisible pour le moment → on ne décide rien (aucune entrée touchée)');
+      return; // ne jamais purger ni couper le démarrage sur une lecture ratée
+    }
     // Sur une bascule explicite, le réglage l'emporte : pas de « l'OS fait foi », c'est l'utilisateur
     // qui vient de cliquer. Sinon on lit ce que le registre raconte vraiment.
     const plan = forcer !== null
       ? { nom: LOGIN_ITEM, ecrire: !!forcer, autoLaunch: !!forcer,
           supprimer: planLanceurs({ runOut, approvedOut, exe }).supprimer.concat(forcer ? [] : [LOGIN_ITEM]) }
-      : planLanceurs({ runOut, approvedOut, exe, autoLaunch: cfg.autoLaunch, autoLaunchInit: cfg.autoLaunchInit });
+      // `=== true` et non la valeur brute : une config d'avant cette version n'a pas ce champ, et un
+      // `undefined` déclencherait la valeur par défaut du paramètre — le plan croirait alors que
+      // l'utilisateur a retiré son entrée de démarrage, sur une installation NEUVE qui n'en a jamais eu.
+      : planLanceurs({ runOut, approvedOut, exe, autoLaunch: cfg.autoLaunch, autoLaunchInit: cfg.autoLaunchInit === true });
+
+    // La tâche planifiée orpheline : plus aucun code ne la crée ni ne la pilote, elle lançait juste
+    // le panel une fois de plus. Traité EN PREMIER car c'est indépendant du reste : le repli de
+    // sécurité plus bas (« on ne purge pas à l'aveugle ») sautait aussi ce ménage-là.
+    execFile(SYS('schtasks.exe'), ['/Query', '/TN', 'HasuPanel'], { windowsHide: true, timeout: 10000 }, (err) => {
+      if (err) return; // absente : rien à faire
+      execFile(SYS('schtasks.exe'), ['/Delete', '/TN', 'HasuPanel', '/F'], { windowsHide: true, timeout: 10000 }, (e2) => {
+        log(e2 ? 'tâche planifiée orpheline : suppression impossible — ' + e2.message
+              : 'tâche planifiée orpheline supprimée (elle lançait le panel en double au démarrage)');
+      });
+    });
 
     // TOUJOURS écrire avant de purger : l'inverse laisse une fenêtre où plus aucun lanceur n'existe.
     if (plan.ecrire) {
@@ -1756,16 +1785,6 @@ const reconcilerLanceurs = (forcer = null) => {
     if (!cfg.autoLaunchInit) cfg.autoLaunchInit = true;
     saveCfg();
     if (cfg.autoLaunch) disableStartupDelay(); else restoreStartupDelay();
-
-    // La tâche planifiée orpheline : plus aucun code ne la crée ni ne la pilote, elle lançait juste
-    // le panel une fois de plus.
-    execFile(SYS('schtasks.exe'), ['/Query', '/TN', 'HasuPanel'], { windowsHide: true, timeout: 10000 }, (err) => {
-      if (err) return; // absente : rien à faire
-      execFile(SYS('schtasks.exe'), ['/Delete', '/TN', 'HasuPanel', '/F'], { windowsHide: true, timeout: 10000 }, (e2) => {
-        log(e2 ? 'tâche planifiée orpheline : suppression impossible — ' + e2.message
-              : 'tâche planifiée orpheline supprimée (elle lançait le panel en double au démarrage)');
-      });
-    });
   })().catch((e) => log('démarrage auto : réconciliation échouée —', e.message))
     .finally(() => { reconcileEnCours = null; });
   return reconcileEnCours;
@@ -1897,7 +1916,7 @@ ipcMain.handle('panel:status', () => ({
   alertsSuppressed: (alertsSuppressed = alertsSuppressed.filter((t) => Date.now() - t < 3600 * 1000)).length,
   ready: firstTickDone,           // false = première mesure en cours (≠ « aucun bot »)
   autoHeal: cfg.autoHeal !== false,
-  lang: cfg.lang === 'en' ? 'en' : 'fr',
+  lang: LANGUES.includes(cfg.lang) ? cfg.lang : 'fr',
   incidents: (cfg.incidents || []).slice(-20).reverse(), // le plus récent en premier
   secondeInstall,                 // chemin d'une AUTRE installation du panel sur ce PC (bandeau)
   cfgWriteFailed,                 // les réglages ne s'écrivent plus sur le disque → bandeau (jamais silencieux)
@@ -2157,7 +2176,7 @@ ipcMain.handle('panel:setSetting', (_e, { key, value } = {}) => {
   if (key === 'autoApplyUpdates') { cfg.autoApplyUpdates = !!value; saveCfg(); return { ok: true }; }
   if (key === 'autoHeal') { cfg.autoHeal = !!value; saveCfg(); return { ok: true }; }
   // La langue vaut aussi pour le menu de la zone de notification : on le reconstruit tout de suite.
-  if (key === 'lang') { cfg.lang = value === 'en' ? 'en' : 'fr'; setLang(cfg.lang); saveCfg(); updateTray(true); return { ok: true }; }
+  if (key === 'lang') { cfg.lang = LANGUES.includes(value) ? value : 'fr'; setLang(cfg.lang); saveCfg(); updateTray(true); return { ok: true }; }
   if (key === 'alerts') { cfg.alerts = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertToast') { cfg.alertToast = !!value; saveCfg(); return { ok: true }; }
   if (key === 'alertSound') { cfg.alertSound = !!value; saveCfg(); if (cfg.alertSound) playSoftSound(); return { ok: true }; } // aperçu immédiat
@@ -2366,14 +2385,18 @@ else {
     (async () => {
       // Laisse une transition de mode jeu déjà en cours se terminer (max ~6 s) avant de nettoyer.
       for (let i = 0; i < 30 && busy; i++) await new Promise((r) => setTimeout(r, 200));
-      try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.some((n) => n !== '-')) await exitGameMode(); } catch (err) { log('quit exitGameMode', err.message); }
+      // `false` = des bots coupés par le mode jeu ne sont pas repartis. Dans ce cas on NE sauvegarde
+      // pas l'état pm2 : le dump servirait de référence au prochain démarrage du PC et graverait leur
+      // extinction. Mieux vaut un dump un peu vieux qu'un dump qui éteint les bots.
+      let relanceOk = true;
+      try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.some((n) => n !== '-')) relanceOk = await exitGameMode() !== false; } catch (err) { relanceOk = false; log('quit exitGameMode', err.message); }
       try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
       // Dernière chance pour une sauvegarde pm2 restée en attente (reportée par le mode jeu) : c'est
       // ce dump que pm2 restaure au prochain démarrage du PC. Sans ça, tout démarrage/arrêt fait
       // pendant une longue partie disparaissait à l'extinction. On est ici APRÈS exitGameMode, donc
       // la liste est de nouveau représentative.
       try {
-        if (pm2SavePending) {
+        if (pm2SavePending && relanceOk) {
           const r = await pm2(['save']);
           log('pm2 save de fermeture :', r.ok ? 'OK' : 'échec');
           if (r.ok) { pm2SavePending = false; cfg.lastSaveAt = Date.now(); saveCfg(); }

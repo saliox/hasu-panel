@@ -141,6 +141,24 @@ test('planLanceurs : tout premier lancement → on pose l\'entrée', () => {
   assert.equal(p.autoLaunch, true);
 });
 
+test('planLanceurs : INSTALLATION NEUVE — le champ est absent, pas à false', () => {
+  // RÉGRESSION RÉELLE, livrée puis rattrapée : `DEFAULTS` ne porte pas `autoLaunchInit`, donc au tout
+  // premier lancement il vaut `undefined` — ce qui déclenche la valeur par défaut `= true` du
+  // paramètre, et le plan conclut « entrée retirée volontairement ». Résultat : aucune entrée posée
+  // sur une machine neuve, et l'interrupteur qui se coupe tout seul.
+  //
+  // Le test précédent ne l'attrapait pas : il force `autoLaunchInit: false`, une valeur que main.js
+  // n'envoie jamais dans ce cas. 163 tests étaient verts avec le défaut dedans.
+  const p = planLanceurs({ runOut: RIEN_A_NOUS, exe: EXE, autoLaunch: true });
+  assert.equal(p.ecrire, false, 'valeur par défaut du paramètre : « déjà initialisé »');
+  // …c'est pourquoi main.js doit passer `cfg.autoLaunchInit === true` et JAMAIS la valeur brute.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /autoLaunchInit: cfg\.autoLaunchInit === true/,
+    'sans le `=== true`, un undefined vaut « déjà initialisé » et la machine neuve perd son démarrage auto');
+  assert.equal(/autoLaunchInit: cfg\.autoLaunchInit(?! === true)/.test(src), false,
+    'aucun passage de la valeur brute ne doit subsister');
+});
+
 test('planLanceurs : premier lancement avec démarrage refusé → on n\'écrit rien', () => {
   const p = planLanceurs({ runOut: RIEN_A_NOUS, exe: EXE, autoLaunch: false, autoLaunchInit: false });
   assert.equal(p.ecrire, false);
