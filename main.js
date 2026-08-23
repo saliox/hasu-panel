@@ -1740,6 +1740,9 @@ const reconcilerLanceurs = (forcer = null) => {
     // Sur une bascule explicite, le réglage l'emporte : pas de « l'OS fait foi », c'est l'utilisateur
     // qui vient de cliquer. Sinon on lit ce que le registre raconte vraiment.
     const plan = forcer !== null
+      // Pas de `drapeauxMorts` ici, VOLONTAIREMENT : sur un « activer » on vient d'écrire le drapeau
+      // « autorisé » pour notre entrée, et le ménage l'effacerait dans la foulée. Ces drapeaux orphelins
+      // sont nettoyés au démarrage suivant, où aucune écriture ne les précède.
       ? { nom: LOGIN_ITEM, ecrire: !!forcer, autoLaunch: !!forcer,
           supprimer: planLanceurs({ runOut, approvedOut, exe }).supprimer.concat(forcer ? [] : [LOGIN_ITEM]) }
       // `=== true` et non la valeur brute : une config d'avant cette version n'a pas ce champ, et un
@@ -1772,11 +1775,22 @@ const reconcilerLanceurs = (forcer = null) => {
     }
     for (const nom of plan.supprimer) {
       const ok = await regSupprimer(REG_RUN, nom);
-      log(ok ? `entrée de démarrage en double supprimée : « ${nom} »`
+      // Deux situations très différentes derrière la même suppression : retirer NOTRE entrée parce que
+      // l'utilisateur vient de couper l'interrupteur, ou retirer une orpheline héritée d'un ancien nom.
+      // Le message disait « en double » dans les deux cas — trompeur au point de faire croire à un bug.
+      const sien = nom === plan.nom;
+      log(ok ? (sien ? `démarrage auto : entrée « ${nom} » retirée (interrupteur sur « désactivé »)`
+                     : `entrée de démarrage en double supprimée : « ${nom} »`)
              : `entrée de démarrage « ${nom} » : suppression impossible`);
       // Le « désactivé » de l'ancienne entrée n'a plus d'objet : sans ça, Gestionnaire des tâches
       // garde une ligne fantôme, et le drapeau resservirait si le nom réapparaissait un jour.
       if (ok) await regSupprimer(REG_APPROVED, nom);
+    }
+    // Drapeaux « désactivé » restés seuls, sans valeur Run : ils n'ont plus d'objet et laissent une
+    // ligne fantôme dans Gestionnaire des tâches. Ceux-là datent des versions qui supprimaient la
+    // valeur sans son drapeau.
+    for (const nom of (plan.drapeauxMorts || [])) {
+      if (await regSupprimer(REG_APPROVED, nom)) log(`drapeau de démarrage orphelin nettoyé : « ${nom} »`);
     }
     if (plan.autoLaunch !== cfg.autoLaunch) {
       log(`démarrage auto : l'état réel du système est « ${plan.autoLaunch ? 'activé' : 'désactivé'} » → l'écran s'aligne`);

@@ -142,6 +142,16 @@ addEventListener('mousedown', () => { sourisEnfoncee = true; }, true);
 addEventListener('mouseup', () => { sourisEnfoncee = false; }, true);
 addEventListener('blur', () => { sourisEnfoncee = false; }); // relâché hors fenêtre : on ne reste pas figé
 
+// Réglages basculés à l'instant : leur aller-retour vers le disque n'est pas encore revenu, donc
+// l'état sondé est PÉRIMÉ pour eux. Les réécrire ferait revenir la case en arrière sous le doigt de
+// l'utilisateur — qui reclique, et annule son propre choix. Deux secondes couvrent largement l'aller-retour.
+const reglagesTouches = new Map(); // id de la case -> horodatage du dernier changement envoyé
+const cocher = (id, valeur) => {
+  const el = $(id);
+  if (!el || Date.now() - (reglagesTouches.get(id) || 0) < 2000) return;
+  el.checked = !!valeur;
+};
+
 const render = (st) => {
   cur = st;
   // La langue vient du processus principal : elle survit au redémarrage, et l'écran s'y aligne même
@@ -259,11 +269,11 @@ const render = (st) => {
   if (botsHtml !== lastBotsHtml && !sourisEnfoncee) { lastBotsHtml = botsHtml; $('bots').innerHTML = botsHtml; }
 
   // Mode jeu
-  $('gm-enabled').checked = !!st.cfg.gameMode.enabled;
-  $('gm-all').checked = !!st.cfg.gameMode.stopAll;
-  $('gm-some').checked = !st.cfg.gameMode.stopAll;
-  $('gm-soloskip').checked = st.cfg.gameMode.soloSkip !== false;
-  $('gm-lownet').checked = !!st.cfg.lowNet;
+  cocher('gm-enabled', st.cfg.gameMode.enabled);
+  cocher('gm-all', st.cfg.gameMode.stopAll);
+  cocher('gm-some', !st.cfg.gameMode.stopAll);
+  cocher('gm-soloskip', st.cfg.gameMode.soloSkip !== false);
+  cocher('gm-lownet', st.cfg.lowNet);
   if (document.activeElement !== $('gm-grace')) $('gm-grace').value = st.cfg.gameMode.graceSec;
   $('gm-stopped').textContent = st.stoppedByGame.length ? `⏸ Coupés par le mode jeu : ${st.stoppedByGame.join(', ')}` : '';
 
@@ -275,24 +285,24 @@ const render = (st) => {
   if (suggestHtml !== lastSuggestHtml) { lastSuggestHtml = suggestHtml; $('game-suggest').innerHTML = suggestHtml; }
 
   // Réglages
-  $('set-autolaunch').checked = !!st.cfg.autoLaunch;
+  cocher('set-autolaunch', st.cfg.autoLaunch);
   if (document.activeElement !== $('set-poll')) $('set-poll').value = st.cfg.pollSec;
-  $('set-scanauto').checked = st.cfg.scanAuto !== false;
+  cocher('set-scanauto', st.cfg.scanAuto !== false);
   const loc = langCourante === 'en' ? 'en-GB' : 'fr-FR';
   $('set-scaninfo').textContent = st.cfg.lastScanAt
     ? t('set.lastScan', { d: new Date(st.cfg.lastScanAt).toLocaleString(loc) })
     : t('set.noScan');
   $('dev-note').textContent = st.cfg.packaged ? '' : t('set.devOnly');
-  $('set-rpc').checked = st.cfg.discordRpc !== false;
+  cocher('set-rpc', st.cfg.discordRpc !== false);
   if (document.activeElement !== $('set-rpc-id')) $('set-rpc-id').value = st.cfg.discordAppId || '';
-  $('set-autoupdate').checked = st.autoApplyUpdates !== false;
-  $('set-alerts').checked = st.cfg.alerts !== false;
+  cocher('set-autoupdate', st.autoApplyUpdates !== false);
+  cocher('set-alerts', st.cfg.alerts !== false);
   // Alertes différées par le plafond horaire : sans ça, l'écran affichait « alertes activées » alors
   // que certaines n'étaient pas parties.
   const supp = $('alert-status');
   if (supp && !supp.textContent.trim()) supp.textContent = st.alertsSuppressed ? t('alerts.suppressed', { n: st.alertsSuppressed }) : '';
-  $('set-alert-toast').checked = st.cfg.alertToast !== false;
-  $('set-alert-sound').checked = st.cfg.alertSound !== false;
+  cocher('set-alert-toast', st.cfg.alertToast !== false);
+  cocher('set-alert-sound', st.cfg.alertSound !== false);
   if (document.activeElement !== $('set-alert-volume')) $('set-alert-volume').value = st.cfg.alertVolume || 10;
   $('alert-vol-val').textContent = `${st.cfg.alertVolume || 10} %`;
   if (document.activeElement !== $('set-alert-webhook')) $('set-alert-webhook').value = st.cfg.alertWebhook || '';
@@ -303,7 +313,7 @@ const render = (st) => {
     : t('set.savedNever');
   $('rpc-status').textContent = st.cfg.discordRpc === false ? t('rpc.off') : (st.cfg.discordAppId ? t('rpc.on') : t('rpc.needId'));
 
-  $('set-autoheal').checked = st.autoHeal !== false;
+  cocher('set-autoheal', st.autoHeal !== false);
 
   // Derniers incidents — le panel voyait chaque chute et l'oubliait aussitôt. Écrit seulement quand
   // la liste change : c'est du DOM reconstruit, et le sondage passe toutes les 3 s.
@@ -677,6 +687,8 @@ document.addEventListener('input', (e) => {
 
 document.addEventListener('change', async (e) => {
   const t = e.target;
+  // Marque AVANT l'aller-retour : le prochain rendu ne doit pas réécrire cette case avec l'état d'avant.
+  if (t && t.id) reglagesTouches.set(t.id, Date.now());
   if (t.dataset?.bot && t.dataset?.key) { await window.panel.setBot(t.dataset.bot, t.dataset.key, t.checked); await refresh(); return; }
   if (t.id === 'gm-enabled') { await window.panel.setGameMode({ enabled: t.checked }); await refresh(); return; }
   if (t.id === 'gm-all' || t.id === 'gm-some') { await window.panel.setGameMode({ stopAll: $('gm-all').checked }); await refresh(); return; }

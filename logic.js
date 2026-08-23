@@ -388,6 +388,11 @@ const parseRegQuery = (stdout) => {
 // de nommage peut changer d'une version d'Electron à l'autre. C'est ce qui referme la classe de bugs.
 const LOGIN_ITEM = 'HasuPanel';
 
+// Les noms que notre valeur Run a portés avant qu'il soit figé. Windows garde un drapeau « désactivé »
+// indexé sur le NOM ; quand la valeur disparaît, ce drapeau survit et laisse une ligne fantôme dans
+// Gestionnaire des tâches > Démarrage. Liste fermée et explicite : on n'efface QUE ce qui a été à nous.
+const NOMS_HERITES = ['electron.app.HasuPanel', 'com.saliox.hasupanel'];
+
 // Windows range les « désactivé » de Gestionnaire des tâches > Démarrage à côté, en binaire, indexés
 // sur le NOM de la valeur. Premier octet impair = désactivé (03, 07…), pair = actif (02, 06…).
 const parseStartupApproved = (stdout) => {
@@ -425,7 +430,14 @@ const planLanceurs = ({ runOut = '', approvedOut = '', exe = '', autoLaunch = tr
   else if (autoLaunchInit) etat = false;
   else etat = !!autoLaunch;
 
-  return { ecrire: etat && !present, supprimer, autoLaunch: etat, nom: LOGIN_ITEM };
+  // Drapeaux à effacer : ceux qui portent un de NOS noms alors que la valeur Run correspondante
+  // n'existe plus. Un drapeau sans valeur ne fait rien, mais il reste affiché — et le jour où le nom
+  // réapparaîtrait, il naîtrait désactivé. On ne touche à AUCUN nom qui ne soit pas le nôtre.
+  const nomsRun = new Set(parseRegQuery(runOut).map((v) => v.nom));
+  const drapeauxMorts = [...NOMS_HERITES, LOGIN_ITEM]
+    .filter((nom) => approuve.has(nom) && !nomsRun.has(nom) && !supprimer.includes(nom));
+
+  return { ecrire: etat && !present, supprimer, drapeauxMorts, autoLaunch: etat, nom: LOGIN_ITEM };
 };
 
 // ---------- Deux installations sur la même machine ----------
@@ -528,5 +540,5 @@ module.exports = {
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,
-  parseRegQuery, parseStartupApproved, planLanceurs, LOGIN_ITEM, autresInstallations,
+  parseRegQuery, parseStartupApproved, planLanceurs, LOGIN_ITEM, NOMS_HERITES, autresInstallations,
 };

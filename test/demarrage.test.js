@@ -95,7 +95,9 @@ test('planLanceurs : sans chemin d\'exécutable, on ne supprime RIEN', () => {
 
 test('planLanceurs : régime établi — rien à faire', () => {
   const p = planLanceurs({ runOut: SEULEMENT_NOUS, exe: EXE, autoLaunch: true });
-  assert.deepEqual(p, { ecrire: false, supprimer: [], autoLaunch: true, nom: LOGIN_ITEM });
+  // Comparaison STRICTE de tout l'objet : c'est elle qui signale un champ ajouté sans être pensé
+  // pour ce cas — le plan pilote des écritures registre, aucun champ ne doit y apparaître par accident.
+  assert.deepEqual(p, { ecrire: false, supprimer: [], drapeauxMorts: [], autoLaunch: true, nom: LOGIN_ITEM });
 });
 
 test('planLanceurs : notre entrée existe → l\'écran dit « activé », même si la config dit non', () => {
@@ -170,6 +172,45 @@ test('planLanceurs : casse et guillemets ne masquent pas nos entrées', () => {
   const out = [ligne('vieux', `"${EXE.toUpperCase()}" --hidden`), ligne('autre', EXE.toLowerCase())].join('\n');
   const p = planLanceurs({ runOut: out, exe: EXE, autoLaunch: true });
   assert.deepEqual(p.supprimer, ['vieux', 'autre']);
+});
+
+// ---------- Drapeaux « désactivé » restés seuls ----------
+// Constaté sur la machine : StartupApproved gardait `com.saliox.hasupanel` et `electron.app.HasuPanel`
+// à 03 (désactivé) alors que leurs valeurs Run avaient disparu depuis longtemps. Un drapeau sans
+// valeur ne fait rien, mais il reste AFFICHÉ dans Gestionnaire des tâches > Démarrage — exactement la
+// confusion des « trois lanceurs » qu'on vient de supprimer.
+test('planLanceurs : nettoie les drapeaux de NOS anciens noms restés sans valeur Run', () => {
+  const approvedOut = [
+    ligne('com.saliox.hasupanel', '030000009FEB3779C72FDD01'),
+    ligne('electron.app.HasuPanel', '0300000078A2207BC72FDD01'),
+    ligne('Steam', '030000005D8D0EE810F3DC01'),
+  ].join('\n');
+  const p = planLanceurs({ runOut: SEULEMENT_NOUS, approvedOut, exe: EXE, autoLaunch: true });
+  assert.deepEqual(p.drapeauxMorts, ['electron.app.HasuPanel', 'com.saliox.hasupanel']);
+  assert.equal(p.drapeauxMorts.includes('Steam'), false, 'JAMAIS le drapeau d\'un autre logiciel');
+});
+
+test('planLanceurs : un drapeau dont la valeur Run existe encore n\'est PAS touché', () => {
+  // Il porte le choix de l'utilisateur (désactivé dans Gestionnaire des tâches) : l'effacer le
+  // contournerait. On ne nettoie que ce qui ne sert plus à rien.
+  const approvedOut = ligne('electron.app.HasuPanel', '030000000000000000000000');
+  const p = planLanceurs({ runOut: A_JOUR, approvedOut, exe: EXE, autoLaunch: true });
+  assert.deepEqual(p.drapeauxMorts, [], 'la valeur existe → le drapeau a encore un sens');
+  assert.ok(p.supprimer.includes('electron.app.HasuPanel'), '…elle sera purgée, avec son drapeau');
+});
+
+test('planLanceurs : aucun drapeau à nettoyer quand il n\'y en a pas', () => {
+  const p = planLanceurs({ runOut: SEULEMENT_NOUS, exe: EXE, autoLaunch: true });
+  assert.deepEqual(p.drapeauxMorts, []);
+});
+
+test('le ménage des drapeaux ne tourne PAS sur une bascule de l\'interrupteur', () => {
+  // Sur un « activer », le panel écrit le drapeau « autorisé » de son entrée juste avant : lancer le
+  // ménage dans la foulée l'effacerait, et l'interrupteur redeviendrait décoratif. Le nettoyage est
+  // donc réservé au démarrage, où aucune écriture ne le précède.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const branche = src.slice(src.indexOf('? { nom: LOGIN_ITEM, ecrire: !!forcer'), src.indexOf(': planLanceurs({ runOut, approvedOut, exe, autoLaunch'));
+  assert.equal(/drapeauxMorts/.test(branche), false, 'la branche « bascule » ne doit pas calculer de ménage');
 });
 
 // ---------- Deux installations ----------

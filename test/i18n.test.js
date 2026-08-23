@@ -172,3 +172,27 @@ test('i18n : chaque langue proposée est réellement chargeable côté processus
     assert.ok(m && m.ui && typeof m.nom === 'string', `ui/lang/${code}.js ne s'exporte pas correctement`);
   }
 });
+
+// ---------------------- les cases à cocher ne doivent pas revenir en arrière sous le doigt
+// Défaut réel : les 13 cases étaient réécrites sans condition à chaque rendu (toutes les 3 s) depuis
+// l'état sondé. Une case cliquée juste avant un rendu revenait visuellement en arrière ; l'utilisateur,
+// croyant que rien ne s'était passé, recliquait — et ce second clic ANNULAIT le premier. C'est le
+// symptôme « l'interrupteur ne marche pas vraiment » qui a lancé toute cette série de correctifs.
+test('ui : aucune case n\'est écrite sans passer par le garde `cocher`', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'ui', 'app.js'), 'utf8');
+  const debut = src.indexOf('const render = (st) => {');
+  const corps = src.slice(debut, src.indexOf('\nconst refresh', debut));
+  assert.ok(debut > 0 && corps.length > 500, 'le corps de render doit être trouvé');
+  const brutes = corps.match(/\$\('[^']+'\)\.checked\s*=/g) || [];
+  assert.deepEqual(brutes, [], 'écriture directe : le rendu écraserait un réglage tout juste basculé');
+  assert.ok((corps.match(/cocher\(/g) || []).length >= 13, 'les 13 cases doivent passer par le garde');
+});
+
+test('ui : chaque changement envoyé marque sa case comme « en vol »', () => {
+  // Sans ce marquage, le garde ne sait pas quoi protéger et le défaut revient à l'identique.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'ui', 'app.js'), 'utf8');
+  assert.match(src, /reglagesTouches\.set\(t\.id, Date\.now\(\)\)/);
+  // …et le garde doit rester TEMPORAIRE : un blocage définitif empêcherait l'écran de refléter un
+  // réglage refusé par le disque.
+  assert.match(src, /reglagesTouches\.get\(id\) \|\| 0\) < \d+/);
+});
