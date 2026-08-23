@@ -59,7 +59,19 @@ const maybeAutoApplyUpdate = () => {
   log('MAJ appliquée automatiquement :', app.getVersion(), '→', updateReadyVersion, '(redémarrage silencieux)');
   quitting = true;                                      // ne pas repartir dans le tray sur ce quit
   // isSilent=true (installeur oneClick, aucune fenêtre) + isForceRunAfter=true (le panel revient tout seul).
-  setTimeout(() => { try { updaterRef.quitAndInstall(true, true); } catch (e) { log('quitAndInstall', e.message); updateApplying = false; quitting = false; } }, 400);
+  setTimeout(() => {
+    try { updaterRef.quitAndInstall(true, true); } catch (e) { log('quitAndInstall', e.message); updateApplying = false; quitting = false; return; }
+    // Chien de garde : `quitAndInstall` ne lève PAS quand l'installation échoue (electron-updater
+    // renvoie false et passe par son propre canal d'erreur). Sans ce filet, un échec laissait
+    // `updateApplying` et `quitting` collés à true — plus aucune MAJ jusqu'au prochain démarrage, et
+    // la fenêtre DÉTRUITE au lieu d'être réduite dans la zone de notification au prochain clic sur ✕.
+    // Si l'installation avait réussi, ce minuteur n'existerait plus : le process serait déjà mort.
+    setTimeout(() => {
+      if (!updateApplying) return;
+      updateApplying = false; quitting = false;
+      log('MAJ : le redémarrage n\'a pas eu lieu au bout de 20 s → on repasse en fonctionnement normal');
+    }, 20000);
+  }, 400);
 };
 // (`semverGt` vit dans logic.js, testé unitairement — pré-release, préfixe « v », champs manquants.)
 const setupAutoUpdate = () => {
@@ -234,9 +246,11 @@ const withGameLock = async (fn) => {
   // Coalesce : si une transition est déjà en cours, on MÉMORISE la dernière demande au lieu de la jeter.
   // Sinon « désactiver le mode jeu » cliqué pendant un enterGameMode en cours était perdu → bots coupés
   // jusqu'à la fermeture du jeu. La demande en attente est rejouée dès que le verrou se libère.
-  if (busy) { pendingGameFn = fn; return; }
+  if (busy) { pendingGameFn = fn; return undefined; } // undefined = mise en attente, PAS un succès
   busy = true;
-  try { await fn(); } finally {
+  // On RENVOIE ce que fn a renvoyé : à la fermeture, l'appelant doit savoir si les bots sont bien
+  // repartis avant d'autoriser un `pm2 save` (un dump pris trop tôt grave leur extinction).
+  try { return await fn(); } finally {
     busy = false;
     const next = pendingGameFn; pendingGameFn = null;
     if (next) withGameLock(next);
@@ -382,6 +396,15 @@ const loadCfg = () => {
 // par accident dès que les réglages n'avaient pas bougé. D'où le compteur `_seq`, incrémenté ici à
 // chaque enregistrement — il rend la comparaison réellement discriminante, et il sert aussi à
 // départager les deux copies au chargement sans dépendre des dates de fichier.
+// Tout ce qui SORT de la machine (webhook, toast) passe par ici. redactSensitive couvre les formes
+// habituelles de chemin ; le nom de session litteral couvre le reste — un chemin UNC, un profil
+// place ailleurs que sous Users, ou un nom qui apparait seul dans un message.
+const NOM_SESSION = String(process.env.USERNAME || '').trim();
+// Sous 3 caracteres, masquer partout hacherait le texte (un nom « ab » se retrouve dans mille mots).
+const RE_SESSION = NOM_SESSION.length >= 3
+  ? new RegExp(NOM_SESSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi') : null;
+const masquer = (texte) => { const s = redactSensitive(texte); return RE_SESSION ? s.replace(RE_SESSION, '[…]') : s; };
+
 let cfgWriteFailed = false; // remonté dans panel:status → bandeau dans l'interface (échec bruyant)
 let cfgSeq = 0;             // dernier numéro d'ordre écrit ; repart au-dessus de ce qu'on a lu au démarrage
 let cfgRepairNeeded = false; // le chargement a dû se rabattre sur la sauvegarde → remettre les deux d'accord
@@ -399,8 +422,10 @@ const saveCfg = () => {
   if (!ok && !cfgWriteFailed) {
     log('saveCfg: ÉCHEC SILENCIEUX — le fichier ne reflète pas ce qui a été écrit ; les réglages ne survivent que dans le .bak :', file);
     // Différé d'un tick : saveCfg peut être appelé pendant l'amorçage, avant que queueAlert soit défini.
+    // Le chemin est MASQUÉ ici : cette alerte part vers le webhook Discord et contient le nom de
+    // session Windows. Le journal local, lui, garde la version entière — c'est là qu'on en a besoin.
     setTimeout(() => queueAlert('⚠️ Réglages non enregistrés',
-      `Le panel n'arrive pas à écrire \`${file}\`. Tes réglages sont conservés dans la copie de secours, mais vérifie ce dossier (antivirus, synchronisation, disque plein).`, 0xfaa61a), 0);
+      `Le panel n'arrive pas à écrire \`${masquer(file)}\`. Tes réglages sont conservés dans la copie de secours, mais vérifie ce dossier (antivirus, synchronisation, disque plein).`, 0xfaa61a), 0);
   }
   cfgWriteFailed = !ok;
   return ok;
@@ -1391,6 +1416,11 @@ const exitGameMode = async () => {
 // ---------- Boucle de surveillance ----------
 let tickRunning = false;
 const tick = async () => {
+  // Fermeture en cours : ne RIEN entreprendre. Sans ça, un tick pouvait lancer une coupure de mode
+  // jeu (`pm2 stop`) pendant que le nettoyage lançait la relance (`pm2 start`) — état final
+  // indéterminé, et `cfg.stoppedByGame` (le seul enregistrement disque, écrit AVANT la coupure
+  // justement pour survivre à une mort du panel) effacé au passage.
+  if (quitting) return;
   if (tickRunning) return; // un tick est déjà en cours (ex. restartPoll(true) au show pendant un tick lent) → évite un double fan-out de spawns
   tickRunning = true;
   try {
@@ -1672,7 +1702,9 @@ const updateTray = () => {
       // Garde-fou ultime : si le nettoyage de `before-quit` se bloquait avant meme darmer son propre
       // delai, rien ne terminerait le processus et licone de la zone de notification resterait la,
       // sans fenetre — exactement le « Quitter qui ne marche pas ».
-      setTimeout(() => { log('Quitter : sortie forcee (le nettoyage na pas rendu la main)'); app.exit(0); }, 15000);
+      // 25 s : le nettoyage dispose de 6 s d'apaisement + 12 s de travail. À 15 s, ce repli le coupait
+      // en pleine relance de bots — il doit rester le dernier recours, pas un concurrent.
+      setTimeout(() => { log('Quitter : sortie forcee (le nettoyage na pas rendu la main)'); app.exit(0); }, 25000);
       app.quit();
     } } // le nettoyage passe par before-quit (restaure les bots + drapeaux)
   ]));
@@ -1824,7 +1856,7 @@ const detecterSecondeInstallation = () => {
   log('DEUXIÈME INSTALLATION détectée :', autres.join(', '), '— celle qui tourne :', process.execPath);
   // L'alerte sort de la machine (webhook Discord) : on masque le nom de session Windows, comme partout
   // ailleurs dans le panel. Le chemin complet reste dans le journal local et dans le bandeau.
-  const affiche = autres.map((p) => redactSensitive(p)).join('`\n`');
+  const affiche = autres.map((p) => masquer(p)).join('`\n`');
   setTimeout(() => queueAlert('⚠️ Deux installations du panel',
     `Une autre installation existe sur ce PC :\n\`${affiche}\`\nLes deux se lancent au démarrage et se mettent à jour chacune de leur côté. Désinstalle celle dont tu ne veux pas (Paramètres → Applications).`,
     0xFAA61A), 0);
@@ -2375,10 +2407,14 @@ else {
   // Nettoyage à la fermeture : on relance les bots coupés par le mode jeu et on efface les drapeaux
   // (watchdog + faible usage internet). Sinon les bots resteraient éteints et les alertes crash
   // suspendues indéfiniment. before-quit peut être asynchrone → on diffère la sortie le temps du nettoyage.
-  let cleanedUp = false;
+  let cleanedUp = false, quitEnCours = false;
   app.on('before-quit', (e) => {
     quitting = true;
     if (cleanedUp) return; // nettoyage déjà fait → on laisse Electron quitter
+    // Deuxième demande pendant le nettoyage : on la retient, on ne relance pas un second nettoyage en
+    // parallèle. Sans cette garde, deux `pm2 save` concurrents pouvaient graver un dump à moitié arrêté.
+    if (quitEnCours) { e.preventDefault(); return; }
+    quitEnCours = true;
     e.preventDefault();
     // Coupe la boucle de sondage AVANT le nettoyage (bump d'époque + clear du timer) : sinon un tick
     // pourrait piloter les mêmes bots (pm2 start/stop) en même temps que exitGameMode = état final indéterminé.
@@ -2395,15 +2431,26 @@ else {
     const finish = () => { if (!cleanedUp) { cleanedUp = true; log('fermeture terminee'); app.exit(0); } };
     // Volontairement PAS `unref()` : c'est le garde-fou qui GARANTIT la sortie, il doit tenir la
     // boucle d'evenements en vie jusqu'a son terme.
-    const deadline = setTimeout(() => { log('fermeture : nettoyage trop long → sortie forcée'); finish(); }, QUIT_DEADLINE_MS);
+    let deadline = null;
     (async () => {
       // Laisse une transition de mode jeu déjà en cours se terminer (max ~6 s) avant de nettoyer.
       for (let i = 0; i < 30 && busy; i++) await new Promise((r) => setTimeout(r, 200));
+      // Le compte à rebours démarre SEULEMENT MAINTENANT : armé avant l'attente, il en mangeait la
+      // moitié et le nettoyage se faisait couper au milieu d'une relance de bots.
+      deadline = setTimeout(() => { log('fermeture : nettoyage trop long → sortie forcée'); finish(); }, QUIT_DEADLINE_MS);
       // `false` = des bots coupés par le mode jeu ne sont pas repartis. Dans ce cas on NE sauvegarde
       // pas l'état pm2 : le dump servirait de référence au prochain démarrage du PC et graverait leur
       // extinction. Mieux vaut un dump un peu vieux qu'un dump qui éteint les bots.
+      // Par le VERROU, comme les trois autres appelants : en direct, cette relance pouvait lancer des
+      // `pm2 start` pendant qu'une coupure finissait ses `pm2 stop`. Seul `true` autorise la suite —
+      // `undefined` signifie que la demande a été mise en attente, donc qu'on ne sait rien.
       let relanceOk = true;
-      try { if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.some((n) => n !== '-')) relanceOk = await exitGameMode() !== false; } catch (err) { relanceOk = false; log('quit exitGameMode', err.message); }
+      try {
+        if (cfg && cfg.stoppedByGame && cfg.stoppedByGame.some((n) => n !== '-')) {
+          relanceOk = await withGameLock(exitGameMode) === true;
+          if (!relanceOk) log('fermeture : relance des bots non confirmée → pas de pm2 save');
+        }
+      } catch (err) { relanceOk = false; log('quit exitGameMode', err.message); }
       try { if (cfg && cfg.lowNetApplied) await clearLowNet(); } catch (err) { log('quit clearLowNet', err.message); }
       // Dernière chance pour une sauvegarde pm2 restée en attente (reportée par le mode jeu) : c'est
       // ce dump que pm2 restaure au prochain démarrage du PC. Sans ça, tout démarrage/arrêt fait
@@ -2416,7 +2463,7 @@ else {
           if (r.ok) { pm2SavePending = false; cfg.lastSaveAt = Date.now(); saveCfg(); }
         }
       } catch (err) { log('quit pm2 save', err.message); }
-      clearTimeout(deadline);
+      if (deadline) clearTimeout(deadline);
       finish();
     })();
   });

@@ -132,8 +132,17 @@ const classifyErrorFr = (logText) => {
 const redactSensitive = (s) => String(s || '')
   .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]')
   .replace(/\b(?:[0-9a-f]{0,4}:){3,7}[0-9a-f]{0,4}\b/gi, '[ipv6]')
-  .replace(/[A-Za-z]:\\Users\\[^\\/\s"']+/gi, 'C:\\Users\\[…]')
-  .replace(/\/(?:home|Users)\/[^/\s"']+/g, '/home/[…]');
+  // Le nom de session s'arrête au SÉPARATEUR, plus au premier blanc : « C:\Users\Jean Dupont\… » ne
+  // masquait que « Jean », et « Dupont » partait vers le webhook. Les noms avec espace sont courants.
+  // La lettre de lecteur est CONSERVÉE : la réécrire en « C: » faisait désigner à l'alerte un chemin
+  // qui n'existe pas — message inutilisable pour aller voir le dossier.
+  // Les deux séparateurs sont acceptés : « c:/users/… » est un chemin Windows valide, et il passait.
+  // Compromis assumé : en fin de ligne, faute de séparateur, quelques mots suivants peuvent être
+  // masqués avec le nom. Trop masquer ne coûte que de la lisibilité ; pas assez, c'est une fuite.
+  .replace(/([A-Za-z]):([\\/])Users\2([^\\/"']+)/gi, '$1:$2Users$2[…]')
+  // `(?<!:)` : sans ça, cette règle repassait derrière la précédente et transformait le chemin Windows
+  // « c:/Users/[…] » en « c:/home/[…] » — un chemin qui n'existe sur aucune machine.
+  .replace(/(?<!:)\/(?:home|Users)\/[^/"']+/g, '/home/[…]');
 
 // ---------- Relance automatique d'un bot tombé ----------
 // Le panel CONSTATAIT les pannes sans jamais les réparer. Quand pm2 a épuisé ses propres relances et

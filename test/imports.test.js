@@ -91,3 +91,41 @@ for (const mod of ['logic', 'validators']) {
     assert.deepEqual(fantomes, [], `importés mais absents de ${mod}.js : ${fantomes.join(', ')}`);
   });
 }
+
+// ---------------------- rien ne sort de la machine sans passer par le masqueur
+// Fuite réelle : l'alerte « Réglages non enregistrés » envoyait le chemin de config EN CLAIR vers le
+// webhook Discord — donc le nom de session Windows. Le journal LOCAL, lui, doit garder le chemin
+// entier : c'est là qu'il sert. La règle est donc « masqué dans queueAlert, entier dans log ».
+test('aucune alerte ne fait sortir un chemin de fichier en clair', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  // Toute interpolation d'un chemin à l'intérieur d'un appel queueAlert(...) doit passer par un masqueur.
+  const detecter = (code) => {
+    const suspects = [];
+    const re = /queueAlert\(([\s\S]{0,900}?)\);/g;
+    let m;
+    while ((m = re.exec(code))) {
+      for (const v of m[1].match(/\$\{[^}]*\}/g) || []) {
+        if (/\b(file|cfgPath|chemin)\b/.test(v) && !/masquer\(|redactSensitive\(/.test(v)) suspects.push(v);
+      }
+    }
+    return suspects;
+  };
+  assert.deepEqual(detecter(src), [], 'un chemin part vers le webhook sans être masqué');
+
+  // CONTRÔLE NÉGATIF, dans le test lui-même. La première version de ce détecteur cherchait « ), 0x »
+  // alors que le code écrit « , 0xfaa61a » : elle ne voyait RIEN et « passait » pour cette raison —
+  // un test anti-fuite qui ne détecte pas la fuite est pire qu'aucun test, il rassure à tort.
+  // On réintroduit donc la fuite d'origine et on exige que le détecteur la voie.
+  const avecLaFuite = src.replace('${masquer(file)}', '${file}');
+  assert.notEqual(src, avecLaFuite, 'le point de fuite historique doit rester repérable dans le code');
+  assert.ok(detecter(avecLaFuite).length > 0, 'le détecteur ne voit pas la fuite qu\'il est censé surveiller');
+});
+
+test('le masqueur efface le nom de session, pas seulement la forme du chemin', () => {
+  // redactSensitive ne reconnaît que les formes habituelles. Un chemin UNC ou un profil placé hors de
+  // \Users passait entier. Le nom de session littéral couvre ces cas.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /const NOM_SESSION = String\(process\.env\.USERNAME/);
+  assert.match(src, /const masquer = \(texte\) => \{ const s = redactSensitive\(texte\)/);
+  assert.match(src, /NOM_SESSION\.length >= 3/, 'un nom trop court hacherait tout le texte');
+});

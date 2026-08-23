@@ -542,6 +542,31 @@ test('redactSensitive : chemins POSIX, et texte sans rien à masquer inchangé',
   assert.equal(redactSensitive(null), '');
 });
 
+test('redactSensitive : un nom de session AVEC ESPACE est masqué en ENTIER', () => {
+  // Trou réel : la règle s'arrêtait au premier blanc. « C:\\Users\\Jean Dupont\\… » ne masquait que
+  // « Jean » — le nom de famille partait vers le webhook Discord. Les noms avec espace sont courants.
+  const s = redactSensitive('erreur dans C:\\Users\\Jean Dupont\\AppData\\panel.log');
+  assert.equal(/Dupont/.test(s), false, 'le nom de famille ne doit pas survivre');
+  assert.equal(/Jean/.test(s), false);
+  assert.ok(s.includes('C:\\Users\\[…]'), s);
+});
+
+test('redactSensitive : la lettre de lecteur est CONSERVÉE', () => {
+  // Elle était réécrite en « C: » : l'alerte désignait alors un chemin qui n'existe pas, et le
+  // message devenait inutilisable pour aller voir le dossier incriminé.
+  assert.ok(redactSensitive('D:\\Users\\bob\\x.log').startsWith('D:\\Users\\[…]'));
+  assert.ok(redactSensitive('E:\\Users\\bob\\x.log').startsWith('E:\\Users\\[…]'));
+});
+
+test('redactSensitive : les deux séparateurs, sans se marcher dessus', () => {
+  // « c:/users/… » est un chemin Windows valide et n'était pas reconnu. Et la règle POSIX repassait
+  // derrière la règle Windows, transformant « c:/Users/[…] » en « c:/home/[…] » — inexistant.
+  const s = redactSensitive('c:/users/teamf/app/x.js');
+  assert.equal(/teamf/.test(s), false);
+  assert.equal(/home/.test(s), false, 'un chemin Windows ne doit pas devenir un chemin Linux');
+  assert.ok(s.startsWith('c:/Users/[…]'), s);
+});
+
 test('classifyErrorFr : le repli est expurgé avant de partir en alerte', () => {
   const out = classifyErrorFr('Boom inattendu chez C:\\Users\\teamf\\bot depuis 10.0.0.7');
   assert.equal(out.includes('teamf'), false);

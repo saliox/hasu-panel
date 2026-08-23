@@ -268,3 +268,59 @@ test('l\'identité de désinstallation est figée (sinon : deux entrées dans Ap
   assert.equal(pkg.build.nsis.perMachine, false, 'per-user : une install par session, sans admin');
   assert.equal(pkg.build.nsis.allowToChangeInstallationDirectory, false, 'un seul dossier possible');
 });
+
+// ---------------------- Fermeture : les règles qui protègent les bots
+// Un audit a montré qu'en quittant le panel PENDANT une bascule de mode jeu, la relance partait hors
+// du verrou : des `pm2 start` pouvaient croiser les `pm2 stop` d'une coupure en cours, puis
+// `cfg.stoppedByGame` — le seul enregistrement disque, écrit exprès AVANT la coupure pour survivre à
+// une mort du panel — était effacé. Résultat possible : des bots éteints, sans trace.
+// Ce chemin ne se teste pas en unitaire (Electron, pm2, minuteurs) ; on fige donc ses règles.
+const mainSrc = () => fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+
+test('fermeture : la relance de fin de partie passe par le verrou de mode jeu', () => {
+  const src = mainSrc();
+  assert.match(src, /await withGameLock\(exitGameMode\) === true/,
+    'appel direct = course avec un tick déjà en vol');
+  // `undefined` veut dire « demande mise en attente », pas « réussi » : seul `true` autorise la suite.
+  assert.equal(/relanceOk = await exitGameMode\(\)/.test(src), false);
+});
+
+test('fermeture : withGameLock rend la valeur de la fonction qu\'il protège', () => {
+  // Sans ça, l'appelant ne peut pas savoir si les bots sont repartis, et autoriserait un `pm2 save`
+  // qui graverait leur extinction dans le dump que pm2 restaure au démarrage du PC.
+  assert.match(mainSrc(), /try \{ return await fn\(\); \} finally/);
+});
+
+test('fermeture : la boucle de sondage ne fait plus rien pendant l\'arrêt', () => {
+  const src = mainSrc();
+  const tick = src.slice(src.indexOf('const tick = async () => {'), src.indexOf('const tick = async () => {') + 700);
+  assert.match(tick, /if \(quitting\) return;/, 'un tick pendant la fermeture relance une transition concurrente');
+});
+
+test('fermeture : pas de second nettoyage en parallèle sur un 2e clic « Quitter »', () => {
+  assert.match(mainSrc(), /if \(quitEnCours\) \{ e\.preventDefault\(\); return; \}/);
+});
+
+test('fermeture : le compte à rebours démarre APRÈS l\'attente d\'apaisement', () => {
+  // Armé avant, il en mangeait la moitié : le nettoyage se faisait couper en pleine relance.
+  const src = mainSrc();
+  const iAttente = src.indexOf('for (let i = 0; i < 30 && busy; i++)');
+  const iDeadline = src.indexOf('deadline = setTimeout(');
+  assert.ok(iAttente > 0 && iDeadline > iAttente, 'le minuteur doit être armé après la boucle d\'attente');
+});
+
+test('fermeture : le repli du tray reste le DERNIER recours', () => {
+  // 6 s d'apaisement + 12 s de nettoyage = 18 s. Un repli à 15 s coupait le nettoyage au lieu de le
+  // secourir. Il doit rester strictement au-dessus du budget complet.
+  const src = mainSrc();
+  const budget = Number(src.match(/QUIT_DEADLINE_MS = (\d+)/)[1]) + 30 * 200;
+  const repli = Number(src.match(/Quitter : sortie forcee[\s\S]{0,80}?\}, (\d+)\)/)[1]);
+  assert.ok(repli > budget, `repli ${repli} ms doit dépasser le budget de nettoyage ${budget} ms`);
+});
+
+test('MAJ : un redémarrage qui n\'arrive pas ne fige pas le panel', () => {
+  // `quitAndInstall` ne lève pas en cas d'échec : sans chien de garde, `updateApplying` et `quitting`
+  // restaient à true — plus aucune MAJ, et la fenêtre détruite au lieu d'être réduite dans le tray.
+  const src = mainSrc();
+  assert.match(src, /if \(!updateApplying\) return;\s*\r?\n\s*updateApplying = false; quitting = false;/);
+});
