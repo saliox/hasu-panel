@@ -999,6 +999,20 @@ const applyTransitions = (bots, prev) => {
     }
     transientTicks.delete(b.name);
 
+    // 1) État persisté (toujours, même alertes coupées) — AVANT le suivi de la chute (1bis) : celui-ci
+    // lit `conf.manualStop`, qui doit déjà refléter l'arrêt volontaire détecté À CE TICK. Dans l'ordre
+    // inverse (constaté ici), un bot coupé depuis un terminal se voyait quand même ouvrir un épisode de
+    // relance automatique — `conf` et `c` désignent le MÊME objet, donc l'écriture plus bas arrivait
+    // juste trop tard pour la lecture du dessous. `runAutoHeal` s'en trouvait protégé (il relit
+    // `manualStop` une fois ce tick terminé), mais l'entrée, elle, restait dans `healState` pour de bon :
+    // `healPending` la voyait « due » au bout de 5 min et forçait un `tasklist` à chaque tick sans plus
+    // aucune raison de le faire, même panel réduit dans la zone de notification.
+    if (d.clearManualStop && conf) { conf.manualStop = false; changed = true; }
+    if (d.setManualStop) {
+      const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false, manualStop: false });
+      if (!c.manualStop) { c.manualStop = true; changed = true; log('arrêt volontaire détecté :', b.name); }
+    }
+
     // 1bis) Suivi de la chute, pour la relance automatique. Indépendant des notifications : c'est de
     // la remise en service, pas de l'information. Un bot revenu en ligne clôt son épisode.
     //
@@ -1016,13 +1030,6 @@ const applyTransitions = (bots, prev) => {
       // à chaque lancement, et un bot mort depuis des heures attend encore 5 min).
       healState.set(b.name, { downSince: Number(b.uptime) > 0 ? Number(b.uptime) : now, tries: 0, lastTryAt: 0 });
       changed = true;
-    }
-
-    // 1) État persisté (toujours, même alertes coupées)
-    if (d.clearManualStop && conf) { conf.manualStop = false; changed = true; }
-    if (d.setManualStop) {
-      const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false, manualStop: false });
-      if (!c.manualStop) { c.manualStop = true; changed = true; log('arrêt volontaire détecté :', b.name); }
     }
 
     // 2) Notifications

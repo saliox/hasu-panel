@@ -98,6 +98,22 @@ test('preload : tout ce qui est exposé est un canal réellement géré par le m
   assert.deepEqual(orphelins, [], `canaux exposés mais non gérés dans main.js : ${orphelins.join(', ')}`);
 });
 
+test('applyTransitions : le suivi de la chute lit manualStop APRÈS qu\'il soit posé, pas avant', () => {
+  // Régression : `conf` (lu une fois en tête de boucle) et le `c` mis à jour par `d.setManualStop`
+  // désignent le MÊME objet — donc l'ORDRE du code décide ce que voit le suivi de la chute (1bis),
+  // qui n'ouvre un épisode de relance que si `!conf.manualStop`. Dans le mauvais ordre, un `pm2 stop`
+  // tapé au terminal (détecté comme arrêt volontaire CE tick) ouvrait quand même un épisode : `runAutoHeal`
+  // s'en trouvait protégé (il relit `manualStop` une fois le tick terminé), mais l'entrée restait dans
+  // `healState` pour de bon — `healPending` la voyait « due » au bout de 5 min et forçait un `tasklist`
+  // à chaque tick sans plus aucune raison, même panel réduit dans la zone de notification.
+  const iFn = MAIN.indexOf('const applyTransitions = ');
+  assert.ok(iFn > 0, 'applyTransitions introuvable dans main.js');
+  const iEtat = MAIN.indexOf('1) État persisté', iFn);
+  const iChute = MAIN.indexOf('1bis) Suivi de la chute', iFn);
+  assert.ok(iEtat > 0 && iChute > 0, 'repères de commentaires introuvables (renommés ?)');
+  assert.ok(iEtat < iChute, 'le bloc « 1) État persisté » (manualStop) doit précéder « 1bis) Suivi de la chute »');
+});
+
 test('les réglages à interrupteur voyagent tous (le bug qui recochait les cases tout seul)', () => {
   // Ces champs valaient `undefined` côté écran ; comme le code teste `!== false`, l'interrupteur
   // se réaffichait « activé » à chaque rafraîchissement, quel que soit le réglage réel.
