@@ -788,3 +788,33 @@ test('verdictEcriture : la mort de la COPIE DE SECOURS est signalée séparémen
   // Le pire cas : les deux à terre. L'alerte doit alors dire la vérité, pas rassurer.
   assert.deepEqual(verdictEcriture('perdu', 'perdu'), { ok: false, bakMort: true });
 });
+
+// ---------------------- l'aller-retour disque doit préserver le RYTHME des relances
+// Défaut réel : `persistRuntime` (main.js) écrivait `{ downSince, tries }` en oubliant `lastTryAt`.
+// Or les délais entre deux tentatives se comptent depuis la DERNIÈRE TENTATIVE, pas depuis la chute —
+// c'était déjà un correctif à part entière (sans lui, les trois essais partaient en trente secondes).
+// Au redémarrage du panel, le champ revenait donc à 0 et le bot brûlait son dernier essai aussitôt.
+//
+// ⚠️ Et le test qui existait FIGEAIT la perte sans la voir : il vérifiait que `sanitizeRuntime` met
+// `lastTryAt: 0` quand le champ est absent — ce qui est correct pour LUI, mais ne dit rien de ce que
+// l'écriture avait le devoir de fournir. Un invariant qui ne regarde qu'un côté d'un aller-retour ne
+// garde pas l'aller-retour.
+test('runtime : le rythme des relances survit à un redémarrage du panel', () => {
+  const now = Date.now();
+  const enMemoire = { downSince: now - 3 * 3600e3, tries: 2, lastTryAt: now - 30e3 };
+  assert.equal(shouldAutoHeal(now, enMemoire.downSince, enMemoire.tries, enMemoire.lastTryAt), false,
+    'témoin : 30 s après la 3e tentative, on doit ATTENDRE');
+
+  // Ce que main.js écrit sur le disque, relu par sanitizeRuntime.
+  const ecrit = { downSince: enMemoire.downSince, tries: enMemoire.tries, lastTryAt: enMemoire.lastTryAt };
+  const relu = sanitizeRuntime({ heal: { bot: ecrit } }).heal.bot;
+  assert.equal(relu.lastTryAt, enMemoire.lastTryAt, 'le champ doit traverser l\'aller-retour');
+  assert.equal(shouldAutoHeal(now, relu.downSince, relu.tries, relu.lastTryAt), false,
+    'après redémarrage, la décision doit être la MÊME qu\'en mémoire');
+
+  // Contre-épreuve : sans le champ — l'ancien comportement — la décision s'inverse.
+  const sansChamp = sanitizeRuntime({ heal: { bot: { downSince: enMemoire.downSince, tries: enMemoire.tries } } }).heal.bot;
+  assert.equal(shouldAutoHeal(now, sansChamp.downSince, sansChamp.tries, sansChamp.lastTryAt), true,
+    'sans le champ, le panel relance tout de suite : c\'est bien lui qui porte la décision');
+});
+

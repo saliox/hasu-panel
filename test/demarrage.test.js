@@ -324,3 +324,35 @@ test('MAJ : un redémarrage qui n\'arrive pas ne fige pas le panel', () => {
   const src = mainSrc();
   assert.match(src, /if \(!updateApplying\) return;\s*\r?\n\s*updateApplying = false; quitting = false;/);
 });
+
+// ---------------------- Mise à jour : un échec de contrôle ne doit pas coûter la journée
+// MESURÉ sur le journal réel de la machine : 12 journées où le contrôle du démarrage a échoué
+// (`net::ERR_INTERNET_DISCONNECTED` — le réseau n'est pas encore là 12 s après l'ouverture de
+// session), et 11 sessions sur 11 d'une durée INFÉRIEURE à 6 h, médiane 10 minutes. Le réessai de
+// croisière (6 h) n'était donc jamais atteint : chaque échec supprimait tout contrôle de la session.
+test('MAJ : un contrôle raté est rattrapé bien avant la cadence de 6 h', () => {
+  const src = mainSrc();
+  const m = src.match(/const RATTRAPAGE_MS = \[([^\]]+)\]/);
+  assert.ok(m, 'l\'échelle de rattrapage doit exister — sans elle, un échec au démarrage est définitif');
+  // Les paliers sont écrits lisiblement (`2 * 60_000`) : on évalue les produits simples.
+  const paliers = m[1].split(',').map((x) => {
+    const t = x.replace(/_/g, '').trim();
+    const p = t.match(/^(\d+)\s*\*\s*(\d+)$/);
+    return p ? Number(p[1]) * Number(p[2]) : Number(t);
+  }).filter((n) => Number.isFinite(n));
+
+  assert.ok(paliers.length >= 3, `au moins 3 rattrapages (${paliers.length})`);
+  // Le premier doit tomber DANS une session typique : la médiane mesurée est de 10 minutes.
+  assert.ok(paliers[0] <= 60_000, `1er rattrapage à ${paliers[0]} ms — trop tard pour une session de 10 min`);
+  // Croissants : réessayer toujours à la même cadence sur un réseau durablement absent serait du
+  // martèlement inutile à chaque démarrage.
+  for (let i = 1; i < paliers.length; i++) {
+    assert.ok(paliers[i] > paliers[i - 1], `l'échelle doit croître (${paliers[i - 1]} → ${paliers[i]})`);
+  }
+  // …et BORNÉE : au-delà, on retombe sur la cadence de croisière au lieu de boucler.
+  assert.match(src, /if \(essaisRates >= RATTRAPAGE_MS\.length\) return;/);
+  // Un succès remet le compteur à zéro, sinon la deuxième panne de la journée n'aurait plus de filet.
+  assert.match(src, /\.then\(\(\) => \{ essaisRates = 0; \}\)/);
+  // Tous les paliers restent très en deçà des 6 h : sinon le rattrapage ne rattrape rien.
+  assert.ok(Math.max(...paliers) < 6 * 3600_000 / 4, 'un palier dépasse le quart de la cadence de croisière');
+});

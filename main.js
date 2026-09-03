@@ -108,7 +108,27 @@ const setupAutoUpdate = () => {
     updateTray();
   });
   on('error', (e) => { pushUpd({ state: 'error', message: e?.message || String(e) }); log('updater erreur :', e?.message || e); });
-  const check = () => autoUpdater.checkForUpdates().catch((e) => log('checkForUpdates', e?.message || e));
+  // ⚠️ UN ÉCHEC DE CONTRÔLE NE DOIT PAS COÛTER LA JOURNÉE.
+  //
+  //    Le 1er contrôle part 12 s après l'ouverture de session — souvent AVANT que le réseau soit
+  //    là (`net::ERR_INTERNET_DISCONNECTED`). L'essai suivant arrivait 6 h plus tard. Or, mesuré sur
+  //    le journal de cette machine : 11 sessions sur 11 durent moins de 6 h, médiane 10 minutes.
+  //    Le réessai n'était donc JAMAIS atteint : chaque échec du démarrage supprimait tout contrôle
+  //    de la session. 12 journées concernées, dont 5 consécutives.
+  //
+  //    C'est la même famille que la panne payée en v1.8.1 (un panel resté un mois sur une vieille
+  //    version) : là c'était l'INSTALLATION qui n'arrivait jamais, ici c'est la VÉRIFICATION.
+  //    On rattrape donc l'échec par une échelle courte, puis on revient à la cadence de croisière.
+  const RATTRAPAGE_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000];
+  let essaisRates = 0;
+  const check = () => autoUpdater.checkForUpdates()
+    .then(() => { essaisRates = 0; }) // réseau revenu : la prochaine panne repart d'une échelle neuve
+    .catch((e) => {
+      log('checkForUpdates', e?.message || e);
+      if (essaisRates >= RATTRAPAGE_MS.length) return; // réseau durablement absent : on attend les 6 h
+      const dans = RATTRAPAGE_MS[essaisRates++];
+      setTimeout(check, dans).unref?.(); // `unref` : ce minuteur ne doit pas retenir la fermeture
+    });
   setTimeout(check, 12000);                     // 1er contrôle 12 s après le démarrage
   setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)
 };
@@ -131,6 +151,7 @@ const {
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
+  TRANSIENT_STATUS,
 } = require('./logic');
 
 // Chemin ABSOLU d'un exécutable système (System32). execFile sans shell résout aussi le répertoire courant
@@ -949,7 +970,12 @@ const persistRuntime = () => {
   const lastAlert = {};
   for (const [k, v] of lastAlertAt) if (isSafeName(k) && Number.isFinite(v)) lastAlert[k] = v;
   const heal = {};
-  for (const [k, v] of healState) if (isSafeName(k) && v && Number.isFinite(v.downSince)) heal[k] = { downSince: v.downSince, tries: v.tries || 0 };
+  // ⚠️ `lastTryAt` DOIT être enregistré. Les délais entre deux relances se comptent depuis la DERNIÈRE
+  //    TENTATIVE, pas depuis la chute — c'était précisément un correctif antérieur (sans lui, les trois
+  //    essais partaient en trente secondes). Ce champ manquait ici : au redémarrage du panel, il
+  //    revenait à 0, `shouldAutoHeal` retombait sur `downSince`, et le bot brûlait son dernier essai
+  //    immédiatement. Démontré : en mémoire `false` (on attend), après aller-retour `true`.
+  for (const [k, v] of healState) if (isSafeName(k) && v && Number.isFinite(v.downSince)) heal[k] = { downSince: v.downSince, tries: v.tries || 0, lastTryAt: Number.isFinite(v.lastTryAt) ? v.lastTryAt : 0 };
   cfg.runtime = { lastAlertAt: lastAlert, heal };
 };
 
@@ -1049,7 +1075,13 @@ const applyTransitions = (bots, prev) => {
       cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
       addIncident(b.name, d.alert === 'looping' ? 'boucle' : 'chute', cause); changed = true;
     }
-    if (!notifyAllowed) continue;
+    // ⚠️ SILENCE ≠ OUBLI. Pendant les fenêtres de silence (90 s au démarrage, 2 min après un réveil du
+    //    PC), on ne notifie pas — mais un simple `continue` CONSOMMAIT la transition : `prevStatus`
+    //    avançait au tick suivant, l'arête « en ligne → tombé » disparaissait, et l'alerte était perdue
+    //    POUR TOUJOURS. Or ces fenêtres couvrent exactement les moments où un bot a le plus de chances
+    //    de tomber (sortie de veille, démarrage du PC). On retient donc l'arête, comme pour un état de
+    //    passage plus haut : l'alerte partira dès la réouverture de la garde, au lieu de disparaître.
+    if (!notifyAllowed) { held.add(b.name); continue; }
     if (now - (lastAlertAt.get(b.name) || 0) < ALERT_DEDUP_MS) continue; // anti-doublon 30 min
     lastAlertAt.set(b.name, now);
     // La cause a pu ne pas être lue ci-dessus (incident dédoublonné) : on la lit alors ici, car
@@ -1103,7 +1135,11 @@ const runAutoHeal = async () => {
     // de cette fonction date d'avant le spawn. On n'insiste pas contre une action en cours — mais on
     // ne SUPPRIME PAS l'épisode : le sortir de la surveillance à cause d'une action sur un AUTRE bot
     // le condamnerait à ne plus jamais être relancé. On repasse simplement au tick suivant.
-    if (actionsInFlight.size || stopAllInFlight || cfg.bots[b.name]?.manualStop) {
+    // `fixAllInFlight` MANQUAIT ici. « Remettre en ordre » lance un `pm2 start` sur exactement les bots
+    // que cette fonction surveille (`needFix` et l'état de relance appliquent les mêmes critères) :
+    // deux démarrages concurrents sur le même bot, et le panel s'attribuait le clic de l'utilisateur
+    // avec un « relance automatique réussie » mensonger — en brûlant un essai au passage.
+    if (actionsInFlight.size || stopAllInFlight || fixAllInFlight || cfg.bots[b.name]?.manualStop) {
       log('relance automatique interrompue (action en cours) :', b.name, '— reprise au prochain tick');
       break;
     }
@@ -1489,9 +1525,20 @@ const exitGameMode = async () => {
   // travaillait sur la lecture pm2 faite au DÉBUT, quand ces bots étaient encore arrêtés — d'où une
   // fausse alerte « N bots devraient être en ligne » et une pastille rouge dans la zone de
   // notification après CHAQUE partie.
+  // ⚠️ ON LAISSE AUX BOTS LE TEMPS DE SE CONNECTER AVANT DE LES JUGER. `pm2 start` rend la main bien
+  //    avant que le process soit « online » : juger à la seconde faisait passer une relance RÉUSSIE
+  //    pour un échec. C'est le piège que `runAutoHeal` documente 380 lignes plus haut, et qu'il évite
+  //    par la même attente — celle-ci manquait ici. Deux dégâts, à chaque fin de partie : une fausse
+  //    alerte « Bots non relancés », et surtout un `perdus` non vide qui faisait SAUTER le `pm2 save`
+  //    de fermeture — le dump servant de référence au prochain démarrage du PC restait donc périmé.
+  if (names.length) await new Promise((res) => setTimeout(res, 4000));
   await refreshBots();
-  const enLigne = new Set(statusCache.bots.filter((b) => b.status === 'online').map((b) => b.name));
-  const perdus = names.filter((n) => !enLigne.has(n));
+  // Un statut de PASSAGE (`launching`…) n'est pas un échec : le bot est bel et bien reparti, il finit
+  // de démarrer. Seul un état terminal compte comme perdu — et si le démarrage se bloque vraiment,
+  // c'est la surveillance normale (alertes, relance automatique) qui le rattrapera aux ticks suivants.
+  const repartis = new Set(statusCache.bots
+    .filter((b) => b.status === 'online' || TRANSIENT_STATUS.has(b.status)).map((b) => b.name));
+  const perdus = names.filter((n) => !repartis.has(n));
   log('mode jeu OFF — relancés :', names.join(', ') || '(aucun)',
     perdus.length ? `— ÉCHEC de relance : ${perdus.join(', ')}` : '');
   if (perdus.length) {
@@ -2189,6 +2236,14 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
     // prochain démarrage du panel (bootEnforce). Un start/restart manuel lève le drapeau.
     const b = cfg.bots[name] || (cfg.bots[name] = { auto: true, gameStop: false });
     if (action === 'stop') b.manualStop = true; else b.manualStop = false;
+    // ⚠️ ET LE BOT SORT DE LA LISTE « coupé par le mode jeu ». Un geste MANUEL reprend la main sur ce
+    //    bot : le mode jeu n'en est plus propriétaire. Sans cette ligne, un bot relancé à la main
+    //    pendant une partie restait « parqué » — or `cfg.stoppedByGame` est lu à trois endroits pour
+    //    NE PAS surveiller : la décision d'alerte (l. 1033), l'auto-réparation (l. 1117) et le bandeau
+    //    « à remettre en ordre » (l. 1189). Il tombait donc dans un trou : ni alerte, ni toast, ni
+    //    relance automatique, ni pastille rouge, pendant toute la partie. Et à la fin, `exitGameMode`
+    //    le relançait alors qu'on venait peut-être de l'arrêter exprès.
+    cfg.stoppedByGame = cfg.stoppedByGame.filter((n) => n !== name);
     saveCfg();
     if (action === 'stop') r = await stopTree(name);
     else if (action === 'restart') { await stopTree(name); r = await pm2(['start', name]); }

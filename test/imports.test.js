@@ -129,3 +129,34 @@ test('le masqueur efface le nom de session, pas seulement la forme du chemin', (
   assert.match(src, /const masquer = \(texte\) => \{ const s = redactSensitive\(texte\)/);
   assert.match(src, /NOM_SESSION\.length >= 3/, 'un nom trop court hacherait tout le texte');
 });
+
+
+// ---------------------- l'écrivain doit fournir ce que le lecteur tolère de ne pas trouver
+test('runtime : main.js écrit bien lastTryAt (l\'oubli est invisible côté lecture)', () => {
+  // `sanitizeRuntime` accepte un `lastTryAt` absent sans broncher — c'est voulu, mais ça rend l'oubli
+  // de l'écrivain totalement muet. Seul un regard sur l'écrivain le rattrape.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const m = src.match(/heal\[k\] = \{ downSince: [^}]+\}/);
+  assert.ok(m, 'la ligne d\'écriture de persistRuntime doit être trouvable');
+  assert.match(m[0], /lastTryAt/, 'persistRuntime doit enregistrer lastTryAt');
+});
+
+// ---------------------- aucun verrou de manœuvre ne doit être oublié par la relance automatique
+// Défaut réel : `fixAllInFlight` existait mais n'était testé que dans son propre gestionnaire. La
+// relance automatique gardait `actionsInFlight` et `stopAllInFlight`, pas lui — et « Remettre en
+// ordre » agit précisément sur les bots qu'elle surveille. Deux `pm2 start` concurrents sur le même
+// bot, et un « relance automatique réussie » mensonger qui s'attribuait le clic de l'utilisateur.
+//
+// Ce test énumère TOUS les drapeaux de manœuvre déclarés et exige que la garde les connaisse : un
+// cinquième drapeau ajouté demain ne pourra pas être oublié en silence.
+test('relance automatique : la garde connaît tous les verrous de manœuvre', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const declares = [...new Set([...src.matchAll(/^let (\w*InFlight)\b/gm)].map((m) => m[1]))];
+  assert.ok(declares.length >= 2, `au moins deux drapeaux attendus, trouvés : ${declares.join(', ')}`);
+
+  const garde = src.match(/if \(actionsInFlight\.size[^)]*\) \{/);
+  assert.ok(garde, 'la garde de runAutoHeal doit rester repérable');
+  const oublies = declares.filter((d) => !garde[0].includes(d));
+  assert.deepEqual(oublies, [],
+    `drapeau(x) absent(s) de la garde : ${oublies.join(', ')} — une manœuvre de l'utilisateur et la relance automatique agiraient en même temps sur le même bot`);
+});
