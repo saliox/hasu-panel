@@ -142,7 +142,26 @@ const redactSensitive = (s) => String(s || '')
   .replace(/([A-Za-z]):([\\/])Users\2([^\\/"']+)/gi, '$1:$2Users$2[…]')
   // `(?<!:)` : sans ça, cette règle repassait derrière la précédente et transformait le chemin Windows
   // « c:/Users/[…] » en « c:/home/[…] » — un chemin qui n'existe sur aucune machine.
-  .replace(/(?<!:)\/(?:home|Users)\/[^/"']+/g, '/home/[…]');
+  .replace(/(?<!:)\/(?:home|Users)\/[^/"']+/g, '/home/[…]')
+  // ---- IDENTIFIANTS ----
+  // Les règles ci-dessus protégeaient l'IP et le nom de session. Elles ne protégeaient RIEN d'autre :
+  // quand aucun motif de classifyErrorFr ne reconnaît l'erreur, c'est la dernière ligne BRUTE du log
+  // du bot qui part vers le webhook Discord. Un bot qui plante en affichant sa chaîne de connexion,
+  // son token, une en-tête Authorization ou l'URL d'un autre webhook publiait donc l'identifiant dans
+  // un salon Discord — et un salon a des membres, un historique et des bots tiers.
+  // Même doctrine que plus haut : trop masquer ne coûte que de la lisibilité, pas assez est une fuite.
+  // L'ORDRE compte : les identifiants d'URL d'abord, l'e-mail en dernier (sinon il mangerait le « @ »
+  // de « user:pass@hôte » et la règle d'URL ne reconnaîtrait plus rien).
+  .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s:@/]+:[^\s@/]+@/gi, '$1[identifiant]:[identifiant]@')
+  .replace(/(discord(?:app)?\.com\/api\/webhooks\/\d+\/)[\w-]+/gi, '$1[identifiant]')
+  .replace(/\beyJ[\w-]{6,}\.[\w-]{6,}\.[\w-]{6,}/g, '[identifiant]')               // JWT
+  .replace(/\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}\b/g, '[identifiant]') // token Discord
+  .replace(/\b(Bearer|Bot|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [identifiant]')
+  // Le préfixe collé est accepté : `\b(token)` ne reconnaît PAS « DISCORD_TOKEN= », faute de frontière
+  // de mot entre « _ » et « TOKEN » — et c'est pourtant la forme la plus courante dans un log.
+  .replace(/([\w.]*(?:token|secret|password|passwd|pwd|api[_-]?key|authorization|cookie|client[_-]?secret))(\s*[:=]\s*)(["']?)[^\s"',;]{6,}/gi,
+    (m, cle, sep, guillemet) => `${cle}${sep}${guillemet}[identifiant]`)
+  .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b/g, '[courriel]');
 
 // ---------- Relance automatique d'un bot tombé ----------
 // Le panel CONSTATAIT les pannes sans jamais les réparer. Quand pm2 a épuisé ses propres relances et
