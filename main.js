@@ -243,6 +243,13 @@ const isWindowVisible = () => !!(win && !win.isDestroyed() && win.isVisible());
 let cfg = null;
 let lastGameSeen = null, lastGameAt = 0;
 let sessionOnline = false; // le jeu détecté a une vraie connexion Internet (session multijoueur)
+// …et POUR QUEL JEU. Sans ce lien, le verdict « en ligne » survivait au jeu qui l'avait obtenu :
+// quitter un jeu en ligne puis lancer un jeu SOLO dans la fenêtre de grâce (60 s par défaut, jusqu'à
+// une heure) laissait `sessionOnline` à vrai, la sonde était sautée (`gameRunning && !sessionOnline`),
+// et le mode jeu coupait les bots toute la session solo malgré « ignorer les jeux solo ». Les deux
+// seules remises à zéro étaient hors d'atteinte : l'une exige que le scan de process soit SAUTÉ (il ne
+// l'est jamais mode jeu actif), l'autre que la grâce soit écoulée.
+let sessionOnlineFor = '';
 // Vrai quand on n'a PAS pu savoir si un jeu tourne (scan sauté, ou tasklist en échec). À distinguer
 // de « aucun jeu » : les décisions coûteuses ou dérangeantes (scan disque, application d'une MAJ)
 // ne doivent pas se déclencher sur une ignorance prise pour une absence.
@@ -796,6 +803,9 @@ const ALERT_MAX_PER_HOUR = 6;
 const startedAt = Date.now();
 let quietUntil = 0, alertTimes = [], lastAlertAt = new Map(), prevStatus = new Map(), alertsPrimed = false;
 let alertsSuppressed = []; // horodatages des alertes différées par le plafond horaire (fenêtre 1 h) — remonté à l'écran
+// Alertes dont TOUS les envois ont échoué : nom du bot → date à partir de laquelle on rejoue l'arête.
+// Voir drainAlerts (l'abandon) et le tick (le rejeu) ; le délai est celui de l'anti-doublon normal.
+const rejouerArete = new Map();
 
 // (Le diagnostic en français vit dans logic.js `classifyErrorFr` — l'ORDRE de ses règles est figé par
 // un test, car un même log peut contenir plusieurs signatures et la première l'emporte.)
@@ -920,9 +930,21 @@ const drainAlerts = async () => {
       if (ok) continue;
       const attente = ALERT_RETRY_MS[a.essais];
       if (attente === undefined) {
-        // Abandon. On OUBLIE que ce bot a été signalé pour qu'un tick ultérieur puisse réessayer,
-        // au lieu de le laisser silencieux pour toujours.
-        if (a.cle) lastAlertAt.delete(a.cle);
+        // Abandon après ~7 min 30 d'essais.
+        //
+        // ⚠️ OUBLIER L'ANTI-DOUBLON NE SUFFISAIT PAS, et ce commentaire décrivait donc un comportement
+        //    que le code n'avait pas : « un tick ultérieur pourra réessayer » était faux. Ce n'est pas
+        //    l'anti-doublon qui empêche de réalerter, c'est l'ARÊTE. L'alerte naît d'une TRANSITION
+        //    « en ligne → tombé », et cette transition a été consommée au PREMIER envoi : `prevStatus`
+        //    porte « tombé » depuis sept minutes. Aux ticks suivants, prev et cur disent tous deux
+        //    « tombé », `decideAlert` ne voit plus rien, et le bot restait muet POUR TOUJOURS — très
+        //    exactement le scénario fondateur de la fonctionnalité : la panne réseau qui tue les bots
+        //    ET le webhook censé le dire.
+        //    On RECONSTRUIT donc l'arête au tick suivant. Pas tout de suite : à l'expiration de
+        //    l'anti-doublon normal, sinon un webhook durablement cassé relancerait une volée de
+        //    notifications toutes les sept minutes. Une chute non remise coûte au plus deux
+        //    tentatives par heure, comme n'importe quelle autre alerte répétée.
+        if (a.cle) { lastAlertAt.delete(a.cle); rejouerArete.set(a.cle, Date.now() + ALERT_DEDUP_MS); }
         log('alerte abandonnée après', a.essais, 'réessai(s) :', a.title);
         continue;
       }
@@ -1603,7 +1625,7 @@ const tick = async () => {
     // périmés. `sessionOnline` en particulier restait collé à `true` — au prochain jeu lancé, même SOLO,
     // la sonde « partie en ligne » était sautée (condition `gameRunning && !sessionOnline`) et le mode
     // jeu coupait les bots malgré l'option « ignorer les jeux solo ».
-    statusCache.game = null; sessionOnline = false; statusCache.online = false;
+    statusCache.game = null; sessionOnline = false; sessionOnlineFor = ''; statusCache.online = false;
   }
   // UNE seule lecture pm2 par tick (lancée ci-dessus, en parallèle du scan de process) : elle sert et
   // à la bascule du mode jeu et à l'affichage. Avant, un lancement de jeu déclenchait deux
@@ -1630,9 +1652,13 @@ const tick = async () => {
 
     // Session EN LIGNE ? (jeu solo → on ne coupe rien). Revérifié à chaque tick tant que le jeu
     // tourne sans être « en ligne » : lancer GTA en histoire puis passer en Online déclenche bien.
+    // Un AUTRE jeu que celui qui a obtenu le verdict : tout est à revérifier. C'est le cas qui faisait
+    // couper les bots sur un jeu solo lancé juste après un jeu en ligne.
+    if (gameRunning && hit !== sessionOnlineFor) { sessionOnline = false; sessionOnlineFor = ''; }
     if (gameRunning && !sessionOnline) {
       sessionOnline = cfg.gameMode.soloSkip === false ? true : await hasOnlineActivity(procs.pids.get(hit.toLowerCase()) || []);
-    } else if (!gameRunning && graceOver) sessionOnline = false;
+      if (sessionOnline) sessionOnlineFor = hit; // on retient À QUI appartient ce verdict
+    } else if (!gameRunning && graceOver) { sessionOnline = false; sessionOnlineFor = ''; }
     statusCache.online = gameRunning && sessionOnline;
 
     await withGameLock(async () => {
@@ -1668,6 +1694,17 @@ const tick = async () => {
     const suivant = snapshotOf(statusCache.bots);
     if (!alertsPrimed) { prevStatus = suivant; alertsPrimed = true; } // 1er tick : amorçage silencieux
     else {
+      // Alerte abandonnée faute d'envoi : on remet l'instantané PRÉCÉDENT à « en ligne », pour que la
+      // chute redevienne une transition visible par decideAlert. Sans ça, l'oubli de l'anti-doublon
+      // côté drainAlerts ne servait à rien (voir le commentaire là-bas).
+      for (const [nom, quand] of rejouerArete) {
+        if (Date.now() < quand) continue;
+        const c = suivant.get(nom);
+        if (!c) continue;                      // bot absent de pm2 : on garde l'arête pour plus tard
+        rejouerArete.delete(nom);
+        if (c.status === 'online') continue;   // revenu tout seul entre-temps : plus rien à signaler
+        prev.set(nom, { status: 'online', restarts: c.restarts });
+      }
       let held = new Set();
       try { held = applyTransitions(statusCache.bots, prev) || new Set(); }
       catch (e) { log('applyTransitions', e.message); }
