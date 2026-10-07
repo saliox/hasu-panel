@@ -590,9 +590,17 @@ const resolvePm2Runner = () => {
   log('pm2 runner :', pm2Direct ? `direct (${NODE_EXE})` : 'repli cmd.exe');
 };
 // (Repli cmd.exe : `quoteForShell` vit dans logic.js, testé unitairement.)
+// Les commandes de LECTURE n'ont pas la patience des commandes d'écriture. Un `jlist` est mesuré à
+// ~300 ms ; lui laisser 60 s comme à un `start` ou un `resurrect` (qui, eux, sont réellement lents)
+// retardait d'autant la détection d'un pm2 bloqué — le tick ATTEND ce retour, donc l'écran, le tray et
+// la surveillance restaient figés sur un état périmé pendant une minute entière. 20 s laissent encore
+// 60× la durée mesurée, et un dépassement isolé ne déclenche aucune alerte : pm2Health exige ~2 min
+// d'échecs avant de dire « pm2 ne répond plus ».
+const PM2_LECTURE = new Set(['jlist', 'list', 'prettylist']);
 const pm2Raw = (args) => new Promise((resolve) => {
   const done = (err, out, errOut) => resolve({ ok: !err, out: `${out || ''}\n${errOut || ''}`.trim() });
-  const opts = { windowsHide: true, timeout: 60000, maxBuffer: 16 * 1024 * 1024 };
+  const lecture = args.length === 1 && PM2_LECTURE.has(String(args[0]));
+  const opts = { windowsHide: true, timeout: lecture ? 20000 : 60000, maxBuffer: 16 * 1024 * 1024 };
   if (pm2Direct) return execFile(NODE_EXE, [PM2_JS, ...args.map(String)], opts, done);
   execFile(`"${PM2}"`, args.map(quoteForShell), { ...opts, shell: true }, done);
 });
@@ -1750,10 +1758,16 @@ const bootEnforce = async () => {
     }
     if (!list.length) log('bootEnforce: aucun process pm2 après plusieurs resurrect — auto-démarrage abandonné pour cette session');
   }
+  // Les arrêts sont MUTUALISÉS. `stopTree` refait un `pm2 jlist` pour retrouver le PID — alors qu'on
+  // vient de lire la liste, PID compris — puis un instantané complet de l'arbre de process et une grâce
+  // de 4 s, le tout PAR BOT. Et ce jlist interne peut échouer : on obtient alors pid=0, l'arbre est vide,
+  // et les enfants orphelins ne sont plus reapés DU TOUT, sans que rien ne le dise. `stopBotsTree` prend
+  // les PID déjà en main : un instantané, une grâce, pour tout le lot.
+  const aArreter = [], aDemarrer = [];
   for (const b of list) {
     const c = cfg.bots[b.name];
     if (!c) continue;
-    if (c.auto === false && b.status === 'online') { await stopTree(b.name); log('boot: stop', b.name, '(auto off)'); }
+    if (c.auto === false && b.status === 'online') { aArreter.push({ name: b.name, pid: b.pid }); }
     else if (c.auto !== false && b.status !== 'online') {
       // Ne PAS ressusciter un bot que le mode jeu vient de couper (jeu déjà lancé au logon → tick a rempli
       // stoppedByGame avant ce bootEnforce à +8s) : sinon on relance ce que le mode jeu a intentionnellement stoppé.
@@ -1762,9 +1776,15 @@ const bootEnforce = async () => {
       // démarrage du PC », pas « impossible à laisser éteint ». Avant, chaque relance du panel (y compris
       // après une mise à jour auto) rallumait tout seul les bots volontairement arrêtés.
       if (c.manualStop) { log('boot: skip', b.name, '(arrêté manuellement)'); continue; }
-      await pm2(['start', b.name]); log('boot: start', b.name);
+      aDemarrer.push(b.name);
     }
   }
+  // Arrêts d'abord (on libère avant d'allouer), en UN lot.
+  if (aArreter.length) {
+    log('boot: stop', aArreter.map((e) => e.name).join(','), '(auto off)');
+    await stopBotsTree(aArreter);
+  }
+  for (const n of aDemarrer) { await pm2(['start', n]); log('boot: start', n); }
 };
 
 // ---------- Lancement auto du panel ----------
