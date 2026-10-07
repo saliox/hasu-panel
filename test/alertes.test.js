@@ -138,3 +138,70 @@ test('alerte abandonnée : main.js applique bien cette règle (et pas une varian
   const j = src.indexOf('applyTransitions(statusCache.bots, prev)');
   assert.ok(i > 0 && j > i, 'le rejeu doit précéder applyTransitions dans le tick');
 });
+
+// ---------------------------------------------------------------------------------------------
+// La FILE PLEINE : l'autre porte par laquelle une alerte disparaissait définitivement.
+//
+// `queueAlert` refusait d'empiler au-delà de 20 entrées, avec un simple `return`. Or l'appelant a
+// déjà posé `lastAlertAt` et consommé la transition AVANT d'arriver là : le bot n'était signalé
+// nulle part, ni sur le moment ni plus tard. Et la file se remplit précisément pendant une panne
+// large — réseau coupé, tous les bots tombent ensemble, chaque webhook expire en 10 s — donc au seul
+// moment qui compte.
+const CAPACITE = 20;
+
+// Modèle minimal : la file est SATURÉE par d'autres alertes, et notre bot tombe à ce moment-là.
+const chuteFilePleine = (avecCorrectif) => {
+  const lastAlertAt = new Map();
+  const rejouerArete = new Map();
+  let file = CAPACITE;            // saturée par d'autres bots
+  let prev = 'online';
+  const campagnes = [];
+
+  for (let now = 0; now <= 120 * 60 * 1000; now += 10 * 1000) {
+    if (now === 30 * 60 * 1000) file = 0;   // la file se vide enfin (le réseau est revenu)
+
+    // tick : rejeu éventuel de l'arête
+    if (avecCorrectif) {
+      for (const [n, quand] of rejouerArete) {
+        if (now < quand) continue;
+        rejouerArete.delete(n);
+        prev = 'online';                     // l'arête est reconstruite
+      }
+    }
+    const cur = 'errored';
+    if (prev === 'online') {                 // transition détectée
+      if (now - (lastAlertAt.get('bot') || 0) >= 30 * 60 * 1000 || !lastAlertAt.has('bot')) {
+        lastAlertAt.set('bot', now);         // l'appelant pose l'anti-doublon AVANT d'empiler
+        if (file >= CAPACITE) {
+          // C'est ICI que tout se joue.
+          if (avecCorrectif) { lastAlertAt.delete('bot'); rejouerArete.set('bot', now + 30 * 60 * 1000); }
+        } else { file++; campagnes.push(now); }
+      }
+    }
+    prev = cur;
+  }
+  return campagnes;
+};
+
+test('file pleine : AVANT, la chute n\'était signalée NULLE PART (contre-épreuve)', () => {
+  assert.deepEqual(chuteFilePleine(false), [],
+    'aucune alerte en deux heures, alors que le bot est tombé et que la file s\'est vidée depuis');
+});
+
+test('file pleine : la chute est signalée dès que la file se dégage', () => {
+  const c = chuteFilePleine(true);
+  assert.ok(c.length >= 1, 'la chute doit finir par être annoncée');
+  assert.ok(c[0] >= 30 * 60 * 1000, `annoncée à ${Math.round(c[0] / 60000)} min, soit après le dégagement`);
+});
+
+test('file pleine : main.js diffère au lieu de perdre (et le dit)', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /const ALERT_QUEUE_MAX = 20;/);
+  assert.match(src, /if \(cle\) \{ lastAlertAt\.delete\(cle\); rejouerArete\.set\(cle, Date\.now\(\) \+ ALERT_DEDUP_MS\); \}/,
+    'une alerte refusée par la file doit redevenir rejouable');
+  // `\\?` : dans la SOURCE l'apostrophe est échappée (`d\'alertes`). Chercher la chaîne telle qu'elle
+  // s'AFFICHE ne la trouve pas — un motif de source s'écrit sur le texte écrit, pas sur le texte rendu.
+  assert.match(src, /file d\\?'alertes pleine/, 'un rejet muet est un rejet qu\'on ne corrigera jamais');
+  // …et le refus ne doit PAS rester un `return` nu.
+  assert.doesNotMatch(src, /if \(alertQueue\.length >= 20\) return;/);
+});

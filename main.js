@@ -963,8 +963,24 @@ const drainAlerts = async () => {
     }
   } finally { alertDraining = false; }
 };
+// Borne dure de la file : on ne la laisse pas enfler sans fin (chaque entrée garde son corps de
+// message en mémoire, et une file de mille alertes ne sert personne).
+const ALERT_QUEUE_MAX = 20;
 const queueAlert = (title, body, color, cle = '') => {
-  if (alertQueue.length >= 20) return; // borne dure : on ne laisse pas la file enfler sans fin
+  if (alertQueue.length >= ALERT_QUEUE_MAX) {
+    // ⚠️ CE REJET ÉTAIT MUET, ET IL PERDAIT L'ALERTE. L'appelant a déjà posé `lastAlertAt` et
+    //    consommé la transition AVANT d'arriver ici : un simple `return` et le bot n'est signalé
+    //    NULLE PART, ni maintenant ni plus tard — la même perte définitive que l'abandon après
+    //    réessais, par une autre porte. Et la file se remplit précisément pendant une panne large
+    //    (réseau coupé : tous les bots tombent ensemble, chaque webhook expire en 10 s), donc au
+    //    seul moment qui compte.
+    //    On REND donc l'alerte rejouable, exactement comme à l'abandon : on oublie l'anti-doublon et
+    //    on réarme l'arête pour plus tard. Une alerte par bot et par fenêtre d'anti-doublon au plus,
+    //    donc ce journal ne peut pas noyer le fichier.
+    if (cle) { lastAlertAt.delete(cle); rejouerArete.set(cle, Date.now() + ALERT_DEDUP_MS); }
+    log('file d\'alertes pleine (' + alertQueue.length + ') —', cle ? 'alerte DIFFÉRÉE :' : 'alerte PERDUE :', title);
+    return;
+  }
   alertQueue.push({ title, body, color, cle, essais: 0, notifie: false });
   drainAlerts(); // volontairement pas attendu : la boucle de surveillance continue
 };
