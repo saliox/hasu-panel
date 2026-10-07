@@ -969,6 +969,31 @@ const queueAlert = (title, body, color, cle = '') => {
   drainAlerts(); // volontairement pas attendu : la boucle de surveillance continue
 };
 
+// À QUI l'interrupteur « Alertes » s'applique-t-il ? L'écran promet exactement ceci : « Me prévenir
+// quand un bot TOMBE ou REDÉMARRE EN BOUCLE ». Donc :
+//   • tout ce qui parle d'un BOT passe par ici et obéit à l'interrupteur ;
+//   • tout ce qui parle du PANEL lui-même (journal bloqué, réglages non enregistrés, détection de jeu
+//     à l'arrêt, deux installations) appelle queueAlert directement et n'y obéit PAS — couper les
+//     alertes de bots ne demande pas au panel de cacher ses propres pannes.
+//
+// Il n'y avait AUCUNE règle avant, et le recensement sur l'arbre le montrait : 13 émetteurs, 8 sans
+// aucune garde, dans les deux familles à la fois. Un commentaire affirmait même qu'un certain site
+// était « le seul émetteur qui ignorait l'interrupteur » — c'était faux, et cette prémisse a fait
+// garder un site de la famille PANEL pendant que trois sites de la famille BOT restaient libres :
+// décocher « me prévenir quand un bot tombe » laissait quand même passer « 🔧 relancé
+// automatiquement », « ⛔ ne repart pas » et « ⚠️ bots non relancés après la partie ». L'asymétrie
+// était visible à l'œil nu : « ✅ est de retour » était gardé, « 🔧 relancé automatiquement » non,
+// alors que les deux annoncent la même chose.
+//
+// Les fenêtres de silence (démarrage, réveil) ne sont PAS appliquées ici : elles protègent des
+// rafales de faux positifs issues d'une TRANSITION douteuse. Les alertes qui passent par ce juge
+// reposent sur un fait MESURÉ (relance tentée puis état relu), et elles ne sont jamais rejouées —
+// les taire reviendrait à les perdre.
+const alerteBot = (titre, corps, couleur, cle = '') => {
+  if (cfg.alerts === false) return;
+  queueAlert(titre, corps, couleur, cle);
+};
+
 // Photo de l'état des bots, base de toute détection de transition.
 const snapshotOf = (bots) => new Map(bots.map((b) => [b.name, { status: b.status, restarts: b.restarts }]));
 
@@ -1185,10 +1210,10 @@ const runAutoHeal = async () => {
     addIncident(b.name, enLigne ? 'relance' : 'relance-ko', enLigne ? `essai ${st.tries}` : classifyErrorFr(String(r.out || '')));
     if (enLigne) {
       healState.delete(b.name);
-      queueAlert(`🔧 ${b.name} relancé automatiquement`,
+      alerteBot(`🔧 ${b.name} relancé automatiquement`,
         `Il était tombé, le panel l'a redémarré (essai ${st.tries}). Aucune action de ta part.`, 0x57F287, b.name);
     } else if (st.tries >= AUTO_HEAL_MAX) {
-      queueAlert(`⛔ ${b.name} ne repart pas`,
+      alerteBot(`⛔ ${b.name} ne repart pas`,
         `${AUTO_HEAL_MAX} relances automatiques ont échoué. Il faut regarder : dossier déplacé, dépendance manquante ou token révoqué.`, 0xED4245, b.name);
     }
     break; // une seule par tick — voir le commentaire en tête de boucle
@@ -1575,7 +1600,7 @@ const exitGameMode = async () => {
     // Un bot que le mode jeu a coupé et n'a pas su rallumer, c'est exactement le silence que ce
     // panel existe pour supprimer (cas réel : le démon pm2 redémarre pendant la partie et perd la
     // définition du process).
-    queueAlert('⚠️ Bots non relancés après la partie',
+    alerteBot('⚠️ Bots non relancés après la partie',
       `Le mode jeu n'a pas réussi à redémarrer : **${perdus.join(', ')}**. Utilise « Remettre en ordre » ou vérifie leur dossier.`,
       0xED4245);
   }
@@ -2065,9 +2090,13 @@ const detecterSecondeInstallation = async () => {
   log('DEUXIÈME INSTALLATION détectée :', autres.join(', '), '— celle qui tourne :', process.execPath);
   // L'alerte sort de la machine (webhook Discord) : on masque le nom de session Windows, comme partout
   // ailleurs dans le panel. Le chemin complet reste dans le journal local et dans le bandeau.
-  // Seul émetteur qui ignorait l'interrupteur des alertes, et sans aucune mémoire : toast + webhook
-  // à CHAQUE démarrage, sans moyen de l'arrêter. On ne réalerte que si le chemin CHANGE.
-  if (cfg.alerts === false) return;
+  // Le vrai défaut ici était l'absence de MÉMOIRE : toast + webhook à CHAQUE démarrage, sans moyen
+  // de l'arrêter. C'est `dualWarnedFor` qui le corrige — une alerte par signature de chemin.
+  // Le garde-fou `cfg.alerts === false` qui l'accompagnait reposait, lui, sur une affirmation fausse
+  // (« seul émetteur qui ignorait l'interrupteur » : il y en avait huit). Deux installations qui se
+  // mettent à jour chacune de leur côté est une panne DU PANEL, pas un bot qui tombe : la retirer de
+  // l'écran parce qu'on a décoché les alertes de bots cacherait le problème au seul moment où il
+  // compte. Voir le juge `alerteBot` pour la règle.
   const signature = autres.join('|');
   if (cfg.dualWarnedFor === signature) return;
   cfg.dualWarnedFor = signature; saveCfg();
