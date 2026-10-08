@@ -161,7 +161,7 @@ const render = (st) => {
   // le moindre signe (fichier lisible mais plus écrit), et il fait perdre webhook et préférences.
   const dualHtml = st.secondeInstall
     ? `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">${t('dual.title')}</div>`
-      + `<div class="updcard-ver">${esc(t('dual.body', { path: st.secondeInstall }))}</div></div></div>`
+      + `<div class="updcard-ver">${t('dual.body', { path: esc(st.secondeInstall) })}</div></div></div>`
     : '';
   const warnHtml = st.cfgWriteFailed
     ? dualHtml + `<div class="updcard-head"><span class="updcard-ico">⚠️</span><div><div class="updcard-ttl">${t('cfg.failTitle')}</div>`

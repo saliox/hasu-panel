@@ -196,3 +196,23 @@ test('ui : chaque changement envoyé marque sa case comme « en vol »', () => {
   // réglage refusé par le disque.
   assert.match(src, /reglagesTouches\.get\(id\) \|\| 0\) < \d+/);
 });
+
+test('ui : esc() s\'applique au PARAMÈTRE, jamais au résultat de t()', () => {
+  // Doctrine écrite dans ui/i18n.js : « les valeurs peuvent contenir du HTML (gras) : elles viennent
+  // des fichiers de langue, jamais de l'extérieur. Tout ce qui vient de pm2, d'un log ou d'une
+  // release passe par esc() côté appelant. »
+  //
+  // Envelopper t() dans esc() inverse la règle : ça échappe la valeur du GABARIT. Rien ne se voyait
+  // aujourd'hui (aucune langue n'avait de balise dans la clé concernée), mais le test
+  // « les balises HTML sont conservées à l'identique » plus haut IMPOSE la balise dans les 14 langues
+  // dès qu'on l'ajoute au français : le jour où quelqu'un met un <b> autour du chemin, l'utilisateur
+  // lirait « <b>C:\… </b> » en clair. Un geste normal suffisait à déclencher le piège.
+  const app = fs.readFileSync(path.join(__dirname, '..', 'ui', 'app.js'), 'utf8');
+  const inverses = [...app.matchAll(/esc\(\s*t\(\s*'([^']+)'/g)].map((m) => m[1]);
+  assert.deepEqual(inverses, [], 'escaper le résultat de t() écraserait le HTML voulu du gabarit');
+
+  // TÉMOIN : le motif doit reconnaître un porteur fabriqué. Sans lui, « aucun » peut vouloir dire
+  // « mon motif ne reconnaît rien ».
+  const faux = "div.innerHTML = `${esc(t('dual.body', { path: p }))}`;";
+  assert.equal([...faux.matchAll(/esc\(\s*t\(\s*'([^']+)'/g)].length, 1, 'le motif ne détecte rien');
+});
