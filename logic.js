@@ -159,7 +159,13 @@ const redactSensitive = (s) => String(s || '')
   .replace(/\b(Bearer|Bot|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [identifiant]')
   // Le préfixe collé est accepté : `\b(token)` ne reconnaît PAS « DISCORD_TOKEN= », faute de frontière
   // de mot entre « _ » et « TOKEN » — et c'est pourtant la forme la plus courante dans un log.
-  .replace(/([\w.]*(?:token|secret|password|passwd|pwd|api[_-]?key|authorization|cookie|client[_-]?secret))(\s*[:=]\s*)(["']?)[^\s"',;]{6,}/gi,
+  // `\b` + préfixe collé OPTIONNEL suivi d'un SÉPARATEUR : `\b(token)` ne reconnaît pas
+  // « DISCORD_TOKEN= » (pas de frontière de mot entre « _ » et « TOKEN »), et c'est la forme la plus
+  // courante dans un log. Le séparateur obligatoire dans le préfixe est ce qui évite d'attraper des
+  // mots ordinaires : « monkey=… » n'a pas de `[_.-]` devant « key » et n'est donc PAS masqué.
+  // `key` a été ajouté seul : la règle ne connaissait que `api_key`, donc BACKUP_KEY (la clé qui
+  // chiffre les sauvegardes du bot !), ENCRYPTION_KEY, PRIVATE_KEY, SIGNING_KEY partaient EN CLAIR.
+  .replace(/\b((?:[\w.]*[_.-])?(?:tokens?|secrets?|passwords?|passwd|pwd|apikey|api[_-]?key|keys?|authorization|cookies?|client[_-]?secret))(\s*[:=]\s*)(["']?)[^\s"',;]{6,}/gi,
     (m, cle, sep, guillemet) => `${cle}${sep}${guillemet}[identifiant]`)
   .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b/g, '[courriel]');
 
@@ -275,9 +281,17 @@ const sanitizeIncidents = (raw, max = 40) =>
 
 const sanitizeRuntime = (raw) => {
   const r = (raw && typeof raw === 'object') ? raw : {};
-  const lastAlertAt = {}, heal = {};
+  const lastAlertAt = {}, heal = {}, rejouer = {};
   const a = (r.lastAlertAt && typeof r.lastAlertAt === 'object') ? r.lastAlertAt : {};
   for (const k of Object.keys(a)) if (_sain(k) && Number.isFinite(a[k])) lastAlertAt[k] = a[k];
+  // ⚠️ TOUT CHAMP NEUF DOIT ÊTRE DÉCLARÉ ICI. Cette fonction reconstruit depuis zéro — c'est sa
+  //    raison d'être, aucune donnée venue du disque n'est recopiée telle quelle — donc un champ
+  //    oublié est JETÉ EN SILENCE, et la persistance qui le produit ne fait rien du tout. C'est
+  //    arrivé à `lastTryAt`, et `rejouer` est passé à deux doigts du même sort : il porte la
+  //    promesse « cette alerte repartira à l'expiration de l'anti-doublon », et sans cette ligne la
+  //    promesse mourait à chaque redémarrage pendant que l'interdiction d'alerter, elle, survivait.
+  const j = (r.rejouer && typeof r.rejouer === 'object') ? r.rejouer : {};
+  for (const k of Object.keys(j)) if (_sain(k) && Number.isFinite(j[k])) rejouer[k] = j[k];
   const h = (r.heal && typeof r.heal === 'object') ? r.heal : {};
   for (const k of Object.keys(h)) {
     const v = h[k];
@@ -289,7 +303,7 @@ const sanitizeRuntime = (raw) => {
       };
     }
   }
-  return { lastAlertAt, heal };
+  return { lastAlertAt, heal, rejouer };
 };
 
 // ---------- Alertes : arrêt volontaire vs panne ----------

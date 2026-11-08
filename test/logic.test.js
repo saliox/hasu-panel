@@ -705,12 +705,29 @@ test('sanitizeRuntime : compteur d\'essais borné, structures inattendues absorb
   assert.equal(sanitizeRuntime({ heal: { a: { downSince: 1, tries: 'x' } } }).heal.a.tries, 0);
   assert.equal(sanitizeRuntime({ heal: { a: { downSince: 1 } } }).heal.a.tries, 0);
   assert.equal(sanitizeRuntime({ heal: { a: 'pas un objet' } }).heal.a, undefined);
-  for (const bad of [null, undefined, 'x', 42, []]) assert.deepEqual(sanitizeRuntime(bad), { lastAlertAt: {}, heal: {} });
+  // `rejouer` fait partie de la forme depuis que le rejeu d'arête est persisté : sans lui,
+  // sanitizeRuntime JETAIT le champ au chargement et la persistance ne faisait rien du tout.
+  for (const bad of [null, undefined, 'x', 42, []]) assert.deepEqual(sanitizeRuntime(bad), { lastAlertAt: {}, heal: {}, rejouer: {} });
 });
 
 test('sanitizeRuntime : aller-retour sans perte pour des données saines', () => {
-  const sain = { lastAlertAt: { saliox: 1700000000000 }, heal: { 'hasu-music': { downSince: 1700000000001, tries: 1, lastTryAt: 1700000000002 } } };
+  // `rejouer` est inclus EXPRÈS, avec une vraie valeur. C'est le champ que sanitizeRuntime JETAIT en
+  // silence : un aller-retour qui ne le transporte pas laisserait revenir le défaut — la promesse
+  // « cette alerte repartira » morte à chaque redémarrage — sans que rien ne rougisse.
+  const sain = {
+    lastAlertAt: { saliox: 1700000000000 },
+    heal: { 'hasu-music': { downSince: 1700000000001, tries: 1, lastTryAt: 1700000000002 } },
+    rejouer: { saliox: 1700000001800000 },
+  };
   assert.deepEqual(sanitizeRuntime(sain), sain);
+});
+
+test('sanitizeRuntime : un rejeu malsain est écarté, les sains passent', () => {
+  // Même doctrine que les autres champs : on reconstruit, on ne recopie pas.
+  const out = sanitizeRuntime({
+    rejouer: { saliox: 1700000001800000, 'nom invalide': 1, __proto__: 1, vide: 'pas un nombre' },
+  });
+  assert.deepEqual(out.rejouer, { saliox: 1700000001800000 });
 });
 
 // ---- non-régression : les défauts trouvés par l'audit du lot de relance automatique ----

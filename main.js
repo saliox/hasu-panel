@@ -940,7 +940,12 @@ const sendAlert = async (title, body, colorHex, dejaNotifie = false) => {
       // « alertes activées » cesse d'être un demi-mensonge.
       alertsSuppressed.push(now);
       log('alerte DIFFÉRÉE (plafond horaire atteint) :', title);
-      return false;
+      // ⚠️ ON REND `notifie: false` : le toast et le son n'ont PAS été consommés ici. L'appelant
+      //    posait `a.notifie = true` sans condition après CHAQUE appel — donc une alerte refusée par
+      //    le plafond partait en réessai marquée « déjà notifiée », et son toast Windows n'était
+      //    JAMAIS montré, même quand le plafond s'était rouvert. Le webhook finissait par partir, le
+      //    canal local restait muet : exactement l'inverse de ce que « notification Windows » promet.
+      return { ok: false, notifie: false };
     }
     alertTimes.push(now);
     if (cfg.alertToast !== false) {
@@ -953,7 +958,9 @@ const sendAlert = async (title, body, colorHex, dejaNotifie = false) => {
   let ok = true;
   if (url) ok = await postWebhook(url, { embeds: [{ title, description: body, color: colorHex, timestamp: new Date(now).toISOString(), footer: { text: 'Hasu Panel' } }] });
   log('alerte :', ok ? '' : '(ÉCHEC envoi)', title, '—', body.replace(/\n/g, ' ').slice(0, 160));
-  return ok;
+  // `notifie: true` : le toast a été montré (ou volontairement désactivé) — dans les deux cas il est
+  // consommé, et un réessai ne doit pas le rejouer.
+  return { ok, notifie: true };
 };
 
 // File d'attente des alertes : envoyer depuis la boucle de surveillance la BLOQUAIT (chaque webhook
@@ -974,10 +981,19 @@ const drainAlerts = async () => {
   try {
     while (alertQueue.length) {
       const a = alertQueue.shift();
-      let ok = false;
-      try { ok = await sendAlert(a.title, a.body, a.color, a.notifie); } catch (e) { log('sendAlert', e.message); }
-      a.notifie = true;
-      if (ok) continue;
+      let r = { ok: false, notifie: a.notifie };
+      try { r = await sendAlert(a.title, a.body, a.color, a.notifie); } catch (e) { log('sendAlert', e.message); }
+      // Le toast ne se marque consommé que s'il l'a VRAIMENT été (voir sendAlert).
+      a.notifie = a.notifie || !!r.notifie;
+      if (r.ok) { if (a.cle) rejouerArete.delete(a.cle); continue; }
+      // ⚠️ LE FILET S'ARME DÈS LE PREMIER ÉCHEC, pas seulement à l'abandon. `alertQueue` ne vit qu'en
+      //    MÉMOIRE : un redémarrage pendant les réessais (30 s / 2 min / 5 min) emportait l'alerte,
+      //    alors que `lastAlertAt` — persisté, lui — continuait de bloquer toute réalerte pendant
+      //    30 minutes. Le panel se taisait donc sur la foi d'un envoi qui n'avait jamais abouti. Et la
+      //    médiane d'une session de ce panel est de DIX MINUTES (mesurée, voir plus haut) : la fenêtre
+      //    n'est pas théorique. Pire, au retour du bot l'utilisateur recevait « ✅ est de retour »
+      //    pour une chute qu'on ne lui avait jamais annoncée.
+      if (a.cle) rejouerArete.set(a.cle, Date.now() + ALERT_DEDUP_MS);
       const attente = ALERT_RETRY_MS[a.essais];
       if (attente === undefined) {
         // Abandon après ~7 min 30 d'essais.
@@ -1089,7 +1105,16 @@ const persistRuntime = () => {
   //    revenait à 0, `shouldAutoHeal` retombait sur `downSince`, et le bot brûlait son dernier essai
   //    immédiatement. Démontré : en mémoire `false` (on attend), après aller-retour `true`.
   for (const [k, v] of healState) if (isSafeName(k) && v && Number.isFinite(v.downSince)) heal[k] = { downSince: v.downSince, tries: v.tries || 0, lastTryAt: Number.isFinite(v.lastTryAt) ? v.lastTryAt : 0 };
-  cfg.runtime = { lastAlertAt: lastAlert, heal };
+  // ⚠️ TROISIÈME FOIS QUE CE DÉFAUT SE POSE ICI, et la troisième forme est la mienne. Ce champ-ci
+  //    (`lastTryAt`) a dû être ajouté après coup ; `rejouer` l'est maintenant pour la même raison.
+  //    `rejouerArete` porte la PROMESSE « l'alerte repartira à l'expiration de l'anti-doublon », et
+  //    il ne vivait qu'en mémoire — pendant que `lastAlertAt`, qui porte l'INTERDICTION d'alerter,
+  //    était persisté. Un redémarrage dans les 30 minutes gardait donc l'interdiction et perdait la
+  //    promesse : silence définitif, sans une ligne de journal. Quand deux moitiés d'une même règle
+  //    ne vivent pas au même endroit, c'est toujours celle qui PROTÈGE qui survit.
+  const rejoue = {};
+  for (const [k, v] of rejouerArete) if (isSafeName(k) && Number.isFinite(v)) rejoue[k] = v;
+  cfg.runtime = { lastAlertAt: lastAlert, heal, rejouer: rejoue };
 };
 
 // …et l'inverse au démarrage. Les entrées trop vieilles sont balayées : une chute d'il y a trois
@@ -1107,7 +1132,16 @@ const hydrateRuntime = () => {
       healState.set(k, { downSince: borne(v.downSince), tries: v.tries || 0, lastTryAt: borne(v.lastTryAt || 0) });
     }
   }
-  if (lastAlertAt.size || healState.size) log('surveillance reprise :', lastAlertAt.size, 'alerte(s) suivie(s),', healState.size, 'bot(s) en attente de relance');
+  // ⚠️ CES HORODATAGES SONT DANS LE FUTUR par nature (`now + 30 min`). Leur appliquer `borne`, qui
+  //    ramène tout futur à maintenant, ferait rejouer l'arête au premier tick — donc une alerte à
+  //    CHAQUE lancement du panel. On les plafonne à la fenêtre d'anti-doublon. Un horodatage PASSÉ,
+  //    lui, est légitime : il veut dire « la fenêtre s'est ouverte pendant que le panel était éteint,
+  //    rejoue maintenant ». Au-delà de la péremption l'épisode est clos.
+  for (const [k, v] of Object.entries(r.rejouer || {})) {
+    if (!Number.isFinite(v) || now - v > PEREMPTION) continue;
+    rejouerArete.set(k, Math.min(v, now + ALERT_DEDUP_MS));
+  }
+  if (lastAlertAt.size || healState.size || rejouerArete.size) log('surveillance reprise :', lastAlertAt.size, 'alerte(s) suivie(s),', healState.size, 'bot(s) en attente de relance,', rejouerArete.size, 'alerte(s) à rejouer');
 };
 
 // Renvoie l'ensemble des bots dont l'instantané ne doit PAS avancer (statut de passage).
@@ -1202,7 +1236,12 @@ const applyTransitions = (bots, prev) => {
     if (cause === null) cause = classifyErrorFr(tailFile(b.errLog || '', 8 * 1024));
     queueAlert(
       d.alert === 'looping' ? `🔁 ${b.name} redémarre en boucle` : `⚠️ ${b.name} est tombé`,
-      (cause ? `**Cause probable :** ${cause}\n` : '') + `État : ${b.status} · redémarrages : ${b.restarts}`,
+      // `masquer` et non `cause` brut : `classifyErrorFr` ne passe par `redactSensitive` que sur son
+      // chemin de REPLI, et `redactSensitive` seul ne connaît pas le nom de session Windows. Un
+      // chemin UNC (\\\\serveur\\partage), un profil hors de C:\\Users ou un dossier de travail portant
+      // le nom de session sortaient donc en clair vers le salon Discord. `masquer` est le juge unique
+      // de tout ce qui quitte la machine : il doit être sur CE chemin aussi.
+      (cause ? `**Cause probable :** ${masquer(cause)}\n` : '') + `État : ${b.status} · redémarrages : ${b.restarts}`,
       d.alert === 'looping' ? 0xE67E22 : 0xED4245,
       b.name); // la clé permet d'oublier le « déjà signalé » si l'envoi finit par échouer
   }
@@ -2561,7 +2600,7 @@ ipcMain.handle('panel:testAlert', async () => {
   alertTimes = []; // un test ne doit pas être refusé par le plafond horaire
   // On REMONTE le vrai résultat : avant, l'échec du webhook (URL révoquée, 404, hors ligne) était
   // ignoré et l'interface affichait « ✅ envoyé » sur une configuration morte.
-  const ok = await sendAlert('✅ Test des alertes — Hasu Panel', 'Si tu lis ceci, les alertes fonctionnent : tu seras prévenu quand un bot tombera.', 0x57F287);
+  const { ok } = await sendAlert('✅ Test des alertes — Hasu Panel', 'Si tu lis ceci, les alertes fonctionnent : tu seras prévenu quand un bot tombera.', 0x57F287);
   return { ok, webhook: hasWebhook, toast: cfg.alertToast !== false,
     error: ok ? '' : (hasWebhook ? 'Discord a refusé le webhook (URL révoquée, salon supprimé, ou pas de connexion).' : 'Envoi impossible.') };
 });

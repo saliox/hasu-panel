@@ -205,3 +205,64 @@ test('file pleine : main.js diffère au lieu de perdre (et le dit)', () => {
   // …et le refus ne doit PAS rester un `return` nu.
   assert.doesNotMatch(src, /if \(alertQueue\.length >= 20\) return;/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// LE REJEU DOIT SURVIVRE À UN REDÉMARRAGE — sinon il ne promet rien.
+//
+// POURQUOI : `rejouerArete` porte la promesse « cette alerte repartira à l'expiration de
+// l'anti-doublon ». Il ne vivait qu'en MÉMOIRE, pendant que `lastAlertAt` — qui porte
+// l'INTERDICTION d'alerter — était persisté. Un redémarrage dans les 30 minutes gardait donc
+// l'interdiction et perdait la promesse : silence définitif, sans une ligne de journal. Et la
+// médiane d'une session de ce panel est de DIX MINUTES (mesurée, commentée dans main.js) : la
+// fenêtre n'était pas théorique.
+//
+// Quand deux moitiés d'une même règle ne vivent pas au même endroit, c'est toujours celle qui
+// PROTÈGE qui survit, et celle qui RÉPARE qui disparaît.
+const { sanitizeRuntime: assainir } = require('../logic');
+
+test('persistance : le rejeu traverse l\'aller-retour disque', () => {
+  const ecrit = { lastAlertAt: { saliox: 1700000000000 }, heal: {}, rejouer: { saliox: 1700000001800000 } };
+  assert.deepEqual(assainir(ecrit).rejouer, { saliox: 1700000001800000 },
+    'sans ça, la persistance côté main.js ne fait RIEN : le champ est jeté au chargement');
+});
+
+test('persistance : contre-épreuve — l\'ancienne forme le jetait', () => {
+  // Reproduction de l'ancien sanitizeRuntime : il reconstruisait { lastAlertAt, heal } et rien
+  // d'autre. Cette assertion existe pour que « le champ passe » ne soit pas vrai par hasard.
+  const ancien = (raw) => ({ lastAlertAt: raw.lastAlertAt || {}, heal: raw.heal || {} });
+  assert.equal(ancien({ rejouer: { saliox: 1 } }).rejouer, undefined, 'témoin : l\'ancienne forme perdait le champ');
+  assert.notEqual(assainir({ rejouer: { saliox: 1 } }).rejouer, undefined, 'la nouvelle le garde');
+});
+
+test('persistance : main.js écrit ET relit le rejeu, avec le bon plafond', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /cfg\.runtime = \{ lastAlertAt: lastAlert, heal, rejouer: rejoue \};/,
+    'persistRuntime doit écrire le rejeu');
+  assert.match(src, /for \(const \[k, v\] of Object\.entries\(r\.rejouer \|\| \{\}\)\)/,
+    'hydrateRuntime doit le relire');
+  // ⚠️ Ces horodatages sont DANS LE FUTUR : les passer par `borne` (qui ramène tout futur à
+  //    maintenant) ferait rejouer l'arête au premier tick, donc une alerte à CHAQUE lancement.
+  assert.match(src, /rejouerArete\.set\(k, Math\.min\(v, now \+ ALERT_DEDUP_MS\)\);/,
+    'un horodatage futur se PLAFONNE, il ne se ramène pas à maintenant');
+  assert.doesNotMatch(src, /rejouerArete\.set\(k, borne\(v\)\)/);
+});
+
+test('alertes : le filet s\'arme dès le PREMIER échec, et se désarme au succès', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /if \(r\.ok\) \{ if \(a\.cle\) rejouerArete\.delete\(a\.cle\); continue; \}/,
+    'un envoi réussi doit désarmer le filet, sinon on réalerte pour rien');
+  assert.match(src, /if \(a\.cle\) rejouerArete\.set\(a\.cle, Date\.now\(\) \+ ALERT_DEDUP_MS\);\s*$/m,
+    'un premier échec doit l\'armer : alertQueue ne vit qu\'en mémoire');
+});
+
+test('alertes : une alerte refusée par le plafond garde son toast pour plus tard', () => {
+  // `a.notifie = true` était posé sans condition après CHAQUE appel : une alerte refusée par le
+  // plafond horaire partait en réessai marquée « déjà notifiée », et son toast Windows n'était
+  // JAMAIS montré — même quand le plafond s'était rouvert. Le webhook finissait par partir et le
+  // canal local restait muet, l'inverse exact de ce que « notification Windows » promet.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /return \{ ok: false, notifie: false \};/, 'le plafond doit dire que le toast n\'est pas consommé');
+  assert.match(src, /return \{ ok, notifie: true \};/);
+  assert.match(src, /a\.notifie = a\.notifie \|\| !!r\.notifie;/, 'le marquage doit suivre la réalité');
+  assert.doesNotMatch(src, /\n      a\.notifie = true;/, 'plus de marquage inconditionnel');
+});

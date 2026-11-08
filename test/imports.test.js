@@ -26,7 +26,7 @@ const src = fs.readFileSync(MAIN, 'utf8');
 // ORDRE IMPORTANT : les commentaires de LIGNE d'abord. main.js contient « test/*.test.js » dans un
 // commentaire ; en commençant par les blocs, ce `/*` s'appariait à un `*/` bien plus loin et effaçait
 // 102 Ko sur 109. C'est le test d'auto-vérification juste en dessous qui l'a attrapé.
-const stripped = src
+const nettoyerCommentaires = (texte) => texte
   // Fins de ligne normalisées D'ABORD : le fichier est en CRLF, et `.` ne matche pas `\r`, donc
   // `\/\/.*$` ne trouvait JAMAIS rien — le nettoyage des commentaires de ligne retirait 0 caractère.
   .replace(/\r\n?/g, '\n')
@@ -34,11 +34,44 @@ const stripped = src
   .map((l) => l.replace(/(^|[^:'"`\\])\/\/.*$/, '$1'))
   .join('\n')
   .replace(/\/\*[\s\S]*?\*\//g, ' ');
+const stripped = nettoyerCommentaires(src);
 
 // Le test se vérifie lui-même : si le nettoyage ci-dessus mange le fichier, tout le reste ment.
 test('garde-fou : le nettoyage des commentaires ne détruit pas main.js', () => {
-  assert.ok(stripped.length > src.length * 0.5,
-    `nettoyage trop agressif : ${stripped.length} caractères restants sur ${src.length}`);
+  // ⚠️ CE GARDE ÉTAIT UN SEUIL DE TAILLE (« > 50 % de src »), ET SA PRÉMISSE A EXPIRÉ. Mesuré sur
+  //    l'historique : 51,9 % en v1.16.13, 50,5 % en .19, 50,2 % en .20, 49,7 % ensuite. La marge
+  //    s'érodait depuis le début — ce fichier est très commenté, et chaque lot en ajoute — et le jour
+  //    où elle a cédé, le test a ACCUSÉ LE NETTOYAGE alors qu'il fonctionnait parfaitement. Un seuil
+  //    absolu posé sur une grandeur qui dérive se périme tout seul, puis accuse le mauvais coupable.
+  //    On garde un plancher, très bas, pour le seul cas qu'il savait vraiment attraper (un nettoyage
+  //    catastrophique), et on prouve le nettoyage par des TÉMOINS, qui ne se périment pas.
+  assert.ok(stripped.length > src.length * 0.25,
+    `nettoyage catastrophique : ${stripped.length} caractères restants sur ${src.length}`);
+
+  // Témoin FABRIQUÉ : un échantillon dont on connaît la bonne réponse. C'est lui qui mesure le
+  // nettoyeur, et non la taille d'un fichier qui change à chaque lot.
+  const t = nettoyerCommentaires([
+    "const a = 1; // DISPARAIT",
+    "const url = 'https://exemple.test/page'; // DISPARAIT_AUSSI",
+    '/* DISPARAIT_BLOC */ const c = 3;',
+    "const d = 4;",
+  ].join('\n'));
+  assert.equal(t.includes('DISPARAIT'), false, 'les commentaires de ligne doivent partir');
+  assert.equal(t.includes('DISPARAIT_BLOC'), false, 'les blocs aussi');
+  assert.match(t, /const a = 1;/, 'le code avant un commentaire doit rester');
+  assert.match(t, /const d = 4;/, 'et la ligne suivante aussi');
+  assert.match(t, /https:\/\/exemple\.test\/page/, 'le « // » d\'une URL est protégé (précédé de « : »)');
+  // ⚠️ LIMITE CONNUE, écrite ici parce que ce témoin l'a révélée en rougissant : la protection ne
+  //    couvre qu'un « // » précédé de « : », d'un guillemet ou d'une barre inverse. Un « // » au
+  //    MILIEU d'une chaîne (`'a//b'`) est donc coupé avec la fin de la ligne, ce qui pourrait faire
+  //    lire un usage ou un import de travers. Mesuré sur l'arbre : ZÉRO porteur réel dans les quatre
+  //    fichiers que ce test inspecte (main.js, logic.js, validators.js, ui/app.js). On documente au
+  //    lieu de réécrire un analyseur JavaScript — mais si un jour une chaîne de ce genre apparaît,
+  //    c'est ici qu'il faudra regarder.
+
+  // …et sur le vrai fichier : du code connu survit, un commentaire connu disparaît.
+  assert.match(src, /const persistRuntime = \(\) => \{/, 'témoin absent de la source : ce test ne mesure plus rien');
+  assert.match(stripped, /const persistRuntime = \(\) => \{/, 'le nettoyage a mangé du CODE');
   assert.match(stripped, /ipcMain\.handle\('panel:status'/, 'le code a survécu au nettoyage');
 });
 

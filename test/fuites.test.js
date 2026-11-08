@@ -94,3 +94,50 @@ test('publication : la course des deux publishers est supprimée en amont', () =
   assert.match(src, /'release', 'view'/, 'ne créer que si absente');
   assert.match(src, /'release', 'create'/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// TOUTE clé, et pas seulement API_KEY.
+//
+// POURQUOI : la règle ne connaissait que `api_key` / `apikey`. Or le bot que ce panel surveille
+// porte une BACKUP_KEY — celle qui chiffre ses sauvegardes, et que la mémoire du projet dit de
+// « conserver hors serveur ». Elle, ENCRYPTION_KEY, PRIVATE_KEY, SIGNING_KEY partaient donc EN CLAIR
+// dans le salon Discord si elles apparaissaient dans la dernière ligne du log d'un bot qui plante.
+const CLES = [
+  ['BACKUP_KEY', 'env BACKUP_KEY=aG9yc2ViYXR0ZXJ5c3RhcGxl', 'aG9yc2ViYXR0ZXJ5c3RhcGxl'],
+  ['PRIVATE_KEY', 'PRIVATE_KEY: 7f3a9c2e5b1d8406', '7f3a9c2e5b1d8406'],
+  ['ENCRYPTION_KEY', 'ENCRYPTION_KEY = s3cr3tk3yv4lue', 's3cr3tk3yv4lue'],
+  ['SIGNING_KEYS (pluriel)', 'SIGNING_KEYS=abcdef123456', 'abcdef123456'],
+  ['key nue', 'key=supersecretvalue', 'supersecretvalue'],
+  ['SECRETS (pluriel)', 'APP_SECRETS=zzzzzzzzzzzz', 'zzzzzzzzzzzz'],
+];
+
+test('fuites : le témoin — chaque ligne de clé contient bien son secret', () => {
+  for (const [q, l, s] of CLES) assert.ok(l.includes(s), `${q} : la ligne d'épreuve ne porte pas le secret`);
+});
+
+test('fuites : aucune clé nommée *_KEY ne survit', () => {
+  for (const [q, l, s] of CLES) {
+    const out = redactSensitive(l);
+    assert.equal(out.includes(s), false, `${q} : « ${s} » partirait vers Discord → ${out}`);
+  }
+});
+
+test('fuites : un mot ordinaire finissant par « key » n\'est PAS masqué (contre-épreuve)', () => {
+  // C'est le SÉPARATEUR obligatoire devant la clé qui fait la différence. Sans cette contre-épreuve,
+  // on ne saurait pas si la règle masque les clés ou simplement tout ce qui contient « key ».
+  assert.equal(redactSensitive('monkey=hunter2hunter est un mot'), 'monkey=hunter2hunter est un mot');
+  assert.equal(redactSensitive('whiskey est une boisson'), 'whiskey est une boisson');
+  assert.equal(redactSensitive('TypeError: Cannot read properties of undefined (reading \'guild\')'),
+    'TypeError: Cannot read properties of undefined (reading \'guild\')');
+});
+
+test('fuites : la cause envoyée au webhook passe par masquer(), pas seulement redactSensitive', () => {
+  // `classifyErrorFr` ne passe par `redactSensitive` que sur son chemin de REPLI, et redactSensitive
+  // seul ne connaît pas le NOM DE SESSION Windows. Un chemin UNC, un profil hors de C:\\Users ou un
+  // dossier de travail portant le nom de session sortaient donc en clair. `masquer` est le juge
+  // unique de tout ce qui quitte la machine.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /\*\*Cause probable :\*\* \$\{masquer\(cause\)\}/,
+    'la cause doit être masquée au point d\'envoi');
+  assert.doesNotMatch(src, /\*\*Cause probable :\*\* \$\{cause\}/);
+});
