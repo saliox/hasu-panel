@@ -169,6 +169,25 @@ const redactSensitive = (s) => String(s || '')
     (m, cle, sep, guillemet) => `${cle}${sep}${guillemet}[identifiant]`)
   .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b/g, '[courriel]');
 
+// ---------- Pourquoi pm2 a-t-il refusé ? ----------
+/**
+ * Motif lisible d'un refus de pm2, ou chaîne VIDE si l'action a réussi. PURE.
+ *
+ * Rend une chaîne et non un booléen : l'appelant n'avait AUCUN motif à montrer, et c'est le défaut —
+ * il rendait `{ ok: r.ok }` en jetant `r.out`, qui contient précisément « Script not found »,
+ * « process already running »… Le bouton reprenait son état normal, le bot restait éteint, et il ne
+ * restait rien : ni message, ni ligne de journal. Le cas est banal (un dossier de bot déplacé), et
+ * c'est celui que le panel nomme ailleurs : « dossier déplacé, dépendance manquante, token révoqué ».
+ *
+ * L'appelant MASQUE le résultat avant de l'afficher ou de le journaliser : ce motif contient le
+ * chemin du script, et `masquer` (qui connaît le nom de session Windows) vit dans main.js.
+ */
+const motifAction = (ok, out) => {
+  if (ok) return '';
+  const texte = String(out == null ? '' : out);
+  return classifyErrorFr(texte) || texte.trim().slice(0, 160) || 'pm2 a refusé l\'action, sans dire pourquoi.';
+};
+
 // ---------- Mode jeu : qui faut-il couper ? ----------
 /**
  * Bots que le mode jeu doit arrêter. PURE.
@@ -669,7 +688,7 @@ module.exports = {
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert, verdictSelftest,
-  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,

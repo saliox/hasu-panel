@@ -156,7 +156,7 @@ const { t, setLang, ORDRE: LANGUES } = require('./ui/i18n');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert, verdictSelftest,
-  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
@@ -848,7 +848,17 @@ const schedulePm2Save = (delayMs = 15000) => {
     }
     saveRetries = 0;
     const r = await pm2(['save']);
-    if (r.ok) { pm2SavePending = false; cfg.lastSaveAt = Date.now(); saveCfg(); log('pm2 save auto OK'); } else log('pm2 save auto échec');
+    if (r.ok) { pm2SavePending = false; cfg.lastSaveAt = Date.now(); saveCfg(); log('pm2 save auto OK'); saveRetries = 0; return; }
+    // ⚠️ « DIFFÉRÉ DOIT VOULOIR DIRE RÉESSAYÉ » — la phrase est écrite quinze lignes plus haut, pour le
+    //    report pendant une partie, et elle n'était PAS appliquée au cas de l'ÉCHEC. Un `pm2 save`
+    //    raté (pm2 occupé, disque qui hoquette, démon en train de redémarrer) était journalisé puis
+    //    ABANDONNÉ : `pm2SavePending` restait vrai, le dump restait périmé, et le prochain reboot
+    //    restaurait un état faux — très exactement la plaie que ce report existe pour éviter. Rien ne
+    //    reprogrammait la sauvegarde avant le prochain start/stop volontaire, qui peut ne jamais venir.
+    //    Deux cas de report voisins, un seul réessayait : l'asymétrie est le défaut.
+    saveRetries++;
+    if (saveRetries % 10 === 1) log('pm2 save auto ÉCHEC — nouvelle tentative (', saveRetries, ')', String(r.out || '').slice(0, 120));
+    schedulePm2Save(Math.min(15000 * saveRetries, 120000));
   }, delayMs);
   saveTimer.unref?.();
 };
@@ -2495,7 +2505,23 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
     else r = await pm2([action, name]);
     schedulePm2Save(); // ce que tu vois = ce qui reviendra au prochain démarrage du PC
     await refreshBots();
-    return { ok: r.ok };
+    // ⚠️ UN REFUS DE PM2 NE LAISSAIT AUCUNE TRACE. On rendait `{ ok: r.ok }` et on jetait `r.out`, qui
+    //    contient précisément le motif (« Script not found », « process already running »…) ; aucun
+    //    `log()` dans tout ce gestionnaire ; et l'écran ignorait le retour. Le bouton repassait donc
+    //    de « ⏳ » à son état normal, le bot restait éteint, et il n'y avait RIEN : ni message, ni
+    //    ligne de journal pour comprendre après coup. Le cas est banal — un dossier de bot déplacé ou
+    //    renommé — et c'est exactement celui que le panel nomme ailleurs (« dossier déplacé,
+    //    dépendance manquante ou token révoqué »).
+    //    `masquer` parce que ce motif contient le CHEMIN du script : il s'affiche à l'écran, mais il
+    //    part aussi dans le journal, et le journal est ce qu'on recopie pour demander de l'aide.
+    // La décision vit dans logic.js (`motifAction`) : elle est donc ÉPROUVÉE sur du code qui tourne,
+    // au lieu d'être seulement figée par l'orthographe d'une assertion de source.
+    const motif = motifAction(r.ok, r.out);
+    if (motif) {
+      log('action REFUSÉE :', action, name, '—', masquer(String(r.out || '').trim().slice(0, 300)));
+      return { ok: false, error: masquer(motif) };
+    }
+    return { ok: true };
   } finally {
     actionsInFlight.delete(name);
   }
@@ -2561,7 +2587,7 @@ ipcMain.handle('panel:logs', async (_e, { name, which } = {}) => {
 });
 
 // Ouvre le dossier du bot dans l'Explorateur. Le chemin vient de pm2 (pm_cwd), jamais du renderer.
-ipcMain.handle('panel:openFolder', (_e, { name, what } = {}) => {
+ipcMain.handle('panel:openFolder', async (_e, { name, what } = {}) => {
   if (!isSafeName(String(name || ''))) return { ok: false };
   const bot = statusCache.bots.find((b) => b.name === name);
   // path.dirname('') renvoie '.' — une valeur TRUTHY : la garde ci-dessous ne se déclenchait pas et
@@ -2569,7 +2595,14 @@ ipcMain.handle('panel:openFolder', (_e, { name, what } = {}) => {
   const src = what === 'logs' ? (bot && bot.outLog) : (bot && bot.cwd);
   const target = src ? (what === 'logs' ? path.dirname(src) : src) : '';
   if (!target || target === '.') return { ok: false, error: 'Dossier inconnu (pm2 ne l\'a pas fourni).' };
-  try { shell.openPath(target); return { ok: true }; } catch { return { ok: false }; }
+  // ⚠️ `shell.openPath` REND UNE PROMESSE et ne lève JAMAIS : elle se résout sur une chaîne vide en
+  //    cas de succès, et sur le MESSAGE D'ERREUR sinon. Le `try/catch` ne protégeait donc de rien et
+  //    `ok: true` était annoncé même quand le dossier n'existait plus (bot désinstallé, disque
+  //    externe débranché, dossier renommé) : l'utilisateur cliquait « 📂 Dossier », rien ne s'ouvrait,
+  //    et le panel disait que tout allait bien. On attend la promesse et on rend la vérité.
+  const err = await shell.openPath(target).catch((e) => String(e && e.message ? e.message : e));
+  if (err) { log('openFolder', name, what || 'cwd', '—', masquer(String(err).slice(0, 200))); return { ok: false, error: masquer(String(err).slice(0, 160)) }; }
+  return { ok: true };
 });
 
 // « Remettre en ordre » : relance les bots qui DEVRAIENT être en ligne (bandeau). Volontaire, borné.

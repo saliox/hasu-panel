@@ -22,6 +22,12 @@ const appliquerLangue = (l) => {
   lastUpdHtml = lastUpdCls = lastWarnHtml = lastIncHtml = null;
   if (cur) render(cur);
 };
+// Derniers refus d'action, par bot : nom → { texte, at }. L'écran est reconstruit toutes les 3 s à
+// partir de l'état du processus principal, qui ne porte PAS cette information — elle est locale à la
+// fenêtre, et volontairement éphémère (une minute) : passé ce délai, l'état du bot parle de lui-même.
+const echecsAction = new Map();
+const ECHEC_VISIBLE_MS = 60 * 1000;
+
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 const fmtUptime = (ts) => {
@@ -203,11 +209,13 @@ const render = (st) => {
     const c = st.cfg.bots[b.name] || { auto: true, gameStop: false };
     const dot = b.status === 'online' ? 'online' : b.status === 'errored' ? 'errored' : 'stopped';
     const stoppedByGame = st.stoppedByGame.includes(b.name);
+    const echec = echecsAction.get(b.name);
+    const motif = (echec && Date.now() - echec.at < ECHEC_VISIBLE_MS) ? echec.texte : '';
     const isImp = imported.includes(b.name);
     return `<div class="bot">
       <span class="dot ${dot}" title="${esc(b.status)}"></span>
       <span class="name">${esc(b.name)}</span>
-      <span class="meta">${b.status === 'online' ? `${t('bots.uptime', { v: fmtUptime(b.uptime) })} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status)} · ↻ ${b.restarts}</span>
+      <span class="meta">${b.status === 'online' ? `${t('bots.uptime', { v: fmtUptime(b.uptime) })} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status)} · ↻ ${b.restarts}${motif ? ` · <span style="color:var(--err)">⚠️ ${esc(motif)}</span>` : ''}</span>
       <label class="chk" title="${t('bots.autobootTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> ${t('bots.autoboot')}</label>
       <label class="chk" title="${t('bots.gamestopTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> ${t('bots.gamestop')}</label>
       ${pendingBots.has(b.name)
@@ -500,18 +508,38 @@ document.addEventListener('click', async (e) => {
     return;
   }
   const addExe = t.closest?.('[data-addexe]');
-  if (addExe) { await window.panel.addGame(addExe.dataset.addexe); closeModal(); await refresh(); return; }
-  if (t.dataset?.scanadd) { await window.panel.addGame(t.dataset.scanadd); document.querySelector(`[data-scanrow="${CSS.escape(t.dataset.scanadd.toLowerCase())}"]`)?.remove(); await refresh(); return; }
+  if (addExe) {
+    // Le refus était jeté : on fermait la modale et « rien ne se passait », sans un mot. Même
+    // convention que le champ de saisie plus bas, qui montre déjà `r.error`.
+    const r = await window.panel.addGame(addExe.dataset.addexe);
+    if (r && !r.ok) { alert(r.error || 'Ajout refusé.'); return; }
+    closeModal(); await refresh(); return;
+  }
+  if (t.dataset?.scanadd) {
+    const r = await window.panel.addGame(t.dataset.scanadd);
+    if (r && !r.ok) { alert(r.error || 'Ajout refusé.'); return; }
+    document.querySelector(`[data-scanrow="${CSS.escape(t.dataset.scanadd.toLowerCase())}"]`)?.remove(); await refresh(); return;
+  }
   if (t.dataset?.ignore) { await window.panel.ignoreGame(t.dataset.ignore); document.querySelector(`[data-scanrow="${CSS.escape(t.dataset.ignore.toLowerCase())}"]`)?.remove(); await refresh(); return; }
   if (t.id === 'game-suggest-btn') { openScanModal(cur?.cfg?.discovered || [], 'Jeux repérés par le dernier scan (1×/jour).'); return; }
   if (t.dataset?.act && t.dataset?.bot) {
     const name = t.dataset.bot;
     t.disabled = true; pendingBots.add(name); render(cur); // ⏳ visible même après un re-rendu
-    try { await window.panel.action(name, t.dataset.act); } finally { pendingBots.delete(name); }
+    try {
+      // Le retour était IGNORÉ : un refus de pm2 ne laissait rien à l'écran. Le bouton reprenait son
+      // état normal, le bot restait éteint, et l'utilisateur n'avait aucun moyen de savoir pourquoi.
+      const r = await window.panel.action(name, t.dataset.act);
+      if (r && r.ok) echecsAction.delete(name);
+      else echecsAction.set(name, { texte: (r && r.error) || 'pm2 a refusé l\'action.', at: Date.now() });
+    } finally { pendingBots.delete(name); }
     await refresh();
     return;
   }
-  if (t.dataset?.folder) { await window.panel.openFolder(t.dataset.folder); return; }
+  if (t.dataset?.folder) {
+    const r = await window.panel.openFolder(t.dataset.folder);
+    if (r && !r.ok) alert(r.error || 'Impossible d\'ouvrir le dossier.');
+    return;
+  }
   if (t.id === 'fix-all') {
     t.disabled = true;
     const s = $('fix-status'); if (s) s.textContent = window.i18n.t('bots.stopAllBusy');
@@ -536,7 +564,11 @@ document.addEventListener('click', async (e) => {
     if (pre) { try { await navigator.clipboard.writeText(pre.textContent || ''); t.textContent = '✅'; setTimeout(() => { t.textContent = '📋 ' + window.i18n.t('logs.copy'); }, 1400); } catch {} }
     return;
   }
-  if (t.id === 'logs-folder') { await window.panel.openFolder(t.dataset.bot, 'logs'); return; }
+  if (t.id === 'logs-folder') { // 'logs', refus montré comme pour le 📂 de la ligne du bot
+    const r = await window.panel.openFolder(t.dataset.bot, 'logs');
+    if (r && !r.ok) alert(r.error || 'Impossible d\'ouvrir le dossier des logs.');
+    return;
+  }
   if (t.id === 'alert-test') {
     t.disabled = true;
     const s = $('alert-status'); if (s) s.textContent = ' ⏳ envoi…';
