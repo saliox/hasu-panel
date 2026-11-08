@@ -242,7 +242,12 @@ const render = (st) => {
   }
   // pm2 muet : ne PAS afficher « aucun bot » (l'écran mentirait alors que tes bots sont peut-être tous morts).
   const health = st.pm2Health || { ok: true };
-  if (!health.ok) {
+  // ⚠️ CETTE AFFECTATION ÉCRASAIT LE GUIDAGE qu'on vient de choisir juste au-dessus. Sur un poste SANS
+  //    pm2, les appels échouent, `pm2Health.ok` tombe au bout de ~2 min, et « pm2 ne répond plus
+  //    depuis N min » remplaçait « pm2 n'est pas installé » AVEC SON BOUTON D'INSTALLATION. L'écran
+  //    disait donc qu'un logiciel absent avait cessé de répondre, et retirait la seule issue. C'est le
+  //    premier écran d'un poste neuf. On ne parle de santé que si la chaîne d'outils est en place.
+  if (!health.ok && tc.node && tc.pm2) {
     const mins = health.since ? Math.max(1, Math.round((Date.now() - health.since) / 60000)) : 1;
     empty = `<div class="tc-warn">${t('tc.pm2Down', { min: mins })}`
       + `${health.reason ? ` <span style="opacity:.7">(${esc(health.reason)})</span>` : ''}</div>`;
@@ -483,9 +488,14 @@ document.addEventListener('click', async (e) => {
   if (t.id === 'tc-node') { window.open?.('https://nodejs.org/fr/download'); return; }
   if (t.id === 'tc-pm2') {
     t.disabled = true;
-    const zone = document.getElementById('tc-pm2-status'); if (zone) zone.textContent = t('tc.pm2Busy');
+    // ⚠️ `t` EST MASQUÉ ICI : `const t = e.target` en tête de ce gestionnaire. Appeler `t(...)`
+    //    lançait donc un élément du DOM comme une fonction → TypeError, AVANT tout appel à
+    //    installPm2 — et après `t.disabled = true`, donc le bouton restait grisé pour de bon. C'était
+    //    le seul geste que le panel promette de faire à la place du terminal sur un poste neuf.
+    //    La ligne d'à côté utilisait déjà `window.i18n.t` : l'asymétrie disait l'oubli.
+    const zone = document.getElementById('tc-pm2-status'); if (zone) zone.textContent = window.i18n.t('tc.pm2Busy');
     let r; try { r = await window.panel.installPm2(); } catch { r = { ok: false }; }
-    if (r.ok) { if (zone) zone.textContent = t('tc.pm2Ok'); setTimeout(refresh, 800); }
+    if (r.ok) { if (zone) zone.textContent = window.i18n.t('tc.pm2Ok'); setTimeout(refresh, 800); }
     else { t.disabled = false; if (zone) zone.textContent = r.reason === 'no-node' ? window.i18n.t('tc.pm2NoNode') : window.i18n.t('tc.pm2Fail'); }
     return;
   }

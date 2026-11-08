@@ -818,3 +818,49 @@ test('runtime : le rythme des relances survit à un redémarrage du panel', () =
     'sans le champ, le panel relance tout de suite : c\'est bien lui qui porte la décision');
 });
 
+
+// ---------------------------------------------------------------------------------------------
+// Verdict de l'auto-test : « aucun bot » N'EST PAS un échec.
+//
+// POURQUOI : `--selftest` jugeait son issue sur `process.exit(bots.length && procs ? 0 : 1)`. Or
+// `pm2List` rend un tableau VIDE dans DEUX cas que tout le reste du code s'applique à distinguer —
+// son propre commentaire le dit, et `pm2Health` existe pour ça : pm2 a répondu et il n'y a aucun bot
+// sur ce poste, ou pm2 est muet. Depuis que les bots tournent chez un hébergeur, l'auto-test rendait
+// donc 1 à CHAQUE lancement alors que tout avait fonctionné (pm2 répondait, 148 process vus, débit
+// mesuré, config lue). Un signal mort que plus personne ne regarde ne protège de rien le jour où il
+// échoue pour une vraie raison — et celui-là a trompé sa propre session, annoncé « réussi » cinq fois
+// de suite parce qu'il était lu à travers un `| tail` qui masque le code de sortie.
+const { verdictSelftest } = require('../logic');
+
+test('selftest : pm2 muet = ÉCHEC', () => {
+  const v = verdictSelftest(false, true, 3);
+  assert.equal(v.code, 1);
+  assert.match(v.texte, /pm2/, 'le verdict doit DIRE lequel des deux cas il a rencontré');
+});
+
+test('selftest : détection de process muette = ÉCHEC', () => {
+  assert.equal(verdictSelftest(true, false, 3).code, 1);
+});
+
+test('selftest : pm2 répond avec des bots = OK', () => {
+  assert.equal(verdictSelftest(true, true, 3).code, 0);
+});
+
+test('selftest : pm2 répond SANS aucun bot = OK, et le dit', () => {
+  // LE cas qui rendait 1 à tort.
+  const v = verdictSelftest(true, true, 0);
+  assert.equal(v.code, 0, 'aucun bot sur ce poste n\'est pas une panne de l\'auto-test');
+  assert.match(v.texte, /aucun bot/i, 'et ça doit se lire, sinon on croit à un OK ordinaire');
+});
+
+test('selftest : contre-épreuve — l\'ancienne règle donnait l\'inverse', () => {
+  // Cette assertion décrit le DÉFAUT. Sans elle, les quatre tests ci-dessus passeraient aussi sur une
+  // fonction qui rend toujours 0, et ne prouveraient pas qu'on a changé quelque chose.
+  const ancienne = (procsOk, nbBots) => (nbBots && procsOk ? 0 : 1);
+  assert.equal(ancienne(true, 0), 1, 'témoin : l\'ancienne règle échouait bien sans bot');
+  assert.equal(verdictSelftest(true, true, 0).code, 0, 'la nouvelle ne doit PAS échouer');
+  // …et l'ancienne était AVEUGLE au seul cas qui compte vraiment : pm2 injoignable avec des bots
+  // connus. Elle rendait 0 — un succès — alors que la surveillance était morte.
+  assert.equal(ancienne(true, 3), 0, 'témoin : l\'ancienne règle disait « OK » avec pm2 muet');
+  assert.equal(verdictSelftest(false, true, 3).code, 1, 'la nouvelle le refuse');
+});

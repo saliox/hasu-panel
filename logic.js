@@ -163,6 +163,55 @@ const redactSensitive = (s) => String(s || '')
     (m, cle, sep, guillemet) => `${cle}${sep}${guillemet}[identifiant]`)
   .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b/g, '[courriel]');
 
+// ---------- Où vit pm2 ? ----------
+// Le préfixe npm GLOBAL n'est pas toujours %APPDATA%\npm : nvm-windows le place par version de Node,
+// `npm config set prefix` le déplace où l'on veut, Chocolatey et une installation par MSI encore
+// ailleurs. Le panel, lui, ne cherchait QUE %APPDATA%\npm — pendant que `probeToolchain` interrogeait
+// le PATH. D'où l'état le plus trompeur possible : l'écran annonçait « pm2 installé », et TOUS les
+// appels échouaient. Au bout de deux minutes la liste était remplacée par « pm2 ne répond plus »,
+// sans remède et sans jamais nommer la vraie cause — le panel était aveugle, et le disait de travers.
+//
+// PURE : rend les bases à essayer, du meilleur au pire, sans doublon. L'appelant joint les segments
+// et teste l'existence (ce module ne connaît ni `path` ni le disque).
+const SOUS_PM2_CMD = ['pm2.cmd'];
+const SOUS_PM2_JS = ['node_modules', 'pm2', 'bin', 'pm2'];
+/**
+ * @param prefixeNpm  sortie de `npm prefix -g` (vide si inconnue)
+ * @param appdataNpm  %APPDATA%\npm, l'emplacement par défaut
+ */
+const basesPm2 = (prefixeNpm, appdataNpm) => {
+  const out = [];
+  for (const b of [prefixeNpm, appdataNpm]) {
+    const s = String(b || '').trim().replace(/[\\/]+$/, '');
+    if (s && !out.includes(s)) out.push(s);
+  }
+  return out;
+};
+
+// ---------- Verdict de l'auto-test ----------
+/**
+ * Que doit rendre `--selftest` ? PURE.
+ *
+ * ⚠️ L'ISSUE NE SE JUGE PAS SUR LE NOMBRE DE BOTS. `pm2List` rend un tableau VIDE dans DEUX cas que
+ *    tout le reste du code s'applique à distinguer (voir son commentaire et `pm2Health`) : pm2 a
+ *    répondu et il n'y a aucun bot sur ce poste, ou pm2 est muet. L'auto-test, lui, jugeait sur
+ *    `bots.length` : depuis que les bots tournent chez un hébergeur, il rendait 1 à CHAQUE lancement
+ *    alors que tout avait fonctionné — pm2 répondait, les process étaient vus, le débit mesuré, la
+ *    config lue. Un signal mort que plus personne ne regarde ne protège de rien le jour où il échoue
+ *    pour une vraie raison. Et il a trompé sa propre session : l'auto-test a été annoncé « réussi »
+ *    cinq fois de suite, lu à travers un `| tail` qui masque le code de sortie.
+ *
+ * @param pm2Ok   pm2 a répondu (indépendamment du nombre de bots)
+ * @param procsOk la détection de process a répondu
+ * @param nbBots  nombre de bots vus
+ * @returns { code: 0|1, texte }
+ */
+const verdictSelftest = (pm2Ok, procsOk, nbBots) => {
+  if (!pm2Ok) return { code: 1, texte: 'ÉCHEC — pm2 injoignable' };
+  if (!procsOk) return { code: 1, texte: 'ÉCHEC — détection de process impossible' };
+  return { code: 0, texte: Number(nbBots) > 0 ? 'OK' : 'OK — pm2 répond, aucun bot géré sur ce poste' };
+};
+
 // ---------- Relance automatique d'un bot tombé ----------
 // Le panel CONSTATAIT les pannes sans jamais les réparer. Quand pm2 a épuisé ses propres relances et
 // marqué le process 'errored', plus personne ne reprenait le relais : constaté sur cette machine,
@@ -578,7 +627,8 @@ module.exports = {
   makeChimeWav, cleanNotes,
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
-  classifyErrorFr, isDeliberateStop, decideAlert,
+  classifyErrorFr, isDeliberateStop, decideAlert, verdictSelftest,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,

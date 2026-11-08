@@ -160,3 +160,13 @@ test('relance automatique : la garde connaît tous les verrous de manœuvre', ()
   assert.deepEqual(oublies, [],
     `drapeau(x) absent(s) de la garde : ${oublies.join(', ')} — une manœuvre de l'utilisateur et la relance automatique agiraient en même temps sur le même bot`);
 });
+
+// L'auto-test ne doit plus confondre « aucun bot » et « pm2 injoignable » : son verdict vit dans
+// logic.js (`verdictSelftest`, éprouvé dans logic.test.js). Ici on vérifie seulement que main.js
+// l'APPELLE vraiment — une fonction pure parfaite que personne n'appelle ne protège de rien.
+test('selftest : main.js ne juge plus sur le nombre de bots', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.doesNotMatch(src, /process\.exit\(bots\.length && procs \? 0 : 1\)/);
+  assert.match(src, /verdictSelftest\(pm2Health\.ok, !!procs, bots\.length\)/,
+    'le verdict doit venir de la fonction pure, pour être éprouvé');
+});

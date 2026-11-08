@@ -133,7 +133,8 @@ const setupAutoUpdate = () => {
   setInterval(check, 6 * 60 * 60 * 1000).unref(); // puis toutes les 6 h (instances qui tournent longtemps)
 };
 
-const PM2 = path.join(process.env.APPDATA || '', 'npm', 'pm2.cmd');
+// (Les chemins de pm2 ne sont plus codés en dur ici : ils sont RÉSOLUS plus bas, voir
+//  `recalculerCheminsPm2` — le préfixe npm global n'est pas toujours %APPDATA%\npm.)
 // Validateurs de sécurité (anti-injection, anti-pollution de prototype, IP publique) : extraits dans
 // un module SANS Electron pour être testables unitairement (`npm test`). Toute modification de ces
 // règles doit faire passer test/validators.test.js — elles gardent une frontière de sécurité.
@@ -147,7 +148,8 @@ const { t, setLang, ORDRE: LANGUES } = require('./ui/i18n');
 // couvert par test/*.test.js, donc c'est bien le code qui tourne en vrai qui est testé.
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
-  hasEstablishedPublic, classifyErrorFr, decideAlert,
+  hasEstablishedPublic, classifyErrorFr, decideAlert, verdictSelftest,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
@@ -557,12 +559,27 @@ const saveCfg = () => {
 // ce qui laisse croire à un bug. On détecte l'absence et on propose de l'installer.
 let toolchain = { node: true, pm2: true };
 const probeToolchain = () => new Promise((resolve) => {
-  // pm2 accessible via le PATH ?
-  execFile('pm2', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (err, out) => {
-    if (!err && /\d+\.\d+/.test(String(out || ''))) return resolve({ node: true, pm2: true });
-    const pm2AtNpm = (() => { try { return fs.existsSync(PM2); } catch { return false; } })();
-    execFile('node', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (e2, o2) => {
-      resolve({ node: !e2 && /v\d+/.test(String(o2 || '')), pm2: pm2AtNpm });
+  // On apprend D'ABORD où npm installe ses paquets globaux : c'est là que vit pm2, et ce n'est pas
+  // toujours %APPDATA%\npm. Sans cette étape, ce sondage et les appels réels de `pm2Raw` répondaient
+  // à DEUX questions différentes — « pm2 est-il dans le PATH ? » contre « pm2 est-il dans
+  // %APPDATA%\npm ? » — et un poste où les deux réponses diffèrent voyait « pm2 installé » avec
+  // 100 % des appels en échec.
+  execFile('npm', ['prefix', '-g'], { shell: true, windowsHide: true, timeout: 20000 }, (eP, oP) => {
+    // Dernière ligne non vide : npm peut précéder sa réponse d'un avis de mise à jour.
+    const brut = String(oP || '').trim().split(/\r?\n/).filter((l) => l.trim()).pop() || '';
+    // Le préfixe part ensuite dans un `execFile` avec shell (repli cmd.exe) : on refuse tout chemin
+    // porteur de métacaractères, comme pour un script importé.
+    if (!eP && brut && !BAD_SHELL_RE.test(brut)) npmPrefix = brut;
+    recalculerCheminsPm2();
+    execFile('pm2', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (err, out) => {
+      const parPath = !err && /\d+\.\d+/.test(String(out || ''));
+      const parChemin = !!(PM2 || PM2_JS);
+      // « pm2 présent » = présent ET LANÇABLE par l'un des trois chemins de pm2Raw. Le PATH en est
+      // un vrai depuis ce lot : les deux réponses ne peuvent donc plus se contredire.
+      if (parPath || parChemin) return resolve({ node: true, pm2: true });
+      execFile('node', ['-v'], { shell: true, windowsHide: true, timeout: 15000 }, (e2, o2) => {
+        resolve({ node: !e2 && /v\d+/.test(String(o2 || '')), pm2: false });
+      });
     });
   });
 });
@@ -574,7 +591,20 @@ const probeToolchain = () => new Promise((resolve) => {
 // quoting, l'arbre est tuable proprement.
 // ⚠️ JAMAIS process.execPath (Electron) même avec ELECTRON_RUN_AS_NODE : le démon pm2 hériterait de
 // HasuPanel.exe, et une mise à jour du panel tuerait TOUS les bots. On veut un vrai node.exe.
-const PM2_JS = path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'pm2', 'bin', 'pm2');
+// Chemins RÉSOLUS (voir `basesPm2` dans logic.js pour le pourquoi). Vides = introuvables sous un
+// préfixe connu : on passera alors par le PATH, troisième repli de `pm2Raw`.
+let npmPrefix = '';                 // appris par probeToolchain (`npm prefix -g`)
+let PM2 = '', PM2_JS = '';
+const recalculerCheminsPm2 = () => {
+  PM2 = ''; PM2_JS = '';
+  for (const base of basesPm2(npmPrefix, path.join(process.env.APPDATA || '', 'npm'))) {
+    const cmd = path.join(base, ...SOUS_PM2_CMD);
+    const js = path.join(base, ...SOUS_PM2_JS);
+    try { if (!PM2 && fs.existsSync(cmd)) PM2 = cmd; } catch {}
+    try { if (!PM2_JS && fs.existsSync(js)) PM2_JS = js; } catch {}
+  }
+};
+recalculerCheminsPm2();
 const findNodeExe = () => {
   const cands = [
     path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
@@ -586,8 +616,16 @@ const findNodeExe = () => {
 };
 let NODE_EXE = null, pm2Direct = false;
 const resolvePm2Runner = () => {
-  try { NODE_EXE = findNodeExe(); pm2Direct = !!(NODE_EXE && fs.existsSync(PM2_JS)); } catch { pm2Direct = false; }
-  log('pm2 runner :', pm2Direct ? `direct (${NODE_EXE})` : 'repli cmd.exe');
+  try {
+    recalculerCheminsPm2();   // le préfixe a pu être appris entre-temps par probeToolchain
+    NODE_EXE = findNodeExe();
+    pm2Direct = !!(NODE_EXE && PM2_JS && fs.existsSync(PM2_JS));
+  } catch { pm2Direct = false; }
+  // Le journal DIT par quel chemin on passe : sans ça, « pm2 ne répond plus » ne distinguait pas un
+  // démon mort d'un pm2 qu'on ne savait pas lancer.
+  log('pm2 runner :', pm2Direct ? `direct (${NODE_EXE} + ${PM2_JS})`
+    : PM2 ? `repli cmd.exe (${PM2})` : 'repli PATH (aucun préfixe npm connu)',
+  npmPrefix ? `— préfixe npm : ${npmPrefix}` : '— préfixe npm inconnu');
 };
 // (Repli cmd.exe : `quoteForShell` vit dans logic.js, testé unitairement.)
 // Les commandes de LECTURE n'ont pas la patience des commandes d'écriture. Un `jlist` est mesuré à
@@ -602,6 +640,10 @@ const pm2Raw = (args) => new Promise((resolve) => {
   const lecture = args.length === 1 && PM2_LECTURE.has(String(args[0]));
   const opts = { windowsHide: true, timeout: lecture ? 20000 : 60000, maxBuffer: 16 * 1024 * 1024 };
   if (pm2Direct) return execFile(NODE_EXE, [PM2_JS, ...args.map(String)], opts, done);
+  // TROISIÈME REPLI : le PATH. Sans lui, un pm2 installé sous un autre préfixe npm ne pouvait être
+  // lancé par AUCUN des deux chemins précédents, et le panel restait aveugle en annonçant le
+  // contraire. `pm2` sans chemin laisse Windows résoudre — exactement ce que fait `probeToolchain`.
+  if (!PM2) return execFile('pm2', args.map(quoteForShell), { ...opts, shell: true }, done);
   execFile(`"${PM2}"`, args.map(quoteForShell), { ...opts, shell: true }, done);
 });
 // Variante courante : uniquement des mots-clés/noms sûrs (start/stop/restart/jlist/save/… + noms pm2).
@@ -2615,7 +2657,11 @@ if (process.argv.includes('--selftest')) {
     if (sal) console.log(`SELFTEST détection en-ligne (via ${sal.name}) :`, await hasOnlineActivity([sal.pid]));
     console.log('SELFTEST débit lien :', Math.round(await linkSpeedMbps()), 'Mbps');
     console.log('SELFTEST config :', cfgPath());
-    process.exit(bots.length && procs ? 0 : 1);
+    // Le verdict vit dans logic.js (`verdictSelftest`), donc il est ÉPROUVÉ — « aucun bot » n'est pas
+    // un échec, « pm2 muet » en est un, et l'auto-test DIT lequel des deux il a rencontré.
+    const verdict = verdictSelftest(pm2Health.ok, !!procs, bots.length);
+    console.log('SELFTEST verdict :', verdict.texte);
+    process.exit(verdict.code);
   });
 } else if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
@@ -2658,7 +2704,10 @@ else {
         try { if (Notification.isSupported()) new Notification({ title: 'Hasu Panel mis à jour', body: `Version ${from} → ${app.getVersion()}. Rien à faire, tout a repris tout seul.` }).show(); } catch {}
       }, 4000);
     }
-    probeToolchain().then((t) => { toolchain = t; }).catch(() => {}); // détecte Node/pm2 (guide si absent)
+    // Le sondage apprend le préfixe npm : on RE-RÉSOUT le lanceur derrière, sinon le premier
+    // `resolvePm2Runner` (qui a tourné avant, sans le préfixe) laissait pm2Direct faux pour toute la
+    // session sur un poste à préfixe non standard.
+    probeToolchain().then((t) => { toolchain = t; resolvePm2Runner(); }).catch(() => {});
     if (!START_HIDDEN) showWindow();
 
     if (IS_STARTUP) {
