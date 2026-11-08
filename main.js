@@ -44,7 +44,14 @@ const updateBlockers = () => {
   if (actionsInFlight.size) b.push('blk.action');
   if (stopAllInFlight) b.push('blk.stopAll');
   if (cfg.stoppedByGame.some((n) => n !== '-')) b.push('blk.parked'); // '-' = aucune cible // on ne redémarre pas là-dessus
-  if (cfg.lowNetApplied) b.push('blk.lownet');
+  // ⚠️ BORNÉ, comme `blk.unknown` juste au-dessus et pour la même raison écrite là : « dans le
+  //    doute on ne redémarre pas — mais pas indéfiniment ». `lowNetApplied` reste volontairement
+  //    levé quand pm2 est muet (c'est lui qui permettra de restaurer les priorités CPU plus tard, et
+  //    `clearLowNet` le dit), mais ce drapeau bloquait AUSSI toute mise à jour, sans aucune borne :
+  //    un pm2 durablement injoignable gelait donc les mises à jour du panel POUR TOUJOURS, en
+  //    silence. Un doute qui dure n'est plus un doute, c'est une panne — et une panne ne doit pas
+  //    empêcher le logiciel de se réparer.
+  if (cfg.lowNetApplied && !(lowNetCoinceDepuis && Date.now() - lowNetCoinceDepuis > GAME_UNKNOWN_MAX_MS)) b.push('blk.lownet');
   if (isWindowVisible()) b.push('blk.window'); // tu es en train de t'en servir
   if (Date.now() - updateReadyAt < UPDATE_GRACE_MS) b.push('blk.grace');
   return b;
@@ -149,7 +156,7 @@ const { t, setLang, ORDRE: LANGUES } = require('./ui/i18n');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert, verdictSelftest,
-  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
@@ -212,6 +219,7 @@ const DEFAULTS = {
   lowNet: false,            // mode « faible usage internet » : priorité réseau au jeu en ligne
   lowNetApplied: false,     // persisté → on sait restaurer les priorités après un crash du panel
   stoppedByGame: [],        // persisté → si le panel redémarre pendant une partie, on sait quoi relancer
+  reprisEnJeu: [],          // bots que TU as redémarrés à la main pendant la partie en cours (persisté comme ci-dessus)
   imported: [],             // bots importés par l'utilisateur (catégorie à part, retirables du panel)
   scanAuto: true,           // découverte de nouveaux jeux installés : 1×/JOUR max (jamais en continu)
   lastScanAt: 0,
@@ -265,6 +273,9 @@ let lowNetFlagOk = true; // le drapeau lu par les bots a-t-il pu être écrit ? 
 // le mal qu'on évite (c'est exactement le mode de panne « panel figé sur une vieille version »).
 // Au-delà de ce délai, on cesse de s'en servir comme motif de blocage.
 const GAME_UNKNOWN_MAX_MS = 30 * 60 * 1000;
+// Depuis quand l'éco réseau n'arrive PLUS à se nettoyer (pm2 muet) ? 0 = pas coincée. Sert à borner
+// le blocage des mises à jour, exactement comme GAME_UNKNOWN_MAX_MS borne le doute sur le jeu.
+let lowNetCoinceDepuis = 0;
 let statusCache = { bots: [], game: null, online: false, updatedAt: 0 };
 let busy = false; // évite deux bascules mode jeu simultanées
 // Verrou partagé par TOUS les appelants de enterGameMode/exitGameMode (tick, bascule manuelle
@@ -457,6 +468,7 @@ const loadCfg = () => {
       [CFG_SEQ]: clampInt(raw[CFG_SEQ], 0, Number.MAX_SAFE_INTEGER, 0),
       games: Array.isArray(raw.games) ? raw.games.filter((g) => EXE_RE.test(g)) : [...DEFAULT_GAMES], // copie : sinon addGame muterait la constante
       stoppedByGame: Array.isArray(raw.stoppedByGame) ? raw.stoppedByGame.filter((n) => isSafeName(n)) : [],
+      reprisEnJeu: Array.isArray(raw.reprisEnJeu) ? raw.reprisEnJeu.filter((n) => isSafeName(n)) : [],
       imported: Array.isArray(raw.imported) ? raw.imported.filter((n) => isSafeName(n)) : [],
       ignoredExes: Array.isArray(raw.ignoredExes) ? raw.ignoredExes.filter((g) => EXE_RE.test(g)) : [],
       discovered: Array.isArray(raw.discovered) ? raw.discovered.filter((g) => g && EXE_RE.test(g.exe || '')) : [],
@@ -1494,8 +1506,13 @@ const clearLowNet = async (known) => {
   // exige `lowNetApplied === true`, donc plus personne ne repasserait jamais. On garde le drapeau levé
   // et on réessaiera au tick suivant.
   const bots = known === undefined ? await pm2List() : known;
-  if (!bots) { log('éco réseau : pm2 muet → priorités NON restaurées, nouvelle tentative au prochain tick'); return; }
+  if (!bots) {
+    if (!lowNetCoinceDepuis) lowNetCoinceDepuis = Date.now();
+    log('éco réseau : pm2 muet → priorités NON restaurées, nouvelle tentative au prochain tick');
+    return;
+  }
   await setBotPriority(bots.map((b) => b.pid), 'Normal');
+  lowNetCoinceDepuis = 0;
   cfg.lowNetApplied = false; saveCfg();
   log('faible usage internet OFF — priorités restaurées');
   updateTray();
@@ -1543,6 +1560,7 @@ const removeBot = async (name) => {
   cfg.imported = cfg.imported.filter((n) => n !== name);
   delete cfg.bots[name];
   cfg.stoppedByGame = cfg.stoppedByGame.filter((n) => n !== name);
+  cfg.reprisEnJeu = (cfg.reprisEnJeu || []).filter((n) => n !== name);
   saveCfg();
   log('retrait:', name);
   await refreshBots();
@@ -1647,9 +1665,19 @@ const enterGameMode = async (game, known) => {
   // au lancement d'un jeu, c'est-à-dire au pire moment pour la fluidité.
   const list = known || await pm2List();
   if (!list) return; // pm2 muet : on ne coupe rien sur une lecture ratée (on réessaiera au tick suivant)
-  const targets = list
-    .filter((b) => b.status === 'online' && (cfg.gameMode.stopAll || cfg.bots[b.name]?.gameStop))
-    .map((b) => b.name);
+  // ⚠️ ON NE RECOUPE PAS CE QUE L'UTILISATEUR A REPRIS À LA MAIN. `panel:action` applique une
+  //    doctrine écrite noir sur blanc plus bas — « un geste MANUEL reprend la main sur ce bot : le
+  //    mode jeu n'en est plus propriétaire » — en retirant le bot de `cfg.stoppedByGame`. Mais cette
+  //    liste est AUSSI la porte d'entrée du mode jeu dans le tick (`stoppedByGame.length === 0`) :
+  //    quand le bot reprise était le SEUL parqué, la liste redevenait vide, la porte se rouvrait, et
+  //    enterGameMode le recoupait 10 à 15 secondes plus tard. En boucle, pendant toute la partie.
+  //    Le geste était donc annulé par la règle censée le respecter — et seulement dans le cas d'un
+  //    seul bot parqué, ce qui est le cas le plus courant ici. La propriété doit être MÉMORISÉE, pas
+  //    déduite d'une liste qui sert à deux choses.
+  // La règle vit dans logic.js (`ciblesModeJeu`), donc elle est ÉPROUVÉE sur du code qui tourne.
+  const targets = ciblesModeJeu(list, {
+    stopAll: cfg.gameMode.stopAll, confs: cfg.bots, repris: cfg.reprisEnJeu,
+  });
   if (!targets.length) { cfg.stoppedByGame = ['-']; saveCfg(); return; } // marqueur « déjà traité » sans cible
   targets.sort((a, b) => (a === 'saliox') - (b === 'saliox')); // saliox coupé EN DERNIER
   // Mémorisé AVANT de couper : l'arrêt prend plusieurs secondes (grâce + un pm2 stop par bot) et si le
@@ -1672,6 +1700,10 @@ const exitGameMode = async () => {
   // de 20 reports, donc le dump de reboot pourrit), ça exclurait ces bots du bandeau « à remettre en
   // ordre », et exitGameMode se rappellerait à chaque tick — un spawn pm2 par tick, indéfiniment.
   cfg.stoppedByGame = [];
+  // La reprise manuelle ne vaut QUE pour l'épisode en cours : la partie finie, le mode jeu
+  // redevient propriétaire de ce bot pour la prochaine. Sans ce nettoyage, un bot repris une fois
+  // n'aurait plus JAMAIS été coupé en jeu — un desserrage silencieux et définitif.
+  cfg.reprisEnJeu = [];
   saveCfg();
   // On republie l'état AVANT que le tick n'en tire des conclusions : sans ça, la suite du tick
   // travaillait sur la lecture pm2 faite au DÉBUT, quand ces bots étaient encore arrêtés — d'où une
@@ -1906,7 +1938,23 @@ const bootEnforce = async () => {
     log('boot: stop', aArreter.map((e) => e.name).join(','), '(auto off)');
     await stopBotsTree(aArreter);
   }
-  for (const n of aDemarrer) { await pm2(['start', n]); log('boot: start', n); }
+  // ⚠️ REVÉRIFIÉ JUSTE AVANT CHAQUE DÉMARRAGE, et sous le verrou du mode jeu. La garde de la
+  //    collecte, plus haut, lit `cfg.stoppedByGame` AU MOMENT DE LA COLLECTE — or plusieurs secondes
+  //    s'écoulent ensuite (le lot d'arrêts comporte une grâce de 4 s), et c'est mon propre lot
+  //    v1.16.15 qui a élargi cette fenêtre en groupant les arrêts avant les démarrages. Un jeu lancé
+  //    au logon (Steam qui redémarre le dernier jeu) fait entrer le tick en mode jeu dans cet
+  //    intervalle : bootEnforce rallumait alors exactement ce que le mode jeu venait de couper, et
+  //    l'utilisateur voyait ses bots revenir en pleine partie. Le verrou ferme la dernière seconde,
+  //    entre la vérification et le spawn.
+  if (aDemarrer.length) {
+    await withGameLock(async () => {
+      for (const n of aDemarrer) {
+        if (cfg.stoppedByGame.includes(n)) { log('boot: skip', n, '(coupé par le mode jeu entre-temps)'); continue; }
+        if (cfg.bots[n] && cfg.bots[n].manualStop) { log('boot: skip', n, '(arrêté à la main entre-temps)'); continue; }
+        await pm2(['start', n]); log('boot: start', n);
+      }
+    });
+  }
 };
 
 // ---------- Lancement auto du panel ----------
@@ -2426,7 +2474,21 @@ ipcMain.handle('panel:action', async (_e, { name, action } = {}) => {
     //    « à remettre en ordre » (l. 1189). Il tombait donc dans un trou : ni alerte, ni toast, ni
     //    relance automatique, ni pastille rouge, pendant toute la partie. Et à la fin, `exitGameMode`
     //    le relançait alors qu'on venait peut-être de l'arrêter exprès.
+    // Lu AVANT le filtre : après, la liste ne dit plus si ce bot y était.
+    const etaitParque = cfg.stoppedByGame.includes(name);
     cfg.stoppedByGame = cfg.stoppedByGame.filter((n) => n !== name);
+    // …ET ON S'EN SOUVIENT, parce que retirer le bot de cette liste ne suffisait pas : `stoppedByGame`
+    // sert AUSSI de porte d'entrée au mode jeu dans le tick (`stoppedByGame.length === 0`). Quand le
+    // bot repris était le SEUL parqué — le cas le plus courant ici — la liste redevenait vide, la
+    // porte se rouvrait, et `enterGameMode` le recoupait 10 à 15 secondes plus tard. En boucle,
+    // pendant toute la partie : le geste de l'utilisateur était annulé par la règle censée le
+    // respecter, et la doctrine écrite juste au-dessus ne tenait qu'à condition qu'un AUTRE bot soit
+    // parqué. Une propriété se MÉMORISE ; elle ne se déduit pas d'une liste qui sert à deux choses.
+    // Un `stop` manuel, lui, n'a rien à mémoriser : le bot est déjà éteint et `manualStop` suffit.
+    if (action !== 'stop' && etaitParque) {
+      cfg.reprisEnJeu = [...new Set([...(cfg.reprisEnJeu || []), name])];
+      log('mode jeu : reprise manuelle de', name, '— il ne sera plus recoupé pendant cette partie');
+    }
     saveCfg();
     if (action === 'stop') r = await stopTree(name);
     else if (action === 'restart') { await stopTree(name); r = await pm2(['start', name]); }
@@ -2446,10 +2508,18 @@ ipcMain.handle('panel:stopAll', async () => {
   if (stopAllInFlight) return { ok: false, error: 'déjà en cours' };
   stopAllInFlight = true;
   try {
-    const online = (await pm2List() || []).filter((b) => b.status === 'online' && isSafeName(b.name));
-    // Arrêt VOLONTAIRE → ces bots ne doivent pas se rallumer seuls au prochain démarrage du panel.
-    for (const b of online) { const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false }); c.manualStop = true; }
-    if (online.length) saveCfg();
+    const tous = (await pm2List() || []).filter((b) => isSafeName(b.name));
+    const online = tous.filter((b) => b.status === 'online');
+    // ⚠️ LE MARQUAGE PORTE SUR TOUS LES BOTS, L'ARRÊT SEULEMENT SUR CEUX EN LIGNE. « Tout arrêter »
+    //    veut dire « que plus rien ne tourne », pas « arrête ceux qui tournent à cette seconde ».
+    //    Le marquage ne visait que les bots EN LIGNE : un bot déjà tombé (donc inscrit dans
+    //    `healState` et attendant une relance automatique à 5 / 15 / 60 min) n'était jamais marqué —
+    //    la relance automatique le rallumait donc quelques minutes après le clic, et « Auto boot » le
+    //    rallumait au démarrage suivant. L'utilisateur voyait revenir précisément ce qu'il venait
+    //    d'éteindre, sans comprendre pourquoi — et le bot le plus susceptible d'être concerné est
+    //    celui qui venait de tomber, c'est-à-dire la raison pour laquelle il a cliqué.
+    for (const b of tous) { const c = cfg.bots[b.name] || (cfg.bots[b.name] = { auto: true, gameStop: false }); c.manualStop = true; }
+    if (tous.length) saveCfg();
     await stopBotsTree(online.map((b) => ({ name: b.name, pid: b.pid }))); // 1 snapshot + 1 grâce pour tous
     await refreshBots();
     log('stopAll:', online.length, 'bot(s)');

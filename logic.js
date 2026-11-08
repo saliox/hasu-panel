@@ -169,6 +169,33 @@ const redactSensitive = (s) => String(s || '')
     (m, cle, sep, guillemet) => `${cle}${sep}${guillemet}[identifiant]`)
   .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b/g, '[courriel]');
 
+// ---------- Mode jeu : qui faut-il couper ? ----------
+/**
+ * Bots que le mode jeu doit arrêter. PURE.
+ *
+ * `repris` = bots que l'utilisateur a redémarrés À LA MAIN pendant la partie en cours. Ils sont
+ * exclus, et c'est le cœur d'un défaut qui a vécu longtemps : `panel:action` retirait bien le bot de
+ * `cfg.stoppedByGame` au nom d'une doctrine explicite (« un geste MANUEL reprend la main sur ce
+ * bot »), mais cette liste sert AUSSI de porte d'entrée au mode jeu dans le tick — l'entrée a lieu
+ * quand la liste est VIDE. Quand le bot repris était le SEUL parqué, la liste se vidait, la porte se
+ * rouvrait, et le bot était recoupé 10 à 15 secondes plus tard. En boucle, pendant toute la partie.
+ * La règle s'annulait donc elle-même, et seulement dans le cas d'un unique bot parqué — le plus
+ * courant sur ce poste.
+ *
+ * @param bots  sortie de pm2List : [{ name, status }]
+ * @param stopAll  « couper TOUS les bots » coché
+ * @param confs  cfg.bots : { <nom>: { gameStop } }
+ * @param repris  cfg.reprisEnJeu
+ */
+const ciblesModeJeu = (bots, { stopAll = false, confs = {}, repris = [] } = {}) => {
+  const pris = new Set(Array.isArray(repris) ? repris : []);
+  const c = (confs && typeof confs === 'object') ? confs : {};
+  return (bots || [])
+    .filter((b) => b && b.status === 'online' && !pris.has(b.name)
+      && (stopAll || !!(c[b.name] && c[b.name].gameStop)))
+    .map((b) => b.name);
+};
+
 // ---------- Où vit pm2 ? ----------
 // Le préfixe npm GLOBAL n'est pas toujours %APPDATA%\npm : nvm-windows le place par version de Node,
 // `npm config set prefix` le déplace où l'on veut, Chocolatey et une installation par MSI encore
@@ -642,7 +669,7 @@ module.exports = {
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert, verdictSelftest,
-  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,
