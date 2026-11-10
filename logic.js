@@ -169,6 +169,28 @@ const redactSensitive = (s) => String(s || '')
     (m, cle, sep, guillemet) => `${cle}${sep}${guillemet}[identifiant]`)
   .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b/g, '[courriel]');
 
+// ---------- Les bots qu'on attend et que pm2 ne nomme plus ----------
+/**
+ * Bots DÉCLARÉS dans la configuration mais ABSENTS de la liste pm2. PURE.
+ *
+ * Le panel ne surveillait que ce que pm2 voulait bien nommer. Un bot supprimé de pm2 — `pm2 delete`
+ * tapé au terminal, un `pm2 resurrect` depuis un dump périmé, un démon réinstallé, un dossier de
+ * données pm2 perdu — disparaissait simplement de l'écran : plus de ligne, donc plus de pastille,
+ * plus d'alerte, plus de relance automatique, et « 0/0 en ligne » affiché EN VERT. C'est très
+ * exactement l'angle mort du constat qui a motivé ce logiciel (quatre bots morts cinq jours sans que
+ * personne ne le signale) : un bot absent est plus silencieux qu'un bot tombé.
+ *
+ * On ne retient que ceux dont la configuration dit qu'on les veut en ligne (`auto !== false`) et
+ * qu'on n'a pas arrêtés soi-même : un bot qu'on a volontairement laissé de côté n'est pas une panne.
+ */
+const botsManquants = (confs, bots) => {
+  const vus = new Set((bots || []).filter((b) => b && b.name).map((b) => b.name));
+  const c = (confs && typeof confs === 'object') ? confs : {};
+  return Object.keys(c)
+    .filter((nom) => !vus.has(nom) && c[nom] && c[nom].auto !== false && !c[nom].manualStop)
+    .sort();
+};
+
 // ---------- Pourquoi pm2 a-t-il refusé ? ----------
 /**
  * Motif lisible d'un refus de pm2, ou chaîne VIDE si l'action a réussi. PURE.
@@ -688,7 +710,7 @@ module.exports = {
   semverGt, clampInt, quoteForShell,
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert, verdictSelftest,
-  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction, botsManquants,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,

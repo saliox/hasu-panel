@@ -210,12 +210,15 @@ const render = (st) => {
     const dot = b.status === 'online' ? 'online' : b.status === 'errored' ? 'errored' : 'stopped';
     const stoppedByGame = st.stoppedByGame.includes(b.name);
     const echec = echecsAction.get(b.name);
+    // « hors ligne depuis » : la durée n'était affichée que pour les bots EN LIGNE. Or c'est
+    // précisément sur un bot tombé qu'elle décide si on regarde ce soir ou tout de suite.
+    const depuis = b.status !== 'online' ? (st.horsLigneDepuis || {})[b.name] : 0;
     const motif = (echec && Date.now() - echec.at < ECHEC_VISIBLE_MS) ? echec.texte : '';
     const isImp = imported.includes(b.name);
     return `<div class="bot">
       <span class="dot ${dot}" title="${esc(b.status)}"></span>
       <span class="name">${esc(b.name)}</span>
-      <span class="meta">${b.status === 'online' ? `${t('bots.uptime', { v: fmtUptime(b.uptime) })} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status)} · ↻ ${b.restarts}${motif ? ` · <span style="color:var(--err)">⚠️ ${esc(motif)}</span>` : ''}</span>
+      <span class="meta">${b.status === 'online' ? `${t('bots.uptime', { v: fmtUptime(b.uptime) })} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status) + (depuis ? ' · ' + t('bots.downFor', { v: fmtUptime(depuis) }) : '')} · ↻ ${b.restarts}${motif ? ` · <span style="color:var(--err)">⚠️ ${esc(motif)}</span>` : ''}</span>
       <label class="chk" title="${t('bots.autobootTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> ${t('bots.autoboot')}</label>
       <label class="chk" title="${t('bots.gamestopTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> ${t('bots.gamestop')}</label>
       ${pendingBots.has(b.name)
@@ -260,6 +263,14 @@ const render = (st) => {
     empty = `<div class="tc-warn">${t('tc.pm2Down', { min: mins })}`
       + `${health.reason ? ` <span style="opacity:.7">(${esc(health.reason)})</span>` : ''}</div>`;
   }
+  // Bandeau des bots ATTENDUS que pm2 ne nomme plus. Placé avant « devraient être en ligne » : un
+  // bot absent de pm2 est un problème d'une autre nature (le process n'existe pas, « Remettre en
+  // ordre » ne peut rien pour lui) et il faut le dire séparément.
+  const manquants = st.manquants || [];
+  const missBanner = manquants.length
+    ? `<div class="tc-warn">${t('bots.missing', { n: manquants.length })} : ${esc(manquants.join(', '))}`
+      + `<div class="hint" style="margin-top:6px">${t('bots.missingWhy')}</div></div>`
+    : '';
   // Bandeau « X bots devraient être en ligne » (Auto boot coché, pas arrêtés par toi ni par le mode jeu).
   const nf = st.needFix || [];
   const fixBanner = nf.length
@@ -275,10 +286,10 @@ const render = (st) => {
   // D'où le clic qui « ne prend pas ». Tant que le bouton de la souris est ENFONCÉ, on ne remplace
   // donc rien — et surtout on ne met pas `lastBotsHtml` à jour, sinon le changement sauté serait
   // perdu définitivement.
-  const botsHtml = (!health.ok ? empty : '') + fixBanner + (
+  const botsHtml = (!health.ok ? empty : '') + missBanner + fixBanner + (
     main.map(botRow).join('') +
     (imps.length ? `<div class="sechead">${t('bots.imported')}</div>${imps.map(botRow).join('')}` : '')
-  ) || (fixBanner + empty);
+  ) || (missBanner + fixBanner + empty);
   if (botsHtml !== lastBotsHtml && !sourisEnfoncee) { lastBotsHtml = botsHtml; $('bots').innerHTML = botsHtml; }
 
   // Mode jeu

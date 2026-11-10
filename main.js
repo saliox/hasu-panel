@@ -156,7 +156,7 @@ const { t, setLang, ORDRE: LANGUES } = require('./ui/i18n');
 const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert, verdictSelftest,
-  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction,
+  basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction, botsManquants,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
@@ -2363,6 +2363,13 @@ ipcMain.handle('panel:status', () => ({
   autoHeal: cfg.autoHeal !== false,
   lang: LANGUES.includes(cfg.lang) ? cfg.lang : 'fr',
   incidents: (cfg.incidents || []).slice(-20).reverse(), // le plus récent en premier
+  // Bots attendus que pm2 ne nomme PLUS : sans eux l'écran disait « 0/0 en ligne » en vert.
+  // Jamais calculé quand pm2 est muet : on ne sait alors RIEN, et « tous manquants » serait un
+  // mensonge spectaculaire au pire moment.
+  manquants: pm2Health.ok ? botsManquants(cfg.bots, statusCache.bots) : [],
+  // Depuis quand chaque bot est tombé, quand on le sait (l'épisode de relance porte la date). On
+  // n'invente rien pour les autres : pas de date plutôt qu'une date fausse.
+  horsLigneDepuis: Object.fromEntries([...healState].map(([n, v]) => [n, v.downSince || 0])),
   secondeInstall,                 // chemin d'une AUTRE installation du panel sur ce PC (bandeau)
   cfgWriteFailed,                 // les réglages ne s'écrivent plus sur le disque → bandeau (jamais silencieux)
   cfgPath: cfgWriteFailed ? cfgPath() : '', // le chemin n'est utile que pour dire OÙ regarder
