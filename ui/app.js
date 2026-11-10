@@ -213,12 +213,16 @@ const render = (st) => {
     // « hors ligne depuis » : la durée n'était affichée que pour les bots EN LIGNE. Or c'est
     // précisément sur un bot tombé qu'elle décide si on regarde ce soir ou tout de suite.
     const depuis = b.status !== 'online' ? (st.horsLigneDepuis || {})[b.name] : 0;
+    // Pente mémoire : une fuite lente est INVISIBLE sur un chiffre instantané, quel que soit le soin
+    // qu'on met à le regarder. Affichée seulement quand le recul suffit (voir tendanceMemoire).
+    const tm = (st.tendanceMem || {})[b.name];
+    const pente = tm ? t('bots.memTrend', { pic: fmtMem(tm.pic), delta: (tm.parJour >= 0 ? '+' : '') + fmtMem(Math.abs(tm.parJour)) }) : '';
     const motif = (echec && Date.now() - echec.at < ECHEC_VISIBLE_MS) ? echec.texte : '';
     const isImp = imported.includes(b.name);
     return `<div class="bot">
       <span class="dot ${dot}" title="${esc(b.status)}"></span>
       <span class="name">${esc(b.name)}</span>
-      <span class="meta">${b.status === 'online' ? `${t('bots.uptime', { v: fmtUptime(b.uptime) })} · ${fmtMem(b.memory)} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status) + (depuis ? ' · ' + t('bots.downFor', { v: fmtUptime(depuis) }) : '')} · ↻ ${b.restarts}${motif ? ` · <span style="color:var(--err)">⚠️ ${esc(motif)}</span>` : ''}</span>
+      <span class="meta">${b.status === 'online' ? `${t('bots.uptime', { v: fmtUptime(b.uptime) })} · ${fmtMem(b.memory)}${pente ? ' ' + pente : ''} · ${b.cpu}% cpu · <span class="net" title="${t('bots.netTitle')}">↓ ${fmtNet(b.netDown)} · ↑ ${fmtNet(b.netUp)}</span>` : stoppedByGame ? t('bots.parked') : esc(b.status) + (depuis ? ' · ' + t('bots.downFor', { v: fmtUptime(depuis) }) : '')} · ↻ ${b.restarts}${motif ? ` · <span style="color:var(--err)">⚠️ ${esc(motif)}</span>` : ''}</span>
       <label class="chk" title="${t('bots.autobootTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="auto" ${c.auto !== false ? 'checked' : ''}> ${t('bots.autoboot')}</label>
       <label class="chk" title="${t('bots.gamestopTitle')}"><input type="checkbox" data-bot="${esc(b.name)}" data-key="gameStop" ${c.gameStop ? 'checked' : ''}> ${t('bots.gamestop')}</label>
       ${pendingBots.has(b.name)
@@ -342,14 +346,28 @@ const render = (st) => {
   // Derniers incidents — le panel voyait chaque chute et l'oubliait aussitôt. Écrit seulement quand
   // la liste change : c'est du DOM reconstruit, et le sondage passe toutes les 3 s.
   const ICONES = { chute: '⚠️', boucle: '🔁', retour: '✅', relance: '🔧', 'relance-ko': '⛔' };
-  const incHtml = (st.incidents || []).length
+  // Fréquence et cause dominante, par bot : l'historique était 20 lignes brutes dont on ne tirait
+  // rien. « 6 chutes en 10 j — cause dominante : Internet/DNS (5/6) » dit où chercher ; vingt lignes
+  // de « ⚠️ saliox » ne le disent pas.
+  const tp = st.tendancePannes || {};
+  const tendHtml = Object.keys(tp).sort().map((nom) => {
+    const e = tp[nom];
+    return `<div style="padding:3px 0;color:var(--warn)">${t('inc.trend', {
+      name: esc(nom), n: e.chutes, j: e.jours,
+    })}${e.cause ? ' — ' + t('inc.trendCause', { cause: esc(e.cause), c: e.combien, n: e.chutes }) : ''}</div>`;
+  }).join('');
+  // Parenthèses OBLIGATOIRES : `+` lie plus fort que `? :`, donc `tendHtml + length ? a : b` se
+  // lit `(tendHtml + length) ? a : b` — et « "" + 0 » vaut la chaîne "0", qui est VRAIE. La branche
+  // « aucun incident » devenait inatteignable, et le bandeau de tendance disparaissait dans la
+  // condition au lieu d'être affiché.
+  const incHtml = tendHtml + ((st.incidents || []).length
     ? (st.incidents || []).map((i) => {
       const h = new Date(i.at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
       return `<div style="padding:3px 0;border-bottom:1px solid var(--line)">`
         + `<span style="opacity:.7">${esc(h)}</span> ${ICONES[i.kind] || '•'} <b>${esc(i.name)}</b>`
         + (i.cause ? ` — ${esc(i.cause)}` : '') + `</div>`;
     }).join('')
-    : t('inc.none');
+    : t('inc.none'));
   if (incHtml !== lastIncHtml) { lastIncHtml = incHtml; $('incidents').innerHTML = incHtml; }
 
   // Mises à jour

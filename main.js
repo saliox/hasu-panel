@@ -157,6 +157,7 @@ const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert, verdictSelftest,
   basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction, botsManquants,
+  echantillonnerMemoire, tendanceMemoire, tendanceIncidents,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
@@ -238,6 +239,8 @@ const DEFAULTS = {
   autoHeal: true,           // retenter de relancer un bot tombé (5 min, 15 min, 1 h, puis on laisse l'alerte parler)
   lang: 'fr',               // langue de l'interface ('fr' | 'en') — bouton dans l'en-tête de la fenêtre
   incidents: [],            // 40 derniers événements {at, name, kind, cause} → onglet « incidents »
+  mem: {},                  // nom → [[horodatage, octets], …] ≤ 26 : la mémoire d'HIER, sans quoi une
+                            // fuite lente est invisible (un chiffre instantané ne monte jamais)
   // État de surveillance PERSISTÉ : il ne vivait qu'en mémoire, donc un redémarrage du panel — que la
   // mise à jour automatique provoque elle-même — perdait les alertes en attente de réessai et les
   // compteurs de relance. Une panne pouvait ainsi repartir de zéro à chaque MAJ.
@@ -442,6 +445,14 @@ const loadCfg = () => {
       // prototype, horodatages corrompus, structures inattendues). Ces données alimentent des
       // relances `pm2 start` : rien de douteux ne doit franchir cette ligne.
       incidents: sanitizeIncidents(raw.incidents, INCIDENTS_MAX),
+      // Reconstruit, jamais recopié : ces séries viennent du disque. `echantillonnerMemoire` écarte
+      // déjà les paires non numériques et les horodatages futurs, et borne la longueur.
+      mem: (() => {
+        const src = (raw.mem && typeof raw.mem === 'object') ? raw.mem : {};
+        const out = {};
+        for (const k of Object.keys(src)) if (isSafeName(k)) out[k] = echantillonnerMemoire(src[k], Date.now(), 0);
+        return out;
+      })(),
       runtime: sanitizeRuntime(raw.runtime),
       // Bornes de fenêtre : uniquement des nombres finis, sinon on repart sur la taille calculée
       // (une valeur corrompue ouvrirait une fenêtre invisible ou de 0 pixel).
@@ -1166,6 +1177,25 @@ const hydrateRuntime = () => {
   if (lastAlertAt.size || healState.size || rejouerArete.size) log('surveillance reprise :', lastAlertAt.size, 'alerte(s) suivie(s),', healState.size, 'bot(s) en attente de relance,', rejouerArete.size, 'alerte(s) à rejouer');
 };
 
+// Un échantillon de mémoire par HEURE et par bot — pas à chaque tick. Le tick passe toutes les 10 s :
+// écrire le fichier de configuration 8 640 fois par jour pour tracer une courbe serait absurde, et
+// c'est `echantillonnerMemoire` qui tranche (elle rend la série inchangée si le dernier point a moins
+// d'une heure). On n'enregistre donc que quand un point a VRAIMENT été ajouté.
+const echantillonnerMem = () => {
+  if (!cfg.mem || typeof cfg.mem !== 'object') cfg.mem = {};
+  const now = Date.now();
+  let change = false;
+  for (const b of statusCache.bots) {
+    if (!isSafeName(b.name) || b.status !== 'online') continue;
+    const avant = cfg.mem[b.name] || [];
+    const apres = echantillonnerMemoire(avant, now, b.memory);
+    const tAvant = avant.length ? avant[avant.length - 1][0] : 0;
+    const tApres = apres.length ? apres[apres.length - 1][0] : 0;
+    if (apres.length !== avant.length || tApres !== tAvant) { cfg.mem[b.name] = apres; change = true; }
+  }
+  if (change) saveCfg();
+};
+
 // Renvoie l'ensemble des bots dont l'instantané ne doit PAS avancer (statut de passage).
 const transientTicks = new Map(); // nom → nombre de ticks consécutifs passés dans un statut de passage
 const lastIncidentAt = new Map(); // nom → dernier incident journalisé (anti-noyade sur un bot qui boucle)
@@ -1859,6 +1889,7 @@ const tick = async () => {
   // restent parfaitement lisibles, et on économise deux spawns sur trois.
   if (isWindowVisible() && (netTick++ % 3) === 0) await measureNet().catch(() => {});
   if (pm2Health.ok) {
+    echantillonnerMem(); // au plus un point par heure et par bot (voir la fonction)
     // L'ordre compte : le suivi des arrêts volontaires tourne TOUJOURS (c'est de l'auto-démarrage),
     // les notifications seulement si elles sont activées. `prevStatus` est mis à jour ici, en UN seul
     // endroit — avant il l'était sur cinq chemins différents à l'intérieur de checkAlerts.
@@ -2363,6 +2394,12 @@ ipcMain.handle('panel:status', () => ({
   autoHeal: cfg.autoHeal !== false,
   lang: LANGUES.includes(cfg.lang) ? cfg.lang : 'fr',
   incidents: (cfg.incidents || []).slice(-20).reverse(), // le plus récent en premier
+  // Tendances : la fréquence des pannes et la pente mémoire, que le panel savait déjà sans le dire.
+  // Chacune rend `null`/rien quand on ne SAIT pas : pas de pente sur six heures de recul, pas de
+  // « cause dominante » sur une chute isolée. Une tendance affirmée sans fondement est pire que rien.
+  tendancePannes: tendanceIncidents(cfg.incidents, Date.now()),
+  tendanceMem: Object.fromEntries(Object.entries(cfg.mem || {})
+    .map(([n, s]) => [n, tendanceMemoire(s)]).filter(([, v]) => v)),
   // Bots attendus que pm2 ne nomme PLUS : sans eux l'écran disait « 0/0 en ligne » en vert.
   // Jamais calculé quand pm2 est muet : on ne sait alors RIEN, et « tous manquants » serait un
   // mensonge spectaculaire au pire moment.

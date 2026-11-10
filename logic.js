@@ -169,6 +169,77 @@ const redactSensitive = (s) => String(s || '')
     (m, cle, sep, guillemet) => `${cle}${sep}${guillemet}[identifiant]`)
   .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b/g, '[courriel]');
 
+// ---------- Tendances : ce que le panel savait déjà sans le dire ----------
+// Deux données étaient relevées puis jetées : l'historique des incidents (40 entrées déjà typées et
+// déjà classées en français par classifyErrorFr) n'en tirait aucune fréquence, et la mémoire de
+// chaque bot, relevée à CHAQUE tick, était affichée à l'instant et jamais comparée à hier. Or une
+// panne qui revient et une mémoire qui monte sont deux choses qu'on ne voit QUE dans le temps : un
+// chiffre instantané ne les montre jamais, quel que soit le soin qu'on met à le regarder.
+
+const MEM_PAS_MS = 60 * 60 * 1000;   // un échantillon par heure : la fuite se mesure en jours
+const MEM_MAX = 26;                  // ~25 h de recul — juste ce qu'il faut pour un delta sur 24 h
+
+/**
+ * Ajoute un échantillon de mémoire à la série d'un bot, si le dernier a plus d'une heure. PURE.
+ * Série = [[horodatage, octets], …], la plus ancienne d'abord. Bornée à MEM_MAX : ce tableau part
+ * dans le fichier de configuration, il ne doit pas grossir sans fin.
+ */
+const echantillonnerMemoire = (serie, now, octets) => {
+  const s = (Array.isArray(serie) ? serie : []).filter((e) => Array.isArray(e)
+    && Number.isFinite(e[0]) && Number.isFinite(e[1]) && e[0] <= now);
+  if (!(Number.isFinite(octets) && octets > 0)) return s;
+  const dernier = s[s.length - 1];
+  if (dernier && now - dernier[0] < MEM_PAS_MS) return s;
+  return [...s, [now, octets]].slice(-MEM_MAX);
+};
+
+/**
+ * Tendance mémoire d'un bot. PURE. Rend null quand on ne SAIT pas — moins de deux échantillons, ou
+ * un recul trop court pour qu'une pente veuille dire quelque chose. Afficher « +0 Mo/24 h » sur
+ * vingt minutes de recul serait une affirmation sans fondement, donc pire que le silence.
+ */
+const tendanceMemoire = (serie, minHeures = 6) => {
+  const s = (Array.isArray(serie) ? serie : []).filter((e) => Array.isArray(e)
+    && Number.isFinite(e[0]) && Number.isFinite(e[1]));
+  if (s.length < 2) return null;
+  const a = s[0], b = s[s.length - 1];
+  const heures = (b[0] - a[0]) / 3600000;
+  if (!(heures >= minHeures)) return null;
+  return {
+    pic: Math.max(...s.map((e) => e[1])),
+    parJour: Math.round(((b[1] - a[1]) / heures) * 24),
+    heures: Math.round(heures),
+  };
+};
+
+/**
+ * Fréquence des chutes et cause dominante, par bot, sur une fenêtre. PURE.
+ * On ne compte que ce qui est une PANNE (chute, boucle) : un retour en ligne ou une relance
+ * réussie ne sont pas des incidents à additionner.
+ */
+const PANNES = new Set(['chute', 'boucle', 'relance-ko']);
+const tendanceIncidents = (incidents, now, jours = 10) => {
+  const depuis = now - jours * 86400000;
+  const par = new Map();
+  for (const i of (Array.isArray(incidents) ? incidents : [])) {
+    if (!i || !i.name || !PANNES.has(i.kind)) continue;
+    if (!Number.isFinite(i.at) || i.at < depuis || i.at > now) continue;
+    if (!par.has(i.name)) par.set(i.name, { chutes: 0, causes: new Map() });
+    const e = par.get(i.name);
+    e.chutes++;
+    const c = String(i.cause || '').trim();
+    if (c) e.causes.set(c, (e.causes.get(c) || 0) + 1);
+  }
+  const out = {};
+  for (const [nom, e] of par) {
+    if (e.chutes < 2) continue;              // une chute isolée n'est pas une tendance
+    let cause = '', combien = 0;
+    for (const [c, n] of e.causes) if (n > combien) { cause = c; combien = n; }
+    out[nom] = { chutes: e.chutes, jours, cause, combien };
+  }
+  return out;
+};
+
 // ---------- Les bots qu'on attend et que pm2 ne nomme plus ----------
 /**
  * Bots DÉCLARÉS dans la configuration mais ABSENTS de la liste pm2. PURE.
@@ -711,6 +782,7 @@ module.exports = {
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert, verdictSelftest,
   basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction, botsManquants,
+  echantillonnerMemoire, tendanceMemoire, tendanceIncidents, MEM_PAS_MS, MEM_MAX,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,
