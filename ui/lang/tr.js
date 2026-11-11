@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2 onları artık tanımıyor (terminalden silinmiş ya da onlar olmadan bir dump geri yüklenmiş). "Yeniden çevrimiçi yap" işe yaramaz: yeniden içe aktarılmaları gerekir.',
     'bots.downFor': '{v} boyunca çevrimdışı',
     'bots.memTrend': '(zirve {pic} · {delta}/24 sa)',
+    'ui.renderFail': '⚠️ Ekran artık yenilenemiyor ({n} kez): gösterilen değerler güncel olmayabilir. Botların izlenmesi devam ediyor. Ayrıntı: {err}',
     'inc.trend': '<b>{name}</b>: {j} günde {n} çökme',
     'inc.trendCause': 'baskın neden: {cause} ({c}/{n})',
     'bots.fixDone': '✅ {n} bot yeniden başlatıldı',

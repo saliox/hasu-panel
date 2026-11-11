@@ -401,12 +401,46 @@ const render = (st) => {
   paintUpdCard();
 };
 
+// ⚠️ CE `catch {}` ÉTAIT NU, et c'est l'endroit le plus visible du logiciel. Si `render()` lève —
+//    une donnée d'une forme inattendue, un champ neuf mal formé — l'écran GÈLE sur sa dernière image
+//    pendant que le sondage continue toutes les 3 s. L'utilisateur lit alors des chiffres périmés en
+//    croyant qu'ils sont vivants, et RIEN ne le lui dit : ni message, ni trace dans la console. Pour
+//    un logiciel dont le métier est de montrer un état, c'est le pire mensonge possible.
+//    On continue de ne pas laisser l'exception remonter (la boucle doit survivre), mais on la DIT.
+let echecsRendu = 0, dernierEchecRendu = '';
 const refresh = async () => {
   if (pending) return;
   pending = true;
-  try { render(await window.panel.status()); } catch {}
+  try {
+    render(await window.panel.status());
+    if (echecsRendu) { echecsRendu = 0; dernierEchecRendu = ''; majBandeauRendu(); }
+  } catch (e) {
+    echecsRendu++;
+    dernierEchecRendu = String((e && e.message) || e || '').slice(0, 200);
+    console.error('[panel] échec de rendu #' + echecsRendu, e);
+    majBandeauRendu();
+  }
   pending = false;
 };
+
+// Bandeau d'échec de rendu : écrit DIRECTEMENT dans le DOM, sans passer par render() — qui est
+// justement ce qui vient d'échouer. Un rapporteur qui emprunte le chemin en panne ne rapporte rien.
+const majBandeauRendu = () => {
+  const zone = document.getElementById('rendu-ko');
+  if (!zone) return;
+  if (!echecsRendu) { zone.style.display = 'none'; zone.textContent = ''; return; }
+  zone.style.display = '';
+  zone.textContent = window.i18n.t('ui.renderFail', { n: echecsRendu, err: dernierEchecRendu });
+};
+
+// Dernier recours côté fenêtre : une erreur hors de `refresh` (gestionnaire de clic, minuteur) ne
+// doit pas disparaître dans la console d'un écran que personne n'ouvre.
+window.addEventListener('error', (ev) => {
+  echecsRendu++; dernierEchecRendu = String((ev && ev.message) || 'erreur').slice(0, 200); majBandeauRendu();
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  echecsRendu++; dernierEchecRendu = String((ev && ev.reason && ev.reason.message) || 'promesse rejetée').slice(0, 200); majBandeauRendu();
+});
 
 // ---------- Modale (import + à propos) ----------
 const openModal = (html) => { $('modal-box').innerHTML = html; $('modal').classList.remove('hidden'); };

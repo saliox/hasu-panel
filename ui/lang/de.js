@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2 kennt sie nicht mehr (im Terminal gelöscht oder ein Dump ohne sie wiederhergestellt). „Wieder online bringen“ hilft hier nicht: sie müssen neu importiert werden.',
     'bots.downFor': 'offline seit {v}',
     'bots.memTrend': '(Spitze {pic} · {delta}/24 h)',
+    'ui.renderFail': '⚠️ Die Anzeige kann sich nicht mehr aktualisieren ({n}-mal): die angezeigten Werte sind möglicherweise veraltet. Die Bot-Überwachung läuft weiter. Details: {err}',
     'inc.trend': '<b>{name}</b>: {n} Ausfälle in {j} T',
     'inc.trendCause': 'Hauptursache: {cause} ({c}/{n})',
     'bots.fixDone': '✅ {n} neu gestartet',

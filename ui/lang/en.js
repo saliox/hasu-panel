@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2 no longer knows them (deleted from a terminal, or a dump restored without them). "Bring back online" cannot help: they must be imported again.',
     'bots.downFor': 'offline for {v}',
     'bots.memTrend': '(peak {pic} · {delta}/24 h)',
+    'ui.renderFail': '⚠️ The screen can no longer refresh ({n} times): the figures shown may be stale. Bot monitoring itself keeps running. Details: {err}',
     'inc.trend': '<b>{name}</b>: {n} crashes in {j} d',
     'inc.trendCause': 'main cause: {cause} ({c}/{n})',
     'bots.fixDone': '✅ {n} restarted',

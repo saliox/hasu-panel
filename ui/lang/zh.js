@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2 已不认识它们（在终端里被删除，或恢复了不含它们的快照）。“恢复上线”无能为力：需要重新导入。',
     'bots.downFor': '已离线 {v}',
     'bots.memTrend': '（峰值 {pic} · {delta}/24 小时）',
+    'ui.renderFail': '⚠️ 界面无法刷新了（{n} 次）：显示的数字可能已过时。机器人监控仍在运行。详情：{err}',
     'inc.trend': '<b>{name}</b>：{j} 天内掉线 {n} 次',
     'inc.trendCause': '主要原因：{cause}（{c}/{n}）',
     'bots.fixDone': '✅ 已重启 {n} 个',

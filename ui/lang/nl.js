@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2 kent ze niet meer (verwijderd via de terminal, of een dump teruggezet zonder ze). "Weer online brengen" helpt niet: ze moeten opnieuw worden geïmporteerd.',
     'bots.downFor': 'offline sinds {v}',
     'bots.memTrend': '(piek {pic} · {delta}/24 u)',
+    'ui.renderFail': '⚠️ Het scherm kan niet meer verversen ({n} keer): de getoonde cijfers zijn mogelijk verouderd. De botbewaking loopt gewoon door. Details: {err}',
     'inc.trend': '<b>{name}</b>: {n} uitvallen in {j} d',
     'inc.trendCause': 'hoofdoorzaak: {cause} ({c}/{n})',
     'bots.fixDone': '✅ {n} herstart',

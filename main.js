@@ -509,6 +509,46 @@ const RE_SESSION = NOM_SESSION.length >= 3
   ? new RegExp(NOM_SESSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi') : null;
 const masquer = (texte) => { const s = redactSensitive(texte); return RE_SESSION ? s.replace(RE_SESSION, '[…]') : s; };
 
+// ---------- Filet de dernier recours ----------
+// ⚠️ IL N'Y EN AVAIT AUCUN. Ni `uncaughtException`, ni `unhandledRejection`, ni
+//    `render-process-gone` : zéro garde-fou dans tout le projet. Or Node ≥ 15 TERMINE le processus
+//    sur une promesse rejetée non captée, et il restait des chemins exposés — dont les DEUX chaînes
+//    de démarrage `app.whenReady().then(async …)`, sans `.catch`. Un seul throw y tuait le panel AU
+//    LANCEMENT : pas de fenêtre, pas de ligne de journal, rien. L'utilisateur double-clique et il ne
+//    se passe simplement rien.
+//
+//    UN SURVEILLANT QUI MEURT EST PIRE QU'UN SURVEILLANT QUI SE TROMPE. On ne « répare » donc pas
+//    l'erreur — on la JOURNALISE, on la MONTRE à l'écran, et on CONTINUE. Poursuivre avec un état
+//    peut-être abîmé est un compromis assumé, et c'est le bon ici : le pire cas d'une poursuite est
+//    un affichage faux, que le reste du panel sait déjà signaler ; le pire cas d'un arrêt est que
+//    plus personne ne surveille les bots, et que rien ne le dise.
+//
+//    LIMITE ASSUMÉE : ce filet est posé ICI, après `log` et `masquer` dont il se sert. Un plantage
+//    survenu AVANT cette ligne (chargement des modules) n'est pas couvert — il n'y a alors ni journal
+//    ni écran pour le dire de toute façon.
+let plantages = [];                  // {at, quoi, msg} des 24 dernières heures, remonté à l'écran
+const plantagesVus = new Set();      // premières lignes déjà alertées : une par CAUSE, pas par occurrence
+const noterPlantage = (quoi, err) => {
+  try {
+    const texte = masquer(String((err && err.stack) || err || 'erreur sans message'));
+    const titre = texte.split('\n')[0].slice(0, 200);
+    log('PLANTAGE INTERCEPTÉ —', quoi, ':', texte.slice(0, 600));
+    const now = Date.now();
+    plantages = [...plantages.filter((p) => now - p.at < 24 * 3600 * 1000), { at: now, quoi, msg: titre }].slice(-20);
+    // Alerte de la famille PANEL : elle n'obéit donc PAS à l'interrupteur des alertes de bots (couper
+    // celles-ci ne demande pas au panel de cacher ses propres pannes — voir le juge `alerteBot`).
+    if (!plantagesVus.has(titre)) {
+      plantagesVus.add(titre);
+      if (plantagesVus.size > 50) plantagesVus.clear();   // borne : la mémoire ne grossit pas sans fin
+      queueAlert('⚠️ Erreur interne du panel',
+        `Le panel a rencontré une erreur (${quoi}) et CONTINUE de surveiller tes bots.\n\n\`${titre}\`\n\nSi ça se répète, regarde panel.log.`,
+        0xFAA61A);
+    }
+  } catch { /* le filet ne doit JAMAIS être la cause d'un plantage */ }
+};
+process.on('uncaughtException', (e) => noterPlantage('exception', e));
+process.on('unhandledRejection', (e) => noterPlantage('promesse rejetée', e));
+
 let cfgWriteFailed = false; // remonté dans panel:status → bandeau dans l'interface (échec bruyant)
 let cfgBakFailed = false;   // la COPIE DE SECOURS ne s'écrit plus : le filet est mort, il faut le dire
 let cfgSeq = 0;             // dernier numéro d'ordre écrit ; repart au-dessus de ce qu'on a lu au démarrage
@@ -840,7 +880,10 @@ let pm2SavePending = false;
 const schedulePm2Save = (delayMs = 15000) => {
   pm2SavePending = true;
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
+  // Un callback `async` dans un minuteur n'a PAS d'appelant pour attraper son rejet : il remonte en
+  // promesse non captée, et Node ≥ 15 termine le processus. Le filet global l'intercepte désormais,
+  // mais une garde locale vaut mieux qu'un filet — elle dit QUEL geste a échoué.
+  saveTimer = setTimeout(() => { (async () => {
     saveTimer = null;
     // « Différé » doit vouloir dire RÉESSAYÉ, pas abandonné : avant, un simple `return` jetait la
     // sauvegarde, donc tout démarrage/arrêt fait pendant une partie n'atteignait JAMAIS pm2 save et le
@@ -870,7 +913,7 @@ const schedulePm2Save = (delayMs = 15000) => {
     saveRetries++;
     if (saveRetries % 10 === 1) log('pm2 save auto ÉCHEC — nouvelle tentative (', saveRetries, ')', String(r.out || '').slice(0, 120));
     schedulePm2Save(Math.min(15000 * saveRetries, 120000));
-  }, delayMs);
+  })().catch((e) => log('pm2 save auto : erreur interne —', e && e.message)); }, delayMs);
   saveTimer.unref?.();
 };
 
@@ -2168,7 +2211,9 @@ const regAutoriserDemarrage = (nom) => new Promise((res) => {
 let reconcileEnCours = null;
 const reconcilerLanceurs = (forcer = null) => {
   if (process.platform !== 'win32' || !app.isPackaged) return Promise.resolve();
-  if (reconcileEnCours) return reconcileEnCours.then(() => reconcilerLanceurs(forcer));
+  // `.catch` OBLIGATOIRE : sans lui, un rejet de la réconciliation précédente remontait en promesse
+  // non captée, et Node ≥ 15 tue le processus là-dessus.
+  if (reconcileEnCours) return reconcileEnCours.catch(() => {}).then(() => reconcilerLanceurs(forcer));
   reconcileEnCours = (async () => {
     const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
     if (forcer !== null) { cfg.autoLaunch = !!forcer; cfg.autoLaunchInit = true; saveCfg(); }
@@ -2848,6 +2893,11 @@ if (process.argv.includes('--selftest')) {
     const verdict = verdictSelftest(pm2Health.ok, !!procs, bots.length);
     console.log('SELFTEST verdict :', verdict.texte);
     process.exit(verdict.code);
+  }).catch((e) => {
+    // Le démarrage est le chemin le PLUS exposé : sans ce `catch`, un throw ici tuait le panel
+    // avant toute fenêtre et avant tout journal — on double-clique et il ne se passe rien.
+    try { log('DÉMARRAGE : erreur non captée —', masquer(String((e && e.stack) || e)).slice(0, 400)); } catch {}
+    try { noterPlantage('démarrage', e); } catch {}
   });
 } else if (!app.requestSingleInstanceLock()) { app.quit(); }
 else {
@@ -2906,6 +2956,11 @@ else {
     for (const b of statusCache.bots) if (!cfg.bots[b.name]) { cfg.bots[b.name] = { auto: true, gameStop: false }; added = true; }
     if (added) saveCfg();
     restartPoll();
+  }).catch((e) => {
+    // Le démarrage est le chemin le PLUS exposé : sans ce `catch`, un throw ici tuait le panel
+    // avant toute fenêtre et avant tout journal — on double-clique et il ne se passe rien.
+    try { log('DÉMARRAGE : erreur non captée —', masquer(String((e && e.stack) || e)).slice(0, 400)); } catch {}
+    try { noterPlantage('démarrage', e); } catch {}
   });
   // Nettoyage à la fermeture : on relance les bots coupés par le mode jeu et on efface les drapeaux
   // (watchdog + faible usage internet). Sinon les bots resteraient éteints et les alertes crash
@@ -2979,4 +3034,15 @@ else {
     })();
   });
   app.on('window-all-closed', () => { /* on reste dans le tray */ });
+  // Le processus d'AFFICHAGE peut mourir seul (manque de mémoire, plantage GPU) : la fenêtre devient
+  // blanche et le panel a l'air vivant depuis la zone de notification. La surveillance, elle, tourne
+  // toujours dans le processus principal — mais plus personne ne peut la LIRE. On recharge.
+  app.on('render-process-gone', (_e, _wc, details) => {
+    noterPlantage('affichage', new Error(`processus d'affichage perdu : ${details && details.reason}`));
+    try { if (win && !win.isDestroyed()) win.reload(); } catch (err) { log('reload après plantage', err.message); }
+  });
+  app.on('child-process-gone', (_e, details) => {
+    // Un utilitaire (GPU, réseau) qui tombe ne tue pas le panel : on le NOTE, sans recharger.
+    log('processus enfant perdu :', details && details.type, details && details.reason);
+  });
 }

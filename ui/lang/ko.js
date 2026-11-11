@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2가 더 이상 알지 못합니다(터미널에서 삭제되었거나, 해당 봇이 없는 덤프를 복원함). "다시 온라인으로"로는 해결되지 않습니다. 다시 가져와야 합니다.',
     'bots.downFor': '{v} 동안 오프라인',
     'bots.memTrend': '(최고 {pic} · {delta}/24시간)',
+    'ui.renderFail': '⚠️ 화면을 더 이상 새로 고칠 수 없습니다({n}회): 표시된 값이 오래되었을 수 있습니다. 봇 감시는 계속됩니다. 상세: {err}',
     'inc.trend': '<b>{name}</b>: {j}일간 {n}회 중단',
     'inc.trendCause': '주요 원인: {cause}({c}/{n})',
     'bots.fixDone': '✅ {n}개 재시작',

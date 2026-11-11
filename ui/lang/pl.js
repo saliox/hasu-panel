@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2 ich już nie zna (usunięte w terminalu albo przywrócony zrzut bez nich). „Przywróć online“ nic tu nie da: trzeba je zaimportować ponownie.',
     'bots.downFor': 'offline od {v}',
     'bots.memTrend': '(szczyt {pic} · {delta}/24 h)',
+    'ui.renderFail': '⚠️ Ekran nie może się już odświeżyć ({n} razy): pokazane wartości mogą być nieaktualne. Nadzór nad botami działa dalej. Szczegóły: {err}',
     'inc.trend': '<b>{name}</b>: {n} awarii w {j} dni',
     'inc.trendCause': 'główna przyczyna: {cause} ({c}/{n})',
     'bots.fixDone': '✅ Zrestartowano {n}',

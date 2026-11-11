@@ -37,6 +37,7 @@
     'bots.missingWhy': 'pm2 ne les connaît plus (supprimés au terminal, ou dump restauré sans eux). « Remettre en ordre » n\'y peut rien : il faut les réimporter.',
     'bots.downFor': 'hors ligne depuis {v}',
     'bots.memTrend': '(pic {pic} · {delta}/24 h)',
+    'ui.renderFail': '⚠️ L\'écran n\'arrive plus à s\'actualiser ({n} fois) : les chiffres affichés sont peut-être périmés. La surveillance des bots, elle, continue. Détail : {err}',
     'inc.trend': '<b>{name}</b> : {n} chutes en {j} j',
     'inc.trendCause': 'cause dominante : {cause} ({c}/{n})',
     'bots.fixDone': '✅ {n} relance(s)',
