@@ -176,6 +176,26 @@ const redactSensitive = (s) => String(s || '')
 // panne qui revient et une mémoire qui monte sont deux choses qu'on ne voit QUE dans le temps : un
 // chiffre instantané ne les montre jamais, quel que soit le soin qu'on met à le regarder.
 
+/**
+ * Séries de mémoire à OUBLIER. PURE.
+ *
+ * Un bot retiré du panel, ou disparu de pm2 pour toujours, laissait sa série dans
+ * panel-config.json — un fichier relu au démarrage et RÉÉCRIT EN ENTIER à chaque enregistrement. Rien
+ * ne la supprimait jamais : la configuration grossissait avec le nombre de noms de bots VUS UN JOUR,
+ * pas avec le nombre de bots.
+ *
+ * On n'oublie QUE ce qui n'est plus nulle part. Un bot encore déclaré dans la config mais absent de
+ * pm2 GARDE sa série : c'est exactement le cas où comparer à hier a le plus de valeur, et l'oublier
+ * reviendrait à effacer la mémoire au moment où on en a besoin.
+ */
+const memAOublier = (series, confs, bots) => {
+  const vivants = new Set([
+    ...Object.keys((confs && typeof confs === 'object') ? confs : {}),
+    ...(bots || []).filter((b) => b && b.name).map((b) => b.name),
+  ]);
+  return Object.keys((series && typeof series === 'object') ? series : {}).filter((n) => !vivants.has(n));
+};
+
 const MEM_PAS_MS = 60 * 60 * 1000;   // un échantillon par heure : la fuite se mesure en jours
 const MEM_MAX = 26;                  // ~25 h de recul — juste ce qu'il faut pour un delta sur 24 h
 
@@ -782,7 +802,7 @@ module.exports = {
   descendantsOf, parseProcessTree, parseTasklistCsv, hasEstablishedPublic,
   classifyErrorFr, isDeliberateStop, decideAlert, verdictSelftest,
   basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction, botsManquants,
-  echantillonnerMemoire, tendanceMemoire, tendanceIncidents, MEM_PAS_MS, MEM_MAX,
+  echantillonnerMemoire, tendanceMemoire, tendanceIncidents, memAOublier, MEM_PAS_MS, MEM_MAX,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, pickCfgSource, CFG_SEQ, seqDe,
   TRANSIENT_STATUS, TRANSIENT_MAX_TICKS, redactSensitive, shouldAutoHeal, AUTO_HEAL_DELAYS_MS, AUTO_HEAL_MAX,
   sanitizeIncidents, sanitizeRuntime, healPending,

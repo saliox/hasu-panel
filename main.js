@@ -157,7 +157,7 @@ const {
   semverGt, clampInt, quoteForShell, descendantsOf, parseProcessTree, parseTasklistCsv,
   hasEstablishedPublic, classifyErrorFr, decideAlert, verdictSelftest,
   basesPm2, SOUS_PM2_CMD, SOUS_PM2_JS, ciblesModeJeu, motifAction, botsManquants,
-  echantillonnerMemoire, tendanceMemoire, tendanceIncidents,
+  echantillonnerMemoire, tendanceMemoire, tendanceIncidents, memAOublier,
   computeDefaultBounds, boundsAreVisible, pollDelayFor, makeChimeWav, pickCfgSource, CFG_SEQ, cleanNotes,
   shouldAutoHeal, AUTO_HEAL_MAX, sanitizeIncidents, sanitizeRuntime, healPending,
   planLanceurs, LOGIN_ITEM, autresInstallations, redactSensitive, parseRegQuery, verdictEcriture,
@@ -297,7 +297,10 @@ const withGameLock = async (fn) => {
   try { return await fn(); } finally {
     busy = false;
     const next = pendingGameFn; pendingGameFn = null;
-    if (next) withGameLock(next);
+    // `.catch` OBLIGATOIRE : ce rejeu n'a aucun appelant pour attraper son rejet — personne
+    // n'attend cette promesse. Avant le filet global, un throw ici tuait le processus ; et même
+    // avec le filet, une garde locale dit QUEL geste a échoué au lieu d'une pile anonyme.
+    if (next) withGameLock(next).catch((e) => log('mode jeu : la demande en attente a échoué —', e && e.message));
   }
 };
 let prevIo = new Map(); // pid -> { read, write, at } : relevé E/S précédent, pour calculer les DÉBITS (octets/s) par delta
@@ -1236,6 +1239,12 @@ const echantillonnerMem = () => {
     const tApres = apres.length ? apres[apres.length - 1][0] : 0;
     if (apres.length !== avant.length || tApres !== tAvant) { cfg.mem[b.name] = apres; change = true; }
   }
+  // NETTOYAGE — le cinquième porteur, celui qui manquait. Sans lui, la configuration grossissait
+  // avec le nombre de noms de bots VUS UN JOUR et non avec le nombre de bots.
+  for (const mort of memAOublier(cfg.mem, cfg.bots, statusCache.bots)) {
+    delete cfg.mem[mort]; change = true;
+    log('mémoire oubliée pour', mort, '(ni dans la config, ni dans pm2)');
+  }
   if (change) saveCfg();
 };
 
@@ -1644,6 +1653,7 @@ const removeBot = async (name) => {
   delete cfg.bots[name];
   cfg.stoppedByGame = cfg.stoppedByGame.filter((n) => n !== name);
   cfg.reprisEnJeu = (cfg.reprisEnJeu || []).filter((n) => n !== name);
+  if (cfg.mem) delete cfg.mem[name];   // retrait VOLONTAIRE : on n'attend pas le tick pour oublier
   saveCfg();
   log('retrait:', name);
   await refreshBots();

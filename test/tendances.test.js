@@ -175,3 +175,47 @@ test('les trois clés de tendance existent dans les 14 langues', () => {
     assert.ok(trend && trend[1].includes('<b>{name}</b>'), `${l} : inc.trend doit porter <b>{name}</b>`);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// LE CINQUIÈME PORTEUR QUI MANQUAIT À MON PROPRE LOT : le NETTOYAGE.
+//
+// `cfg.mem[nom]` n'était jamais supprimé. La série d'un bot retiré du panel, ou disparu de pm2 pour
+// toujours, restait dans panel-config.json — un fichier relu au démarrage et RÉÉCRIT EN ENTIER à
+// chaque enregistrement. La configuration grossissait donc avec le nombre de noms de bots VUS UN
+// JOUR, et non avec le nombre de bots. J'avais écrit l'écrivain, le lecteur, l'assainisseur et la
+// borne, et oublié le nettoyage — alors que je venais d'écrire la fiche qui dit de compter les cinq.
+const { memAOublier } = require('../logic');
+const EN_LIGNE2 = (n) => ({ name: n, status: 'online' });
+
+test('oubli : une série sans bot nulle part est oubliée', () => {
+  assert.deepEqual(memAOublier({ mort: [], saliox: [] }, { saliox: {} }, [EN_LIGNE2('saliox')]), ['mort']);
+});
+
+test('oubli : un bot DÉCLARÉ mais absent de pm2 GARDE sa mémoire', () => {
+  // C'est le cas où comparer à hier a le plus de valeur : l'oublier reviendrait à effacer la
+  // mémoire au moment précis où on en a besoin.
+  assert.deepEqual(memAOublier({ saliox: [] }, { saliox: {} }, []), []);
+});
+
+test('oubli : un bot vu par pm2 mais absent de la config garde aussi sa mémoire', () => {
+  assert.deepEqual(memAOublier({ x: [] }, {}, [EN_LIGNE2('x')]), []);
+});
+
+test('oubli : entrées malsaines absorbées', () => {
+  assert.deepEqual(memAOublier(null, null, null), []);
+  assert.deepEqual(memAOublier({ a: [] }, null, [null, undefined, {}]), ['a']);
+});
+
+test('oubli : main.js purge ET au tick ET au retrait volontaire', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(src, /for \(const mort of memAOublier\(cfg\.mem, cfg\.bots, statusCache\.bots\)\) \{/);
+  assert.match(src, /delete cfg\.mem\[mort\]; change = true;/);
+  assert.match(src, /if \(cfg\.mem\) delete cfg\.mem\[name\];   \/\/ retrait VOLONTAIRE/);
+});
+
+test('verrou du mode jeu : le rejeu de la demande en attente est gardé', () => {
+  // Ce rejeu n'a aucun appelant pour attraper son rejet : personne n'attend cette promesse.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.doesNotMatch(src, /\n    if \(next\) withGameLock\(next\);/);
+  assert.match(src, /if \(next\) withGameLock\(next\)\.catch\(\(e\) => log\('mode jeu : la demande en attente a échoué/);
+});
